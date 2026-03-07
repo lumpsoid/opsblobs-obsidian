@@ -12,11 +12,11 @@ import {
   ProtoStateExchange,
   ProtoContentRequest,
   ProtoContentResponse,
+  ProtoContentPush,
   ProtoSyncComplete,
-  SyncSession,
   PairedDevice,
 } from '../types';
-import { Encryption, base64ToBytes } from './encryption';
+import { Encryption, base64ToBytes, bytesToBase64 } from './encryption';
 import { HybridLogicalClock } from '../core/hlc';
 import { mergeVaultStates } from '../merge/state-merge';
 import { SyncApplicator } from './sync-applicator';
@@ -26,6 +26,7 @@ export interface SyncClientOptions {
   remotePort: number;
   pairedDevice: PairedDevice;
   localState: VaultState;
+  localDeviceName: string;
   hlc: HybridLogicalClock;
   applicator: SyncApplicator;
   onProgress?: (label: string, current: number, total: number) => void;
@@ -52,7 +53,7 @@ export class SyncClient {
     const hello: ProtoHello = {
       type: 'HELLO',
       deviceId: localState.deviceId,
-      deviceName: 'This device',
+      deviceName: this.options.localDeviceName || 'Unknown Device',
       hlc: hlc.now(),
       sessionId: this.sessionId,
     };
@@ -78,6 +79,7 @@ export class SyncClient {
     };
     const stateResp = await this.send<ProtoStateExchange>(stateMsg);
     if (stateResp.type !== 'STATE') throw new Error('Expected STATE response');
+    // stateResp.hashesNeeded tells us which of our content the server requires
 
     // ── Step 4: Compute merge ─────────────────────────────────────────────
     onProgress?.('Computing merge...', 3, 5);
@@ -113,15 +115,27 @@ export class SyncClient {
       }
     }
 
-    // ── Step 5b: Send content remote needs ────────────────────────────────
-    const hashesForRemote: string[] = [];
-    for (const [, entry] of localState.fileEntries) {
-      if (!entry.deleted) hashesForRemote.push(entry.contentHash);
+    // ── Step 5b: Push content the server needs ────────────────────────────
+    // The server told us (in stateResp.hashesNeeded) which content it requires.
+    // Send those chunks so the server can apply the merge on its end.
+    const hashesForServer = stateResp.hashesNeeded ?? [];
+    if (hashesForServer.length > 0) {
+      onProgress?.(`Uploading ${hashesForServer.length} file(s) to remote...`, 5, 6);
+      const pushChunks: Array<{ hash: string; dataBase64: string }> = [];
+      for (const hash of hashesForServer) {
+        const content = localState.contentStore.get(hash);
+        if (content) {
+          pushChunks.push({ hash, dataBase64: bytesToBase64(content) });
+        }
+      }
+      if (pushChunks.length > 0) {
+        const pushMsg: ProtoContentPush = { type: 'CONTENT_PUSH', chunks: pushChunks };
+        await this.send<ProtoContentResponse>(pushMsg);  // server acks with empty CONTENT
+      }
     }
-    // (Remote will request what it needs via CONTENT_REQUEST — handled by server)
 
     // ── Step 6: Apply merge ───────────────────────────────────────────────
-    onProgress?.('Applying changes...', 5, 5);
+    onProgress?.('Applying changes...', 6, 6);
     const mergeResult = mergeVaultStates(localState, remoteState);
     await applicator.applyActions(mergeResult.actions, localState, remoteState);
 

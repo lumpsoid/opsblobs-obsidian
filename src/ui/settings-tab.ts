@@ -133,6 +133,24 @@ export class SyncSettingTab extends PluginSettingTab {
         ta.inputEl.style.fontSize = '0.85rem';
       });
 
+    // ── Network ───────────────────────────────────────────────────────────
+    containerEl.createEl('h3', { text: 'Network' });
+
+    new Setting(containerEl)
+      .setName('Sync Port')
+      .setDesc('Port this device listens on when acting as server. The other device must be able to reach this port on your local network.')
+      .addText(t => {
+        t.setValue(String(this.plugin.settings.syncPort))
+          .setPlaceholder('47821')
+          .onChange(async v => {
+            const n = parseInt(v, 10);
+            if (n > 1024 && n < 65536) {
+              this.plugin.settings.syncPort = n;
+              await this.plugin.saveSettings();
+            }
+          });
+      });
+
     // ── Storage ───────────────────────────────────────────────────────────
     containerEl.createEl('h3', { text: 'Storage' });
 

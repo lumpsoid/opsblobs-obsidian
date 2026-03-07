@@ -2,8 +2,8 @@
 //  Obsidian Vault Sync — Main Plugin Entry
 // ─────────────────────────────────────────────
 
-import { Plugin, Notice, addIcon } from 'obsidian';
-import { SyncSettings, DEFAULT_SETTINGS, VaultState, MergeAction } from './types';
+import { Plugin, Notice, Modal, addIcon } from 'obsidian';
+import { SyncSettings, DEFAULT_SETTINGS, VaultState } from './types';
 import { HybridLogicalClock } from './core/hlc';
 import { FileRegistry } from './core/file-registry';
 import { ContentStore } from './core/content-store';
@@ -182,17 +182,16 @@ export default class VaultSyncPlugin extends Plugin {
 
     // For simplicity, sync with the first paired device
     // In a full implementation, you'd choose which device or sync with all
-    const target = this.settings.pairedDevices[0];
+    const target = this.settings.pairedDevices[0]!;
     await this.syncWithDevice(target);
   }
 
   private async syncWithDevice(device: typeof this.settings.pairedDevices[0]) {
     this.syncInProgress = true;
     this.updateRibbonState('syncing');
-    new Notice(`🔄 Syncing with ${device.deviceName}...`);
 
     try {
-      // Build current vault state
+      // Build local vault state — read all file content into the in-memory store
       const localState: VaultState = {
         deviceId: this.settings.deviceId,
         hlc: this.hlc.getCurrent(),
@@ -200,24 +199,83 @@ export default class VaultSyncPlugin extends Plugin {
         pendingOps: this.opLogger.getPendingOps(),
         contentStore: new Map(),
       };
-
-      // Load content for pending files into the content store
       await this.populateContentStore(localState);
 
-      // Dynamic import to keep initial load fast
       const { SyncClient } = await import('./network/sync-client');
+      const { SyncServer, getLocalIPs } = await import('./network/sync-server');
 
-      // In a real app, we'd get IP/port from the QR scan or manual entry
-      // For now, show a notice explaining the connection setup
-      new Notice('💡 Tip: Start a sync server on the other device first, then enter its IP in settings.', 5000);
+      const onProgress = (label: string) => {
+        this.statusBarItem?.setText(`⟳ ${label}`);
+      };
+
+      if (device.lastKnownIp && device.lastKnownPort) {
+        // ── Client mode: connect to the other device ──────────────────────
+        new Notice(`🔄 Connecting to ${device.deviceName}...`);
+        const client = new SyncClient({
+          remoteIp: device.lastKnownIp,
+          remotePort: device.lastKnownPort,
+          pairedDevice: device,
+          localState,
+          localDeviceName: this.settings.deviceName || 'Unknown Device',
+          hlc: this.hlc,
+          applicator: this.applicator,
+          onProgress: (label, current, total) => onProgress(`${label} (${current}/${total})`),
+        });
+        await client.runSync();
+
+      } else {
+        // ── Server mode: start listening, wait for the other device ───────
+        const server = new SyncServer({
+          localState,
+          pairedDevice: device,
+          settings: this.settings,
+          hlc: this.hlc,
+          applicator: this.applicator,
+          onProgress: (label, current, total) => onProgress(`${label} (${current}/${total})`),
+        });
+
+        const port = await server.start();
+        const ips = getLocalIPs();
+        const ipStr = ips.length > 0 ? ips[0]! : '(your IP)';
+
+        // Show a modal so the user sees the connection info and can cancel
+        await new Promise<void>((resolve, reject) => {
+          const modal = new WaitingForConnectionModal(
+            this.app,
+            ipStr,
+            port,
+            () => {
+              server.stop();
+              reject(new Error('Sync cancelled'));
+            },
+          );
+          modal.open();
+
+          server.onComplete = () => {
+            modal.close();
+            resolve();
+          };
+          server.onError = (err: Error) => {
+            modal.close();
+            reject(err);
+          };
+        });
+
+        await server.stop();
+      }
+
+      // ── Post-sync bookkeeping ──────────────────────────────────────────
+      device.lastSyncTime = Date.now();
+      device.lastSyncHlc = this.hlc.getCurrent();
+      await this.saveSettings();
 
       new Notice(`✅ Sync complete with ${device.deviceName}`);
-      device.lastSyncTime = Date.now();
-      await this.saveSettings();
 
     } catch (err) {
       console.error('Vault Sync error:', err);
-      new Notice(`❌ Sync failed: ${(err as Error).message}`);
+      if ((err as Error).message !== 'Sync cancelled') {
+        new Notice(`❌ Sync failed: ${(err as Error).message}`);
+      }
       this.updateRibbonState('error');
     } finally {
       this.syncInProgress = false;
@@ -256,7 +314,7 @@ export default class VaultSyncPlugin extends Plugin {
       conflict: 'Vault Sync (conflicts need resolution)',
       error: 'Vault Sync (error — click for details)',
     };
-    this.ribbonIcon.setAttribute('aria-label', titles[state]);
+    this.ribbonIcon.setAttribute('aria-label', titles[state] ?? 'Vault Sync');
   }
 
   private updateStatusBar() {
@@ -292,5 +350,52 @@ export default class VaultSyncPlugin extends Plugin {
     if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
     if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
     return `${Math.floor(seconds / 86400)}d ago`;
+  }
+}
+
+// ─── Waiting-for-connection modal ──────────────────────────────────────────────
+// Shown on the server side while waiting for the client to connect.
+
+class WaitingForConnectionModal extends Modal {
+  constructor(
+    app: Parameters<typeof Modal['prototype']['constructor']>[0],
+    private ip: string,
+    private port: number,
+    private onCancel: () => void,
+  ) {
+    super(app);
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl('h2', { text: '📡 Waiting for Connection' });
+    contentEl.createEl('p', {
+      text: 'On the other device, press Sync and enter these details:',
+    });
+
+    const dl = contentEl.createEl('dl', { cls: 'waiting-connection-info' });
+    dl.createEl('dt', { text: 'IP' });
+    dl.createEl('dd', { text: this.ip });
+    dl.createEl('dt', { text: 'Port' });
+    dl.createEl('dd', { text: String(this.port) });
+
+    const style = document.createElement('style');
+    style.textContent = `
+      .waiting-connection-info { display: grid; grid-template-columns: auto 1fr; gap: 0.25rem 1rem;
+        font-size: 1rem; margin: 1rem 0 1.5rem; }
+      .waiting-connection-info dt { color: var(--text-muted); font-weight: 600; }
+      .waiting-connection-info dd { margin: 0; font-family: var(--font-monospace); font-size: 1.1rem; }
+    `;
+    contentEl.appendChild(style);
+
+    const btn = contentEl.createEl('button', { text: 'Cancel', cls: 'mod-warning' });
+    btn.addEventListener('click', () => {
+      this.close();
+      this.onCancel();
+    });
+  }
+
+  onClose() {
+    this.contentEl.empty();
   }
 }
