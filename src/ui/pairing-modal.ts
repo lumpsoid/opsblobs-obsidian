@@ -110,11 +110,41 @@ export class PairingModal extends Modal {
     });
 
     contentEl.createEl('p', {
-      text: 'Waiting for the other device to enter the code...',
+      text: 'Once the other device has entered the code, confirm pairing below.',
       cls: 'pairing-waiting',
     });
 
-    new ButtonComponent(contentEl)
+    // Name input for the remote device
+    let remoteName = '';
+    new Setting(contentEl)
+      .setName('Other Device Name')
+      .setDesc('A friendly name for the device that will enter the code')
+      .addText(t => {
+        t.setPlaceholder('My Laptop');
+        t.onChange(v => { remoteName = v.trim(); });
+      });
+
+    const footer = contentEl.createDiv('pairing-footer');
+    new ButtonComponent(footer)
+      .setButtonText('Confirm Pairing ✓')
+      .setClass('mod-cta')
+      .onClick(async () => {
+        // This device acts as server: no lastKnownIp/lastKnownPort so main.ts
+        // will put it into server (listener) mode when syncing.
+        const device: PairedDevice = {
+          deviceId: `pending-${Date.now()}`,
+          deviceName: remoteName || 'Remote Device',
+          encryptionKeyBase64: this.derivedKeyBase64,
+          lastSyncHlc: null,
+          lastSyncTime: null,
+          // Intentionally no lastKnownIp / lastKnownPort — this device listens.
+        };
+        await this.onPaired(device);
+        this.step = 'done';
+        this.render();
+      });
+
+    new ButtonComponent(footer)
       .setButtonText('← Back')
       .onClick(() => { this.step = 'choose'; this.render(); });
   }
