@@ -1,3 +1,108 @@
+# Obsidian Vault Sync
+
+A peer-to-peer vault sync plugin for [Obsidian](https://obsidian.md) that works across all platforms including iOS — no third-party server required.
+
+## Architecture
+
+| Layer | What it does |
+|---|---|
+| **HLC** (`src/core/hlc.ts`) | Hybrid Logical Clock — total causal ordering across devices without requiring synchronized clocks |
+| **File Registry** (`src/core/file-registry.ts`) | Stable UUID → path mapping. Files retain identity through renames, moves, and deletes |
+| **Content Store** (`src/core/content-store.ts`) | Content-addressed (SHA-256) storage for ancestor versions used in three-way merge |
+| **Operation Logger** (`src/core/operation-logger.ts`) | Records vault changes with 1.5s debounce; persists to `.vault-sync/oplog.json` |
+| **Diff3** (`src/merge/diff3.ts`) | Bundled patience diff + three-way merge (~300 lines, zero dependencies) |
+| **State Merge** (`src/merge/state-merge.ts`) | Pure CRDT merge function — commutative, associative, idempotent |
+| **Encryption** (`src/network/encryption.ts`) | AES-256-GCM via Web Crypto API; PBKDF2 key derivation from pairing codes |
+| **Sync Client/Server** (`src/network/`) | HTTP-based P2P transport; QR code / manual IP pairing |
+| **UI** (`src/ui/`) | Conflict resolution modal, pairing flow, settings tab |
+
+## Sync Protocol
+
+```
+Device A (initiator)          Device B (responder)
+─────────────────────          ─────────────────────
+       ── HELLO ──────────────►
+       ◄── HELLO ──────────────
+       ── OPS_SINCE ──────────►
+       ◄── OPS_SINCE ──────────
+       ── STATE ──────────────►
+       ◄── STATE ──────────────
+
+  [Both compute merge independently]
+
+       ── CONTENT_REQUEST ────►
+       ◄── CONTENT ────────────
+       ◄── CONTENT_REQUEST ────
+       ── CONTENT ────────────►
+
+  [Both apply merge results]
+
+       ── SYNC_COMPLETE ──────►
+       ◄── SYNC_COMPLETE ──────
+```
+
+All messages are encrypted with AES-256-GCM using the paired device's shared key.
+
+## Conflict Resolution
+
+**Automatic (no user action needed):**
+- Files added on one device → accepted on the other
+- Files with non-overlapping edits → merged automatically using patience diff + three-way merge
+- Renames on both sides → higher HLC timestamp wins
+
+**Manual (UI):**
+- Overlapping edits to the same region → conflict resolution modal (Accept Local / Accept Remote / Accept Both)
+- Delete vs. modify → configurable strategy (ask / always keep deletion / always keep modification)
+
+## Development
+
+```bash
+npm install
+npm run dev          # watch mode
+npm test             # run unit tests
+npm run build        # production build
+```
+
+Copy `main.js` and `manifest.json` into your vault's `.obsidian/plugins/obsidian-vault-sync/` folder.
+
+## Milestones
+
+- [x] **M1** — HLC, file registry, operation logger, content store
+- [x] **M2** — Patience diff, three-way merge, state merge function
+- [x] **M3** — Encryption, sync client/server, P2P protocol
+- [x] **M4** — Conflict UI, pairing flow, settings tab
+- [ ] **M5** — Binary files, performance, multi-device hardening
+- [ ] **M6** — Release, documentation, community submission
+
+## File Structure
+
+```
+src/
+  core/
+    hlc.ts              # Hybrid Logical Clock
+    file-registry.ts    # UUID ↔ path mapping
+    content-store.ts    # Content-addressed storage
+    operation-logger.ts # Vault event hooks + debounce
+  merge/
+    diff3.ts            # Patience diff + three-way merge
+    state-merge.ts      # CRDT merge function
+  network/
+    encryption.ts       # AES-256-GCM
+    sync-client.ts      # Initiator (Device A)
+    sync-server.ts      # Responder (Device B)
+    sync-applicator.ts  # Applies merge actions to vault
+  ui/
+    conflict-modal.ts   # Conflict resolution UI
+    pairing-modal.ts    # Pairing flow
+    settings-tab.ts     # Plugin settings
+  main.ts               # Plugin entry point
+  types.ts              # All TypeScript interfaces
+  __tests__/
+    core.test.ts        # Unit tests (HLC, diff3, state merge)
+  __mocks__/
+    obsidian.ts         # Obsidian API mock for testing
+```
+
 # Obsidian Sample Plugin
 
 This is a sample plugin for Obsidian (https://obsidian.md).
