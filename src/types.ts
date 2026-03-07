@@ -84,6 +84,8 @@ export interface PairedDevice {
   encryptionKeyBase64: string;
   lastSyncHlc: HLC | null;
   lastSyncTime: number | null;
+  lastKnownIp?: string;    // IP of this device on its local network
+  lastKnownPort?: number;  // port of this device's sync server
 }
 
 export interface SyncSettings {
@@ -95,6 +97,7 @@ export interface SyncSettings {
   deleteConflictStrategy: 'ask' | 'keep_deleted' | 'keep_modified';
   syncObsidianConfig: boolean;
   ancestorRetentionDays: number;
+  syncPort: number;  // port this device listens on when acting as server
 }
 
 export const DEFAULT_SETTINGS: SyncSettings = {
@@ -111,6 +114,7 @@ export const DEFAULT_SETTINGS: SyncSettings = {
   deleteConflictStrategy: 'ask',
   syncObsidianConfig: false,
   ancestorRetentionDays: 30,
+  syncPort: 47821,
 };
 
 // ─── Protocol messages ────────────────────────────────────────────────────────
@@ -132,6 +136,7 @@ export interface ProtoOpsExchange {
 export interface ProtoStateExchange {
   type: 'STATE';
   fileEntries: Array<[string, FileEntry]>;  // serialised map entries
+  hashesNeeded?: string[];  // hashes the responding side needs from the sender
 }
 
 export interface ProtoContentRequest {
@@ -149,6 +154,11 @@ export interface ProtoSyncComplete {
   newHlc: HLC;
 }
 
+export interface ProtoContentPush {
+  type: 'CONTENT_PUSH';
+  chunks: Array<{ hash: string; dataBase64: string }>;
+}
+
 export interface ProtoError {
   type: 'ERROR';
   code: string;
@@ -161,5 +171,6 @@ export type ProtoMessage =
   | ProtoStateExchange
   | ProtoContentRequest
   | ProtoContentResponse
+  | ProtoContentPush
   | ProtoSyncComplete
   | ProtoError;

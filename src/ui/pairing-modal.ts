@@ -96,18 +96,20 @@ export class PairingModal extends Modal {
     codeDisplay.createEl('div', { text: formatted, cls: 'code-digits' });
     codeDisplay.createEl('p', { text: 'Enter this code on the other device', cls: 'code-hint' });
 
-    // QR code placeholder (would use a QR library in production)
-    const qrContainer = contentEl.createDiv('qr-placeholder');
-    qrContainer.createEl('div', {
-      text: `IP: ${this.getLocalIP()} | Port: shown in sync panel | Code: ${this.pairingCode}`,
-      cls: 'qr-text',
-    });
+    // Show connection details the other device needs to enter
+    const localIPs = this.getLocalIPs();
+    const port = this.settings.syncPort;
+    const saltStr = bytesToBase64(this.salt);
 
-    const saltDisplay = contentEl.createDiv('pairing-salt');
-    saltDisplay.createEl('small', {
-      text: `Salt: ${bytesToBase64(this.salt).slice(0, 16)}...`,
-      cls: 'salt-hint',
-    });
+    const infoBox = contentEl.createDiv('qr-placeholder');
+    infoBox.createEl('p', { text: 'Tell the other device:', cls: 'qr-text' });
+    const dl = infoBox.createEl('dl', { cls: 'connection-info' });
+    dl.createEl('dt', { text: 'IP address' });
+    dl.createEl('dd', { text: localIPs.length > 0 ? localIPs.join(' / ') : '(check network settings)' });
+    dl.createEl('dt', { text: 'Port' });
+    dl.createEl('dd', { text: String(port) });
+    dl.createEl('dt', { text: 'Salt' });
+    dl.createEl('dd', { text: saltStr, cls: 'mono' });
 
     contentEl.createEl('p', {
       text: 'Once the other device has entered the code, confirm pairing below.',
@@ -153,13 +155,23 @@ export class PairingModal extends Modal {
     const { contentEl } = this;
     contentEl.createEl('h2', { text: '⌨️ Enter the Code' });
     contentEl.createEl('p', {
-      text: 'Enter the 6-digit code shown on the other device.',
+      text: 'Enter the details shown on the other device.',
       cls: 'pairing-subtitle',
     });
 
     let code = '';
+    let deviceName = '';
     let ip = '';
+    let port = String(this.settings.syncPort);
     let saltBase64 = '';
+
+    new Setting(contentEl)
+      .setName('Device Name')
+      .setDesc('A friendly name for the other device')
+      .addText(t => {
+        t.setPlaceholder('My iPhone');
+        t.onChange(v => { deviceName = v; });
+      });
 
     new Setting(contentEl)
       .setName('Pairing Code')
@@ -173,18 +185,26 @@ export class PairingModal extends Modal {
 
     new Setting(contentEl)
       .setName('Other Device IP')
-      .setDesc('Local network IP (e.g. 192.168.1.42)')
+      .setDesc('Local network IP shown on the other device (e.g. 192.168.1.42)')
       .addText(t => {
         t.setPlaceholder('192.168.1.42');
-        t.onChange(v => { ip = v; });
+        t.onChange(v => { ip = v.trim(); });
       });
 
     new Setting(contentEl)
-      .setName('Salt (from other device)')
-      .setDesc('Base64 salt shown on other device')
+      .setName('Port')
+      .setDesc('Port shown on the other device')
+      .addText(t => {
+        t.setValue(port).setPlaceholder(String(this.settings.syncPort));
+        t.onChange(v => { port = v.trim(); });
+      });
+
+    new Setting(contentEl)
+      .setName('Salt')
+      .setDesc('Base64 salt shown on the other device')
       .addText(t => {
         t.setPlaceholder('base64 salt...');
-        t.onChange(v => { saltBase64 = v; });
+        t.onChange(v => { saltBase64 = v.trim(); });
       });
 
     const footer = contentEl.createDiv('pairing-footer');
@@ -198,17 +218,23 @@ export class PairingModal extends Modal {
           this.render();
           return;
         }
+        if (!ip) {
+          this.errorMessage = 'Please enter the other device\'s IP address.';
+          this.step = 'error';
+          this.render();
+          return;
+        }
         try {
           const salt = saltBase64 ? base64ToBytes(saltBase64) : this.salt;
           this.derivedKeyBase64 = await Encryption.deriveKey(code, salt);
-          // In a real implementation, we'd do a challenge-response here to verify
-          // the key matches before saving
           const device: PairedDevice = {
             deviceId: `device-${Date.now()}`,
-            deviceName: ip || 'Remote Device',
+            deviceName: deviceName || ip,
             encryptionKeyBase64: this.derivedKeyBase64,
             lastSyncHlc: null,
             lastSyncTime: null,
+            lastKnownIp: ip,
+            lastKnownPort: parseInt(port, 10) || this.settings.syncPort,
           };
           await this.onPaired(device);
           this.step = 'done';
@@ -250,9 +276,22 @@ export class PairingModal extends Modal {
       .onClick(() => { this.step = 'choose'; this.render(); });
   }
 
-  private getLocalIP(): string {
-    // In a real implementation, enumerate network interfaces
-    return '(check network settings)';
+  private getLocalIPs(): string[] {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const os = (globalThis as any).require('os');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ifaces = os.networkInterfaces() as Record<string, Array<any>>;
+      const ips: string[] = [];
+      for (const list of Object.values(ifaces)) {
+        for (const iface of list) {
+          if (iface.family === 'IPv4' && !iface.internal) ips.push(iface.address as string);
+        }
+      }
+      return ips;
+    } catch {
+      return [];
+    }
   }
 
   private injectStyles() {
@@ -274,8 +313,11 @@ export class PairingModal extends Modal {
       .code-digits { font-size: 2.5rem; font-weight: 700; letter-spacing: 0.15em; font-family: var(--font-monospace); }
       .code-hint { color: var(--text-muted); font-size: 0.85rem; margin: 0.5rem 0 0; }
       .qr-placeholder { background: var(--background-modifier-border); padding: 1rem; border-radius: 6px; margin: 0.75rem 0; text-align: center; }
-      .qr-text { font-family: var(--font-monospace); font-size: 0.75rem; word-break: break-all; }
-      .salt-hint { color: var(--text-faint); font-size: 0.7rem; }
+      .qr-text { font-size: 0.85rem; margin: 0 0 0.5rem; }
+      .connection-info { display: grid; grid-template-columns: auto 1fr; gap: 0.25rem 0.75rem; font-size: 0.85rem; margin: 0; }
+      .connection-info dt { color: var(--text-muted); font-weight: 600; }
+      .connection-info dd { margin: 0; font-family: var(--font-monospace); word-break: break-all; }
+      .mono { font-family: var(--font-monospace); font-size: 0.7rem; word-break: break-all; }
       .pairing-waiting { text-align: center; color: var(--text-muted); }
       .pairing-error { color: var(--color-red); }
       .pairing-footer { display: flex; gap: 0.75rem; margin-top: 1rem; justify-content: flex-end; }
