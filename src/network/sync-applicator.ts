@@ -37,10 +37,15 @@ export class SyncApplicator {
         await this.applyAction(action, localState, remoteState);
       }
     } finally {
-      // Always resume listening
-      this.opLogger.startListening();
-      // Clear pending ops — sync is complete
+      // Clear pending ops before resuming listeners so that vault events
+      // fired asynchronously by our writes (modify/create/delete) don't get
+      // re-logged as new pending changes after clearOps returns.
       await this.opLogger.clearOps();
+      // Yield to the event loop so Obsidian's async vault events from the
+      // writes above are dispatched and silently dropped (listeners are still
+      // off at this point), then re-attach.
+      await new Promise(resolve => setTimeout(resolve, 0));
+      this.opLogger.startListening();
     }
 
     // Update ancestor hashes for all synced files
@@ -53,10 +58,16 @@ export class SyncApplicator {
     remote: VaultState,
   ): Promise<void> {
     switch (action.type) {
-      case 'write_local':
+      case 'write_local': {
+        const hash = await hashContent(action.content);
         await this.writeLocalFile(action.path, action.content);
-        await this.contentStore.put(await hashContent(action.content), action.content);
+        await this.contentStore.put(hash, action.content);
+        // Keep the registry in sync so that if a vault modify event fires for
+        // this write after we resume listening, flushModify's hash-equality
+        // guard ("skip if content hasn't changed") will correctly suppress it.
+        await this.registry.updateContentHash(action.path, hash, action.hlc);
         break;
+      }
 
       case 'move_local':
         await this.moveLocalFile(action.fromPath, action.toPath);
