@@ -75,6 +75,9 @@ export class SyncApplicator {
 
       case 'delete_local':
         await this.deleteLocalFile(action.path);
+        // Tombstone in the registry so the propagated delete survives restarts
+        // and isn't re-detected as a local creation on the next reconcile.
+        await this.registry.markDeleted(action.path, this.hlc.now());
         break;
 
       case 'conflict': {

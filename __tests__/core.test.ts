@@ -168,10 +168,7 @@ describe('threeWayMerge', () => {
     expect(result.conflicts[0]!.remote).toContain('B_remote');
   });
 
-  // KNOWN FAILURE — merge-engine alignment bug (see docs/implementation-plan.md, Phase 1):
-  // two differing inserts at the same anchor are flagged as a conflict instead of unioned.
-  // Un-skip when the mergeFromDiffs alignment is reworked in P1.
-  test.skip('grocery store scenario: three devices append different items', () => {
+  test('grocery store scenario: three devices append different items', () => {
     const ancestor = '# Grocery List\n- Milk';
     const deviceA = '# Grocery List\n- Milk\n- Bread';
     const deviceB = '# Grocery List\n- Milk\n- Eggs';
@@ -193,10 +190,7 @@ describe('threeWayMerge', () => {
     expect(abcText).toContain('Butter');
   });
 
-  // KNOWN FAILURE — merge-engine alignment bug (see docs/implementation-plan.md, Phase 1):
-  // a one-sided line modification (delete+insert) vs the other side keeping that line is
-  // mis-aligned into a false delete-vs-keep conflict. Un-skip when reworked in P1.
-  test.skip('CRLF and LF are normalized (no spurious conflicts)', () => {
+  test('CRLF and LF are normalized (no spurious conflicts)', () => {
     const ancestor = 'a\r\nb\r\nc';
     const local = 'a\r\nB\r\nc';
     const remote = 'a\nb\nC';
@@ -271,6 +265,51 @@ describe('mergeVaultStates', () => {
 
     const { actions } = mergeVaultStates(local, remote);
     expect(actions).toContainEqual(expect.objectContaining({ type: 'no_op', fileId: 'file1' }));
+  });
+
+  test('local deleted, remote unchanged since ancestor → delete_remote', () => {
+    // Remote still holds the last-synced content (contentHash === ancestor),
+    // so local's deletion is clean and should propagate to remote.
+    const clockA = new HybridLogicalClock('A');
+    const clockB = new HybridLogicalClock('B');
+    const local = makeState('A', [{ id: 'file1', deleted: true, hlcTimestamp: clockA.now() }]);
+    const remote = makeState('B', [
+      { id: 'file1', contentHash: 'shared', ancestorContentHash: 'shared', hlcTimestamp: clockB.now() },
+    ]);
+
+    const { actions } = mergeVaultStates(local, remote);
+    expect(actions).toContainEqual(
+      expect.objectContaining({ type: 'delete_remote', fileId: 'file1' }),
+    );
+  });
+
+  test('remote deleted, local unchanged since ancestor → delete_local', () => {
+    const clockA = new HybridLogicalClock('A');
+    const clockB = new HybridLogicalClock('B');
+    const local = makeState('A', [
+      { id: 'file1', contentHash: 'shared', ancestorContentHash: 'shared', hlcTimestamp: clockA.now() },
+    ]);
+    const remote = makeState('B', [{ id: 'file1', deleted: true, hlcTimestamp: clockB.now() }]);
+
+    const { actions } = mergeVaultStates(local, remote);
+    expect(actions).toContainEqual(
+      expect.objectContaining({ type: 'delete_local', fileId: 'file1' }),
+    );
+  });
+
+  test('remote deleted, local edited since ancestor → delete_conflict', () => {
+    // Local diverged from the ancestor, so the delete is not clean — must ask.
+    const clockA = new HybridLogicalClock('A');
+    const clockB = new HybridLogicalClock('B');
+    const local = makeState('A', [
+      { id: 'file1', contentHash: 'edited', ancestorContentHash: 'shared', hlcTimestamp: clockA.now() },
+    ]);
+    const remote = makeState('B', [{ id: 'file1', deleted: true, hlcTimestamp: clockB.now() }]);
+
+    const { actions } = mergeVaultStates(local, remote);
+    expect(actions).toContainEqual(
+      expect.objectContaining({ type: 'delete_conflict', fileId: 'file1', side: 'remote_deleted' }),
+    );
   });
 
   test('local deleted, remote modified → delete_conflict', () => {

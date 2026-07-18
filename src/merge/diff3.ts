@@ -100,7 +100,7 @@ function patienceAnchors(
 function longestIncreasingSubsequence(pairs: Array<[number, number]>): Array<[number, number]> {
   if (pairs.length === 0) return [];
   const piles: Array<[number, number]> = [];
-  const prev: number[] = new Array(pairs.length).fill(-1);
+  const prev: number[] = new Array<number>(pairs.length).fill(-1);
   const pileTop: number[] = [];
 
   for (let i = 0; i < pairs.length; i++) {
@@ -138,7 +138,7 @@ function myersLCS(
   if (m === 0 || n === 0) return [];
 
   // DP table
-  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array<number>(n + 1).fill(0));
   for (let i = m - 1; i >= 0; i--) {
     for (let j = n - 1; j >= 0; j--) {
       if (aSlice[i] === bSlice[j]) dp[i]![j] = dp[i + 1]![j + 1]! + 1;
@@ -231,181 +231,155 @@ export function threeWayMerge(
   return mergeFromDiffs(ancestor, localDiff, remoteDiff);
 }
 
-type Region =
-  | { type: 'equal'; lines: string[] }
-  | { type: 'local'; lines: string[] }
-  | { type: 'remote'; lines: string[] }
-  | { type: 'conflict'; local: string[]; remote: string[]; ancestor: string[] };
+/**
+ * A hunk is a contiguous change against the ancestor spine: ancestor lines
+ * [ancStart, ancEnd) are replaced by `lines`. A *pure insertion* is a
+ * zero-width hunk (ancStart === ancEnd) that adds `lines` at that gap without
+ * removing any ancestor line.
+ */
+interface Hunk {
+  ancStart: number;
+  ancEnd: number;
+  lines: string[];
+}
+
+/**
+ * Decompose a diff (ancestor → variant) into hunks against the ancestor spine.
+ * Kept ("equal") lines are the gaps between hunks; a delete+insert at the same
+ * anchor coalesces into one replacement hunk, and a bare insert becomes a
+ * zero-width hunk. This coupling is what lets the merge tell an *append* (pure
+ * insert) apart from a *modification* (insert bound to a deletion).
+ */
+function toHunks(diff: DiffOp[]): Hunk[] {
+  const hunks: Hunk[] = [];
+  let ai = 0;
+  let cur: Hunk | null = null;
+  for (const op of diff) {
+    if (op.type === 'equal') {
+      if (cur) { hunks.push(cur); cur = null; }
+      ai += op.lines.length;
+    } else if (op.type === 'delete') {
+      if (!cur) cur = { ancStart: ai, ancEnd: ai, lines: [] };
+      ai += op.lines.length;
+      cur.ancEnd = ai;
+    } else {
+      // insert — attach to the current change (or open a zero-width one)
+      if (!cur) cur = { ancStart: ai, ancEnd: ai, lines: [] };
+      cur.lines.push(...op.lines);
+    }
+  }
+  if (cur) hunks.push(cur);
+  return hunks;
+}
+
+/** A zero-width hunk deletes no ancestor line — it is a pure insertion. */
+function isInsert(h: Hunk): boolean {
+  return h.ancStart === h.ancEnd;
+}
+
+function sameLines(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+
+/**
+ * Do two hunks have to be classified jointly?
+ *  - their replaced ancestor ranges overlap (both touched the same line), or
+ *  - both are pure inserts at the same gap (concurrent appends — unioned, not
+ *    conflicted), or
+ *  - one is a pure insert landing strictly inside the other's replaced range.
+ * Adjacent hunks (one ends where the next begins) do NOT interact — they are
+ * independent one-sided edits.
+ */
+function hunksInteract(a: Hunk, b: Hunk): boolean {
+  if (Math.max(a.ancStart, b.ancStart) < Math.min(a.ancEnd, b.ancEnd)) return true;
+  if (isInsert(a) && isInsert(b) && a.ancStart === b.ancStart) return true;
+  if (isInsert(a) && !isInsert(b) && b.ancStart < a.ancStart && a.ancStart < b.ancEnd) return true;
+  if (isInsert(b) && !isInsert(a) && a.ancStart < b.ancStart && b.ancStart < a.ancEnd) return true;
+  return false;
+}
 
 function mergeFromDiffs(
   ancestor: string[],
   localDiff: DiffOp[],
   remoteDiff: DiffOp[],
 ): ThreeWayMergeResult {
-  // Build a sequence of regions from the ancestor's perspective
-  const regions: Region[] = [];
+  const N = ancestor.length;
+  const local = toHunks(localDiff);
+  const remote = toHunks(remoteDiff);
 
-  // Flatten diffs into aligned chunks using ancestor as spine
-  const localChunks = expandDiff(ancestor, localDiff);
-  const remoteChunks = expandDiff(ancestor, remoteDiff);
+  const merged: string[] = [];
+  const conflicts: ConflictChunk[] = [];
+  let li = 0, ri = 0, pos = 0;
 
-  // Walk ancestor positions, emitting regions
-  let li = 0, ri = 0;
+  const emitEqual = (from: number, to: number) => {
+    for (let k = from; k < to; k++) merged.push(ancestor[k]!);
+  };
 
-  while (li < localChunks.length || ri < remoteChunks.length) {
-    const lc = localChunks[li];
-    const rc = remoteChunks[ri];
+  while (li < local.length || ri < remote.length) {
+    const lh = local[li];
+    const rh = remote[ri];
+    const lStart = lh ? lh.ancStart : Infinity;
+    const rStart = rh ? rh.ancStart : Infinity;
 
-    if (!lc && !rc) break;
+    // Emit the unchanged ancestor lines that precede the next change.
+    const nextChange = Math.min(lStart, rStart);
+    if (pos < nextChange) {
+      emitEqual(pos, nextChange);
+      pos = nextChange;
+    }
 
-    // Both at same ancestor position — equal on both sides
-    if (lc?.anchorIdx === rc?.anchorIdx && lc?.type === 'keep' && rc?.type === 'keep') {
-      appendRegion(regions, { type: 'equal', lines: [lc.line] });
+    if (lh && rh && hunksInteract(lh, rh)) {
+      if (isInsert(lh) && isInsert(rh) && lh.ancStart === rh.ancStart) {
+        // Concurrent appends at the same gap — union (dedup if identical).
+        if (sameLines(lh.lines, rh.lines)) merged.push(...lh.lines);
+        else merged.push(...lh.lines, ...rh.lines);
+      } else if (sameLines(lh.lines, rh.lines)) {
+        // Both made the identical change — clean.
+        merged.push(...lh.lines);
+        pos = Math.max(pos, lh.ancEnd, rh.ancEnd);
+      } else {
+        // Overlapping, divergent edits — a genuine conflict.
+        const ancLines = ancestor.slice(
+          Math.min(lh.ancStart, rh.ancStart),
+          Math.max(lh.ancEnd, rh.ancEnd),
+        );
+        const start = merged.length;
+        merged.push(...lh.lines);  // local as placeholder in the merged text
+        conflicts.push({
+          startLine: start,
+          endLine: merged.length - 1,
+          ancestor: ancLines,
+          local: lh.lines,
+          remote: rh.lines,
+        });
+        pos = Math.max(pos, lh.ancEnd, rh.ancEnd);
+      }
       li++; ri++;
       continue;
     }
 
-    // Collect run of inserts from local
-    const localInserts: string[] = [];
-    while (li < localChunks.length && localChunks[li]!.type === 'insert') {
-      localInserts.push(localChunks[li]!.line);
-      li++;
-    }
+    // Non-interacting: emit the earlier hunk as a one-sided change. At a tie,
+    // a pure insert goes first so it lands before the following line's edit.
+    let takeLocal: boolean;
+    if (lStart !== rStart) takeLocal = lStart < rStart;
+    else if (isInsert(lh!) !== isInsert(rh!)) takeLocal = isInsert(lh!);
+    else takeLocal = true;
 
-    // Collect run of inserts from remote
-    const remoteInserts: string[] = [];
-    while (ri < remoteChunks.length && remoteChunks[ri]!.type === 'insert') {
-      remoteInserts.push(remoteChunks[ri]!.line);
+    if (takeLocal) {
+      merged.push(...lh!.lines);
+      pos = Math.max(pos, lh!.ancEnd);
+      li++;
+    } else {
+      merged.push(...rh!.lines);
+      pos = Math.max(pos, rh!.ancEnd);
       ri++;
     }
-
-    if (localInserts.length > 0 && remoteInserts.length > 0) {
-      // Both inserted — true conflict if different content
-      if (JSON.stringify(localInserts) !== JSON.stringify(remoteInserts)) {
-        regions.push({ type: 'conflict', local: localInserts, remote: remoteInserts, ancestor: [] });
-      } else {
-        appendRegion(regions, { type: 'equal', lines: localInserts });
-      }
-    } else if (localInserts.length > 0) {
-      appendRegion(regions, { type: 'local', lines: localInserts });
-    } else if (remoteInserts.length > 0) {
-      appendRegion(regions, { type: 'remote', lines: remoteInserts });
-    }
-
-    // Now handle deletions and keeps at the current ancestor position
-    const lKeep = localChunks[li];
-    const rKeep = remoteChunks[ri];
-
-    if (!lKeep && !rKeep) break;
-
-    if (lKeep?.anchorIdx !== rKeep?.anchorIdx) break; // alignment issue, bail
-
-    if (lKeep?.type === 'keep' && rKeep?.type === 'keep') {
-      appendRegion(regions, { type: 'equal', lines: [lKeep.line] });
-      li++; ri++;
-    } else if (lKeep?.type === 'delete' && rKeep?.type === 'delete') {
-      // Both deleted — no conflict
-      li++; ri++;
-    } else if (lKeep?.type === 'delete' && rKeep?.type === 'keep') {
-      // Local deleted, remote kept — local wins (it's an explicit deletion)
-      // Actually this IS a conflict: remote wants to keep, local deleted
-      regions.push({ type: 'conflict', local: [], remote: [rKeep.line], ancestor: [lKeep.line] });
-      li++; ri++;
-    } else if (lKeep?.type === 'keep' && rKeep?.type === 'delete') {
-      regions.push({ type: 'conflict', local: [lKeep.line], remote: [], ancestor: [rKeep.line] });
-      li++; ri++;
-    }
   }
 
-  // Merge adjacent conflicts
-  const mergedRegions = mergeAdjacentConflicts(regions);
-
-  // Build output
-  const merged: string[] = [];
-  const conflicts: ConflictChunk[] = [];
-  let lineOffset = 0;
-
-  for (const region of mergedRegions) {
-    if (region.type === 'equal') {
-      merged.push(...region.lines);
-      lineOffset += region.lines.length;
-    } else if (region.type === 'local') {
-      merged.push(...region.lines);
-      lineOffset += region.lines.length;
-    } else if (region.type === 'remote') {
-      merged.push(...region.lines);
-      lineOffset += region.lines.length;
-    } else {
-      // Conflict — use local as placeholder
-      const start = lineOffset;
-      merged.push(...region.local);
-      const end = lineOffset + region.local.length - 1;
-      lineOffset += region.local.length;
-      conflicts.push({
-        startLine: start,
-        endLine: end,
-        ancestor: region.ancestor,
-        local: region.local,
-        remote: region.remote,
-      });
-    }
-  }
+  // Trailing unchanged ancestor lines.
+  if (pos < N) emitEqual(pos, N);
 
   return { merged, conflicts, hasConflicts: conflicts.length > 0 };
-}
-
-interface ExpandedLine {
-  type: 'keep' | 'delete' | 'insert';
-  line: string;
-  anchorIdx: number;  // index in ancestor (for inserts, the preceding anchor idx)
-}
-
-function expandDiff(ancestor: string[], diff: DiffOp[]): ExpandedLine[] {
-  const result: ExpandedLine[] = [];
-  let ai = 0;
-  for (const op of diff) {
-    if (op.type === 'equal') {
-      for (const line of op.lines) {
-        result.push({ type: 'keep', line, anchorIdx: ai });
-        ai++;
-      }
-    } else if (op.type === 'delete') {
-      for (const line of op.lines) {
-        result.push({ type: 'delete', line, anchorIdx: ai });
-        ai++;
-      }
-    } else {
-      // insert: associate with preceding ancestor position
-      for (const line of op.lines) {
-        result.push({ type: 'insert', line, anchorIdx: ai });
-      }
-    }
-  }
-  return result;
-}
-
-function appendRegion(regions: Region[], region: Region): void {
-  const last = regions[regions.length - 1];
-  if (last && last.type === region.type && region.type !== 'conflict') {
-    (last as any).lines.push(...(region as any).lines);
-  } else {
-    regions.push(region);
-  }
-}
-
-function mergeAdjacentConflicts(regions: Region[]): Region[] {
-  const result: Region[] = [];
-  for (const r of regions) {
-    const last = result[result.length - 1];
-    if (last?.type === 'conflict' && r.type === 'conflict') {
-      last.local.push(...r.local);
-      last.remote.push(...r.remote);
-      last.ancestor.push(...r.ancestor);
-    } else {
-      result.push(r);
-    }
-  }
-  return result;
 }
 
 function normalizeLines(text: string): string[] {
@@ -421,7 +395,7 @@ export function applyConflictResolutions(
   const lines = [...mergeResult.merged];
   // Apply resolutions in reverse order to preserve line indices
   const sorted = Array.from(resolutions.entries()).sort((a, b) => b[0] - a[0]);
-  for (const [idx, chunk] of sorted) {
+  for (const [, chunk] of sorted) {
     const resolved = getResolutionLines(chunk);
     lines.splice(chunk.startLine, chunk.local.length, ...resolved);
   }

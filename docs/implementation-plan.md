@@ -113,6 +113,33 @@ Fix merge bugs the server model inherits unchanged. Independent of transport —
 **Exit:** deletions converge across devices; delete/modify conflicts prompt correctly; the two
 skipped merge tests are un-skipped and pass; tests cover the new delete cases.
 
+**Status (2026-07-19): DONE.**
+- **Deletion propagation** (`merge/state-merge.ts`) — added an ancestor check
+  (`isUnchangedSinceAncestor`): a one-sided delete against a surviving side that still matches the
+  shared ancestor now emits `delete_remote` / `delete_local` instead of always `delete_conflict`.
+  A null ancestor (never synced) or a diverged surviving side still yields `delete_conflict`.
+  Convergence is by symmetry — the deleter emits `delete_remote` (a no-op marker for its own
+  applicator) while the peer independently computes `delete_local` and removes the file (same
+  pattern as `send_remote`/`write_local`).
+- **Applicator** (`network/sync-applicator.ts`) — the previously-unreachable `delete_local` case is
+  now reached; it also `markDeleted()`s the registry so the propagated delete survives restarts and
+  isn't re-detected as a fresh local creation on the next reconcile.
+- **Real `ask` delete-conflict modal** (`main.ts`) — replaced the auto-restore Notice with a
+  `DeleteConflictModal` (Keep modified / Keep deleted; dismiss defaults to restore, so no edit is
+  lost). `keep_deleted` / `keep_modified` strategies still short-circuit without prompting.
+- **`mergeFromDiffs` reworked** (`merge/diff3.ts`) — replaced the expanded-line/region walker with a
+  **hunk-based three-way merge**. Each diff decomposes into hunks (`[ancStart, ancEnd)` replaced by
+  lines; a pure insert is a zero-width hunk). Two hunks are classified jointly only when their
+  ancestor ranges overlap or both are pure inserts at the same gap. This fixes both bugs: concurrent
+  appends at the same anchor **union** (grocery scenario) instead of conflicting, while a
+  both-modified-the-same-line edit still conflicts; and a one-sided line modification vs. the other
+  side keeping the line no longer mis-aligns into a false delete-vs-keep conflict (CRLF test).
+- **Tests — green, 26 pass / 0 skip.** The two `test.skip` merge tests are un-skipped and pass;
+  added `delete_remote` / `delete_local` / delete-vs-edit `delete_conflict` cases to `state-merge`.
+- **Lint** — `diff3.ts` and `state-merge.ts` are now clean; `main.ts` UI-guideline churn
+  (sentence-case, `<style>` injection) stays deferred to **P4**, and `conflict-modal.ts` lint to its
+  P1/P4 UI pass. CI `lint` remains advisory until those land.
+
 ---
 
 ## Phase 2 — Crypto envelope & re-keying  🔴 (client-only)

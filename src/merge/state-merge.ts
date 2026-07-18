@@ -85,13 +85,23 @@ function classifyAndResolve(
     return { type: 'no_op', fileId };
   }
 
-  // ── Delete/modify conflicts ──────────────────────────────────────────────
+  // ── One side deleted ─────────────────────────────────────────────────────
+  // A *clean* one-sided delete: the surviving side has not touched the file
+  // since the last common sync (its content still matches the shared ancestor),
+  // so the deletion propagates without asking. If the surviving side changed
+  // the file, it's a genuine delete/modify conflict.
   if (le.deleted && !re.deleted) {
+    if (isUnchangedSinceAncestor(re)) {
+      return { type: 'delete_remote', fileId, path: re.path };
+    }
     const content = remote.contentStore.get(re.contentHash) ?? new Uint8Array();
     return { type: 'delete_conflict', fileId, path: re.path, side: 'local_deleted', content };
   }
 
   if (!le.deleted && re.deleted) {
+    if (isUnchangedSinceAncestor(le)) {
+      return { type: 'delete_local', fileId, path: le.path };
+    }
     const content = local.contentStore.get(le.contentHash) ?? new Uint8Array();
     return { type: 'delete_conflict', fileId, path: le.path, side: 'remote_deleted', content };
   }
@@ -176,6 +186,17 @@ function resolveRenameConflict(fileId: string, le: FileEntry, re: FileEntry): Me
   } else {
     return { type: 'move_local', fileId, fromPath: le.path, toPath: re.path };
   }
+}
+
+/**
+ * Has this entry been left untouched since the last common sync? True only when
+ * we have a recorded ancestor hash and the current content still equals it — the
+ * signal that the *other* side's deletion can be applied cleanly rather than
+ * surfaced as a delete/modify conflict. A null ancestor (never synced) is treated
+ * as "changed" so we err toward asking.
+ */
+function isUnchangedSinceAncestor(entry: FileEntry): boolean {
+  return entry.ancestorContentHash !== null && entry.contentHash === entry.ancestorContentHash;
 }
 
 /** Heuristic binary detection: check for null bytes in the first 8KB. */
