@@ -28,7 +28,7 @@ export class FileRegistry {
   async load(): Promise<void> {
     try {
       const raw = await this.app.vault.adapter.read(REGISTRY_PATH);
-      const data: SerializedRegistry = JSON.parse(raw);
+      const data = JSON.parse(raw) as SerializedRegistry;
       this.entries = new Map(data.entries);
       this.rebuildPathIndex();
     } catch {

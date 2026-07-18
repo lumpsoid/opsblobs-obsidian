@@ -98,8 +98,8 @@ export function hlcFromString(s: string): HLC {
   if (parts.length < 3) throw new Error(`Invalid HLC string: ${s}`);
   // deviceId may contain hyphens; everything from index 2 onward is the deviceId
   return {
-    wallTime: parseInt(parts[0], 10),
-    counter: parseInt(parts[1], 10),
+    wallTime: parseInt(parts[0]!, 10),
+    counter: parseInt(parts[1]!, 10),
     deviceId: parts.slice(2).join('-'),
   };
 }

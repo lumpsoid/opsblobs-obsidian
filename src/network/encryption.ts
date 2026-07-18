@@ -69,9 +69,9 @@ export class Encryption {
       plaintext,
     );
     // Prepend nonce to ciphertext for transport
-    const combined = new Uint8Array(nonce.length + (ciphertext as ArrayBuffer).byteLength);
+    const combined = new Uint8Array(nonce.length + ciphertext.byteLength);
     combined.set(nonce, 0);
-    combined.set(new Uint8Array(ciphertext as ArrayBuffer), nonce.length);
+    combined.set(new Uint8Array(ciphertext), nonce.length);
     return bytesToBase64(combined);
   }
 
@@ -104,7 +104,7 @@ export class Encryption {
 
 export function bytesToBase64(bytes: Uint8Array): string {
   let binary = '';
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!);
   return btoa(binary);
 }
 
@@ -119,7 +119,7 @@ export function base64ToBytes(b64: string): Uint8Array {
 export function generatePairingCode(): string {
   const arr = new Uint32Array(1);
   crypto.getRandomValues(arr);
-  return (arr[0] % 1_000_000).toString().padStart(6, '0');
+  return (arr[0]! % 1_000_000).toString().padStart(6, '0');
 }
 
 /** Generate a random pairing salt (16 bytes). */

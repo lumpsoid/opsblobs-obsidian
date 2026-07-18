@@ -54,7 +54,7 @@ function diffRecurse(
   let prevAi = aLo, prevBi = bLo;
   for (const [ai, bi] of anchors) {
     diffRecurse(a, prevAi, ai, b, prevBi, bi, ops);
-    ops.push({ type: 'equal', lines: [a[ai]] });
+    ops.push({ type: 'equal', lines: [a[ai]!] });
     prevAi = ai + 1;
     prevBi = bi + 1;
   }
@@ -71,14 +71,14 @@ function patienceAnchors(
   const bCount = new Map<string, number[]>();
 
   for (let i = aLo; i < aHi; i++) {
-    const indices = aCount.get(a[i]) ?? [];
+    const indices = aCount.get(a[i]!) ?? [];
     indices.push(i);
-    aCount.set(a[i], indices);
+    aCount.set(a[i]!, indices);
   }
   for (let i = bLo; i < bHi; i++) {
-    const indices = bCount.get(b[i]) ?? [];
+    const indices = bCount.get(b[i]!) ?? [];
     indices.push(i);
-    bCount.set(b[i], indices);
+    bCount.set(b[i]!, indices);
   }
 
   // Collect unique lines that appear exactly once in both
@@ -86,7 +86,7 @@ function patienceAnchors(
   for (const [line, aIdxs] of aCount) {
     const bIdxs = bCount.get(line);
     if (aIdxs.length === 1 && bIdxs && bIdxs.length === 1) {
-      pairs.push([aIdxs[0], bIdxs[0]]);
+      pairs.push([aIdxs[0]!, bIdxs[0]!]);
     }
   }
 
@@ -104,25 +104,25 @@ function longestIncreasingSubsequence(pairs: Array<[number, number]>): Array<[nu
   const pileTop: number[] = [];
 
   for (let i = 0; i < pairs.length; i++) {
-    const bVal = pairs[i][1];
+    const bVal = pairs[i]![1];
     let lo = 0, hi = piles.length;
     while (lo < hi) {
       const mid = (lo + hi) >> 1;
-      if (piles[pileTop[mid]][1] < bVal) lo = mid + 1;
+      if (piles[pileTop[mid]!]![1] < bVal) lo = mid + 1;
       else hi = mid;
     }
-    if (lo > 0) prev[i] = pileTop[lo - 1];
+    if (lo > 0) prev[i] = pileTop[lo - 1]!;
     pileTop[lo] = i;
-    if (lo === piles.length) piles.push(pairs[i]);
-    else piles[lo] = pairs[i];
+    if (lo === piles.length) piles.push(pairs[i]!);
+    else piles[lo] = pairs[i]!;
   }
 
   // Reconstruct
   const result: Array<[number, number]> = [];
-  let k = pileTop[piles.length - 1];
+  let k = pileTop[piles.length - 1]!;
   while (k !== -1) {
-    result.unshift(pairs[k]);
-    k = prev[k];
+    result.unshift(pairs[k]!);
+    k = prev[k]!;
   }
   return result;
 }
@@ -141,8 +141,8 @@ function myersLCS(
   const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
   for (let i = m - 1; i >= 0; i--) {
     for (let j = n - 1; j >= 0; j--) {
-      if (aSlice[i] === bSlice[j]) dp[i][j] = dp[i + 1][j + 1] + 1;
-      else dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+      if (aSlice[i] === bSlice[j]) dp[i]![j] = dp[i + 1]![j + 1]! + 1;
+      else dp[i]![j] = Math.max(dp[i + 1]![j]!, dp[i]![j + 1]!);
     }
   }
 
@@ -152,7 +152,7 @@ function myersLCS(
     if (aSlice[i] === bSlice[j]) {
       lcs.push([aLo + i, bLo + j]);
       i++; j++;
-    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+    } else if (dp[i + 1]![j]! >= dp[i]![j + 1]!) {
       i++;
     } else {
       j++;
@@ -171,7 +171,7 @@ function emitFromLCS(
   for (const [la, lb] of lcs) {
     if (ai < la) ops.push({ type: 'delete', lines: a.slice(ai, la) });
     if (bi < lb) ops.push({ type: 'insert', lines: b.slice(bi, lb) });
-    ops.push({ type: 'equal', lines: [a[la]] });
+    ops.push({ type: 'equal', lines: [a[la]!] });
     ai = la + 1;
     bi = lb + 1;
   }
@@ -267,15 +267,15 @@ function mergeFromDiffs(
 
     // Collect run of inserts from local
     const localInserts: string[] = [];
-    while (li < localChunks.length && localChunks[li].type === 'insert') {
-      localInserts.push(localChunks[li].line);
+    while (li < localChunks.length && localChunks[li]!.type === 'insert') {
+      localInserts.push(localChunks[li]!.line);
       li++;
     }
 
     // Collect run of inserts from remote
     const remoteInserts: string[] = [];
-    while (ri < remoteChunks.length && remoteChunks[ri].type === 'insert') {
-      remoteInserts.push(remoteChunks[ri].line);
+    while (ri < remoteChunks.length && remoteChunks[ri]!.type === 'insert') {
+      remoteInserts.push(remoteChunks[ri]!.line);
       ri++;
     }
 

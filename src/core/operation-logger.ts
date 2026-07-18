@@ -7,7 +7,7 @@
 //  Debounces rapid saves so only one operation is recorded per logical edit.
 
 import { App, TFile, normalizePath } from 'obsidian';
-import { Operation, OperationType } from '../types';
+import { Operation } from '../types';
 import { HybridLogicalClock } from './hlc';
 import { FileRegistry } from './file-registry';
 import { ContentStore, hashContent } from './content-store';
@@ -33,7 +33,7 @@ export class OperationLogger {
   async load(): Promise<void> {
     try {
       const raw = await this.app.vault.adapter.read(OPLOG_PATH);
-      this.pendingOps = JSON.parse(raw);
+      this.pendingOps = JSON.parse(raw) as Operation[];
     } catch {
       this.pendingOps = [];
     }
@@ -41,16 +41,16 @@ export class OperationLogger {
 
   startListening(): void {
     const onCreate = this.app.vault.on('create', file => {
-      if (file instanceof TFile) this.handleCreate(file);
+      if (file instanceof TFile) void this.handleCreate(file);
     });
     const onModify = this.app.vault.on('modify', file => {
-      if (file instanceof TFile) this.handleModify(file);
+      if (file instanceof TFile) void this.handleModify(file);
     });
     const onDelete = this.app.vault.on('delete', file => {
-      if (file instanceof TFile) this.handleDelete(file);
+      if (file instanceof TFile) void this.handleDelete(file);
     });
     const onRename = this.app.vault.on('rename', (file, oldPath) => {
-      if (file instanceof TFile) this.handleRename(file, oldPath);
+      if (file instanceof TFile) void this.handleRename(file, oldPath);
     });
 
     // Store removers so we can clean up on unload

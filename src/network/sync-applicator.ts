@@ -3,7 +3,7 @@
 //  Applies merge actions to the actual vault
 // ─────────────────────────────────────────────
 
-import { App, normalizePath } from 'obsidian';
+import { App, TFile, normalizePath } from 'obsidian';
 import { MergeAction, VaultState } from '../types';
 import { FileRegistry } from '../core/file-registry';
 import { ContentStore, hashContent } from '../core/content-store';
@@ -114,8 +114,8 @@ export class SyncApplicator {
     }
 
     const existing = this.app.vault.getAbstractFileByPath(normalized);
-    if (existing) {
-      await this.app.vault.modifyBinary(existing as any, content.buffer);
+    if (existing instanceof TFile) {
+      await this.app.vault.modifyBinary(existing, content.buffer);
     } else {
       await this.app.vault.createBinary(normalized, content.buffer);
     }
@@ -124,14 +124,14 @@ export class SyncApplicator {
   private async moveLocalFile(fromPath: string, toPath: string): Promise<void> {
     const file = this.app.vault.getAbstractFileByPath(normalizePath(fromPath));
     if (file) {
-      await this.app.fileManager.renameFile(file as any, normalizePath(toPath));
+      await this.app.fileManager.renameFile(file, normalizePath(toPath));
     }
   }
 
   private async deleteLocalFile(path: string): Promise<void> {
     const file = this.app.vault.getAbstractFileByPath(normalizePath(path));
     if (file) {
-      await this.app.vault.trash(file as any, true);
+      await this.app.vault.trash(file, true);
     }
   }
 

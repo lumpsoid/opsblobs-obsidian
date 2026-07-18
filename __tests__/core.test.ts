@@ -6,7 +6,7 @@ import { describe, test, expect, vi } from 'vitest';
 import { HybridLogicalClock, hlcCompare, hlcToString, hlcFromString } from '../src/core/hlc';
 import { diffLines, threeWayMerge } from '../src/merge/diff3';
 import { mergeVaultStates } from '../src/merge/state-merge';
-import { VaultState, FileEntry, HLC } from '../src/types';
+import { VaultState, FileEntry } from '../src/types';
 
 // ─── HLC Tests ────────────────────────────────────────────────────────────────
 
@@ -15,7 +15,7 @@ describe('HybridLogicalClock', () => {
     const clock = new HybridLogicalClock('device-a');
     const times = Array.from({ length: 100 }, () => clock.now());
     for (let i = 1; i < times.length; i++) {
-      expect(hlcCompare(times[i], times[i - 1])).toBeGreaterThan(0);
+      expect(hlcCompare(times[i]!, times[i - 1]!)).toBeGreaterThan(0);
     }
   });
 
@@ -61,7 +61,8 @@ describe('HybridLogicalClock', () => {
 
   test('commutativity: merge(A, merge(B, C)) == merge(B, merge(A, C))', () => {
     const clocks = ['a', 'b', 'c'].map(id => new HybridLogicalClock(id));
-    const [ta, tb, tc] = clocks.map(c => c.now());
+    const merged = clocks.map(c => c.now());
+    const ta = merged[0]!, tb = merged[1]!;
 
     const clockX = new HybridLogicalClock('x');
     clockX.merge(ta);
@@ -163,8 +164,8 @@ describe('threeWayMerge', () => {
     const result = threeWayMerge(ancestor, local, remote);
     expect(result.hasConflicts).toBe(true);
     expect(result.conflicts).toHaveLength(1);
-    expect(result.conflicts[0].local).toContain('B_local');
-    expect(result.conflicts[0].remote).toContain('B_remote');
+    expect(result.conflicts[0]!.local).toContain('B_local');
+    expect(result.conflicts[0]!.remote).toContain('B_remote');
   });
 
   // KNOWN FAILURE — merge-engine alignment bug (see docs/implementation-plan.md, Phase 1):

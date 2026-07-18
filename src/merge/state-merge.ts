@@ -8,7 +8,7 @@
 //  Commutative: merge(A, B) produces equivalent actions as merge(B, A).
 
 import { VaultState, FileEntry, MergeAction, StateMergeResult } from '../types';
-import { HybridLogicalClock, hlcCompare, hlcMax } from '../core/hlc';
+import { hlcCompare, hlcMax } from '../core/hlc';
 import { threeWayMerge } from './diff3';
 
 export function mergeVaultStates(local: VaultState, remote: VaultState): StateMergeResult {

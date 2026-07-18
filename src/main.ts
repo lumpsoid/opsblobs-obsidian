@@ -2,7 +2,7 @@
 //  Obsidian Vault Sync — Main Plugin Entry
 // ─────────────────────────────────────────────
 
-import { Plugin, Notice, Modal, addIcon } from 'obsidian';
+import { App, Plugin, Notice, Modal, addIcon } from 'obsidian';
 import { SyncSettings, DEFAULT_SETTINGS, VaultState } from './types';
 import { HybridLogicalClock } from './core/hlc';
 import { FileRegistry } from './core/file-registry';
@@ -358,7 +358,7 @@ export default class VaultSyncPlugin extends Plugin {
 
 class WaitingForConnectionModal extends Modal {
   constructor(
-    app: Parameters<typeof Modal['prototype']['constructor']>[0],
+    app: App,
     private ip: string,
     private port: number,
     private onCancel: () => void,
