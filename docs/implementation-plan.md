@@ -199,6 +199,41 @@ Build the client half of the API spec. This is the core of the pivot.
 
 **Exit:** a device syncs a full round (pull→merge→push) against the fake; cursor advances correctly.
 
+**Status (2026-07-19): DONE.**
+- **Pure orchestrator** (`src/network/server-sync.ts`) — no `obsidian` import, so the whole round
+  is unit-testable. Defines the `ServerApi` wire contract (the five §4–§5 endpoints + record
+  types), a `VaultSyncHost` interface abstracting the local vault
+  (registry/content-store/applicator), and `ServerSyncClient.runSync()`. A round is:
+  pull ops (loop `GET /ops?since` until drained, decrypt each `ciphertext` → `Operation`) →
+  reconstruct a remote projection → fetch referenced blobs → **push our pending ops** (blobs via
+  `blobs:check`+`PUT`, then `POST /ops`) → merge (`mergeVaultStates`) + apply → save cursor.
+- **HTTP transport + cursor** (`src/network/server-http.ts`) — `HttpServerApi` over Obsidian
+  `requestUrl` (mobile-safe), `Bearer` auth, `/v1/vaults/{vaultId}/…` paths, octet-stream blob
+  bodies, `throw:false` + explicit status handling (`StaleCursorError` on `409`, `null` on blob
+  `404`). `CursorStore` persists the scalar cursor at `.vault-sync/sync-cursor.json`.
+- **In-memory fake** (`src/network/fake-server.ts`) — `FakeSyncServer` implements `ServerApi` with
+  a monotonic `seq` oplog, idempotent append by `clientOpId`, a content-addressed blob store, and
+  `422` (`MissingBlobError`) when an append references an un-uploaded blob. Obsidian-free, so it
+  doubles as the P7 harness. Not imported by `main.ts` → tree-shaken from the plugin bundle.
+- **Key design calls:**
+  - *Push only locally-authored ops.* Merge-derived content (clean three-way merges) is **not**
+    pushed — every device that pulls the same source ops recomputes the identical result (the D1
+    CRDT-replay property). **Known gap:** a *user-resolved text conflict* is a fresh decision that
+    replay can't reproduce; making it emit an op is deferred (noted in code + here).
+  - *Persist the pull cursor, not `headCursor`.* Spec §7 step 6 says `cursor = headCursor`, but
+    that skips ops another device appended between our pull and our push (seq ∈ (pulled, head]).
+    We save the pulled cursor; our own just-pushed ops re-pull once next round and merge to a
+    no-op. Correctness over one extra decrypt.
+  - *Push before apply.* Ops land on the server before the applicator clears the local oplog; a
+    crash in between is safe because the append is idempotent by `clientOpId`.
+- **Tests — green, 10 new (`__tests__/server-sync.test.ts`), 52 total.** Cover `reconstructRemoteState`
+  (HLC last-writer, out-of-order, delete, empty), the fake (idempotent append, `422`, pull
+  pagination), and full rounds against the fake: A pushes → B pulls/merges/converges + cursor
+  advances 0→1; re-run doesn't double-append and settles the cursor; cross-device blob dedup via
+  `blobs:check`. Build + lint clean on all four new files.
+- **Deferred to P4:** the concrete `VaultSyncHost` bridging registry/content-store/applicator/
+  oplog and the settings that supply server URL + token + passphrase — that's the UI/wiring phase.
+
 ---
 
 ## Phase 4 — Settings, UI & wiring  🟡 (client-only)
