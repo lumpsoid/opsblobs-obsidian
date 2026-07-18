@@ -242,16 +242,10 @@ function mergeFromDiffs(
   localDiff: DiffOp[],
   remoteDiff: DiffOp[],
 ): ThreeWayMergeResult {
-  // Expand diffs into per-line annotations
-  type Annotation = 'keep' | 'local_add' | 'local_del' | 'remote_add' | 'remote_del';
-  interface AncestorLine { line: string; localState: 'keep' | 'delete'; remoteState: 'keep' | 'delete' }
-  interface InsertedLine { source: 'local' | 'remote'; line: string }
-
   // Build a sequence of regions from the ancestor's perspective
   const regions: Region[] = [];
 
   // Flatten diffs into aligned chunks using ancestor as spine
-  let ai = 0;
   const localChunks = expandDiff(ancestor, localDiff);
   const remoteChunks = expandDiff(ancestor, remoteDiff);
 

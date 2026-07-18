@@ -1,27 +1,35 @@
 {
-	"name": "obsidian-sample-plugin",
-    "version": "0.1.0",
-    "description": "Peer-to-peer vault sync for Obsidian with CRDT-based conflict resolution",
+	"name": "obsidian-vault-sync",
+	"version": "0.1.0",
+	"description": "End-to-end-encrypted vault sync for Obsidian with client-side CRDT conflict resolution",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+		"test": "vitest run",
+		"test:watch": "vitest",
 		"version": "node version-bump.mjs && git add manifest.json versions.json",
 		"lint": "eslint ."
 	},
-    "keywords": ["obsidian", "sync", "p2p", "crdt"],
+	"keywords": [
+		"obsidian",
+		"sync",
+		"e2e-encryption",
+		"crdt"
+	],
 	"license": "0-BSD",
 	"devDependencies": {
-		"@types/node": "^16.11.6",
+		"@eslint/js": "9.30.1",
+		"@types/node": "^20.11.0",
 		"esbuild": "0.25.5",
 		"eslint-plugin-obsidianmd": "0.1.9",
 		"globals": "14.0.0",
+		"jiti": "2.6.1",
 		"tslib": "2.4.0",
 		"typescript": "^5.8.3",
 		"typescript-eslint": "8.35.1",
-		"@eslint/js": "9.30.1",
-		"jiti": "2.6.1"
+		"vitest": "^4.1.10"
 	},
 	"dependencies": {
 		"obsidian": "latest"

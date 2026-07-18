@@ -3,7 +3,7 @@
 //  Phase 4.3
 // ─────────────────────────────────────────────
 
-import { App, Modal, ButtonComponent, MarkdownRenderer } from 'obsidian';
+import { App, Modal, ButtonComponent } from 'obsidian';
 import { ThreeWayMergeResult, ConflictChunk } from '../types';
 
 export class ConflictResolutionModal extends Modal {
