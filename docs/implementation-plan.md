@@ -158,6 +158,31 @@ Adapt `encryption.ts` from a pairing-code transport cipher to at-rest vault encr
 
 **Exit:** ops and blobs encrypt/decrypt under a passphrase-derived key; blob-key format decided and tested.
 
+**Status (2026-07-19): DONE.**
+- **New `VaultCrypto` class** (`src/network/encryption.ts`) added *alongside* the retired-in-P5
+  pairing `Encryption` class (kept so the build stays green until P5 deletes the P2P path).
+  Key chain: **PBKDF2-SHA256** (210k iters — tuned down from OWASP's 600k for the mobile
+  WebView target; ~1.5 bits of brute-force cost traded for ~3× faster unlock, negligible vs
+  passphrase entropy — with a per-vault salt) → 256-bit master →
+  **HKDF-Expand** into three domain-separated branches (distinct `info` labels): an AES-256-GCM
+  `encKey`, an HMAC-SHA256 `blindKey`, and a 128-bit verification tag. PBKDF2 runs once; HKDF
+  expansion is cheap, so sub-keys are independent without paying the KDF cost three times.
+- **Two envelopes** matching the spec: `encryptOp`/`decryptOp` (JSON → base64 `nonce‖AES-GCM`,
+  for the op `ciphertext` field) and `encryptBlob`/`decryptBlob` (raw bytes → raw bytes, binary-safe
+  for the `application/octet-stream` blob body).
+- **§9.1 hash blinding — DECIDED: HMAC-blinded.** `blindHash(rawHashHex)` =
+  `HMAC-SHA256(blindKey, hashHex)` as hex — the server-facing blob key. Dedup preserved
+  (same key → same HMAC across devices); server can't map a key back to known plaintext. The
+  plaintext SHA-256 stays the *local* content-store identity; blinding is applied only at the
+  transport boundary (wired in P3), so `content-store.ts` is unchanged this phase.
+- **Key verification** via `fingerprint()` — a deterministic HKDF branch disjoint from the
+  encryption key, so two devices confirm the same passphrase+salt before trusting data (surfaced
+  in the P4 settings UI).
+- **Tests — green, 16 new (`__tests__/crypto.test.ts`), 42 total.** Cover: op/blob round-trips
+  (binary, empty), random-nonce non-determinism, cross-key decrypt failure, GCM tamper detection,
+  blinding determinism + cross-device dedup + cross-vault unlinkability, fingerprint match/mismatch,
+  and not-ready guards. Build + lint clean on touched files.
+
 ---
 
 ## Phase 3 — Server transport client  🔴 (client-only, tested vs a fake server)
@@ -232,14 +257,15 @@ Implement [`server-api-spec.md`](server-api-spec.md).
 
 | Open question (spec §9) | Blocks | Leaning |
 |---|---|---|
-| Hash blinding (HMAC vs raw SHA-256) | **P2** (client) | HMAC-blinded |
+| ~~Hash blinding (HMAC vs raw SHA-256)~~ **DECIDED** | ~~P2~~ done | **HMAC-blinded** (shipped) |
 | Token / auth issuance | P6 (deploy) | — |
 | Stale-writer `409` policy | P6 | Always accept in v1 |
 | Checkpoints v1 vs v2 | P6/P7 | v2 |
 | Blob GC strategy | P6 | Checkpoint-driven |
 | Size / quota limits | P6 | — |
 
-Only **hash blinding** gates client work; the rest gate the server/deploy and can be settled during P6.
+Hash blinding (the only client-gating question) is **resolved** (HMAC-blinded, P2); the rest gate
+the server/deploy and can be settled during P6, so client work P3–P5 is unblocked.
 
 ---
 

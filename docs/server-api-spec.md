@@ -45,7 +45,7 @@ These are settled unless listed under [Open questions](#9-open-questions).
 | **deviceId** | Stable per-device ID (already exists in the plugin). Appears on op records for tie-breaking/debugging. |
 | **seq** | Server-assigned, strictly increasing integer per vault. Assigned at append time. |
 | **cursor** | A device's last-consumed `seq`. Persisted locally. `0` = "seen nothing". |
-| **hash** | Content address of a blob. See [D5] and §9 on whether this is a raw plaintext SHA-256 or a key-blinded HMAC. |
+| **hash** | Content address of a blob = `HMAC-SHA256(blindKey, plaintextSHA256Hex)` (hex). Key-blinded so the server can't fingerprint content against known plaintext; still dedups (see [D5], §9.1). |
 | **clientOpId** | Client-generated unique string per op, for idempotent append. |
 
 ---
@@ -224,8 +224,13 @@ same key yields the same HMAC across devices.
 
 ## 9. Open questions (need a call before server build)
 
-1. **Hash blinding.** Ship raw plaintext SHA-256 as the blob key (simpler, leaks a fingerprint),
-   or `HMAC(vaultKey, hash)` (stronger, still dedups)? *Leaning: HMAC-blinded.*
+1. **Hash blinding. — DECIDED (2026-07-19): HMAC-blinded.** The server-facing blob key is
+   `HMAC-SHA256(blindKey, plaintextHashHex)` as hex, where `blindKey` is an HKDF sub-key of the
+   vault key (domain-separated from the AES-GCM encryption key). Dedup is preserved (same key →
+   same HMAC across devices); the server can't map a blob key back to known plaintext. Implemented
+   client-side in `VaultCrypto.blindHash` (`src/network/encryption.ts`); the plaintext SHA-256
+   from `hashContent` remains the *local* content-store identity, blinded only at the transport
+   boundary (P3).
 2. **Token/auth issuance.** How does a device obtain its `Bearer` token — pre-shared vault secret
    exchanged out-of-band, an account system, or an admin-issued token? Separate from the
    E2E-content contract, but blocks a real deployment.
