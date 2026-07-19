@@ -4,7 +4,7 @@
 // ─────────────────────────────────────────────
 
 import { App, TFile, normalizePath } from 'obsidian';
-import { MergeAction, VaultState } from '../types';
+import { HLC, MergeAction, VaultState } from '../types';
 import { FileRegistry } from '../core/file-registry';
 import { ContentStore, hashContent } from '../core/content-store';
 import { OperationLogger } from '../core/operation-logger';
@@ -12,6 +12,14 @@ import { HybridLogicalClock } from '../core/hlc';
 
 export type ConflictHandler = (action: Extract<MergeAction, { type: 'conflict' }>) => Promise<Uint8Array | null>;
 export type DeleteConflictHandler = (action: Extract<MergeAction, { type: 'delete_conflict' }>) => Promise<'keep_deleted' | 'restore'>;
+
+/** A user-resolved conflict that must be re-emitted as an op so it replicates. */
+interface PendingResolution {
+  fileId: string;
+  path: string;
+  contentHash: string;
+  hlc: HLC;
+}
 
 export class SyncApplicator {
   constructor(
@@ -32,9 +40,15 @@ export class SyncApplicator {
     // Pause op logging while we apply sync changes (we don't want to re-log them)
     this.opLogger.stopListening();
 
+    // User-resolved conflicts are re-emitted as ops (below) so peers learn the
+    // resolution instead of diverging. Collected here and recorded only *after*
+    // clearOps, which would otherwise wipe them.
+    const resolutions: PendingResolution[] = [];
+
     try {
       for (const action of actions) {
-        await this.applyAction(action, localState, remoteState);
+        const resolved = await this.applyAction(action, localState, remoteState);
+        if (resolved) resolutions.push(resolved);
       }
     } finally {
       // Clear pending ops before resuming listeners so that vault events
@@ -50,13 +64,21 @@ export class SyncApplicator {
 
     // Update ancestor hashes for all synced files
     await this.updateAncestorHashes(actions, localState, remoteState);
+
+    // Persist the resolution ops now that the already-pushed pending log is
+    // clear — they become pending for the next round and replicate the manual
+    // resolution to peers. The registry was already updated to the resolved
+    // hash during apply, so the resumed modify listener suppresses the echo.
+    for (const r of resolutions) {
+      await this.opLogger.recordResolvedUpdate(r.fileId, r.path, r.contentHash, r.hlc);
+    }
   }
 
   private async applyAction(
     action: MergeAction,
     local: VaultState,
     remote: VaultState,
-  ): Promise<void> {
+  ): Promise<PendingResolution | null> {
     switch (action.type) {
       case 'write_local': {
         const hash = await hashContent(action.content);
@@ -66,27 +88,37 @@ export class SyncApplicator {
         // this write after we resume listening, flushModify's hash-equality
         // guard ("skip if content hasn't changed") will correctly suppress it.
         await this.registry.updateContentHash(action.path, hash, action.hlc);
-        break;
+        return null;
       }
 
       case 'move_local':
         await this.moveLocalFile(action.fromPath, action.toPath);
-        break;
+        return null;
 
       case 'delete_local':
         await this.deleteLocalFile(action.path);
         // Tombstone in the registry so the propagated delete survives restarts
         // and isn't re-detected as a local creation on the next reconcile.
         await this.registry.markDeleted(action.path, this.hlc.now());
-        break;
+        return null;
 
       case 'conflict': {
         const resolved = await this.onConflict(action);
-        if (resolved) {
-          await this.writeLocalFile(action.localPath, resolved);
-          await this.contentStore.put(await hashContent(resolved), resolved);
-        }
-        break;
+        if (!resolved) return null;
+        // The resolution is a fresh decision the CRDT replay can't reproduce, so
+        // it must become its own op. Timestamp it *now*: runSync has already
+        // advanced the clock past the merged HLC, so this dominates the remote
+        // content it supersedes and wins last-writer-wins on peers.
+        const hlcTs = this.hlc.now();
+        const hash = await hashContent(resolved);
+        await this.writeLocalFile(action.localPath, resolved);
+        await this.contentStore.put(hash, resolved);
+        // Advance the registry to the resolved content (mirrors write_local's
+        // echo-suppression) and record it as the new synced ancestor — this
+        // resolution is the base future three-way merges align against.
+        await this.registry.updateContentHash(action.localPath, hash, hlcTs);
+        await this.registry.setAncestorHash(action.fileId, hash);
+        return { fileId: action.fileId, path: action.localPath, contentHash: hash, hlc: hlcTs };
       }
 
       case 'delete_conflict': {
@@ -96,14 +128,14 @@ export class SyncApplicator {
           await this.contentStore.put(await hashContent(action.content), action.content);
         }
         // 'keep_deleted' — do nothing
-        break;
+        return null;
       }
 
       case 'send_remote':
       case 'delete_remote':
       case 'no_op':
         // These are handled by the transport layer, not the applicator
-        break;
+        return null;
     }
   }
 

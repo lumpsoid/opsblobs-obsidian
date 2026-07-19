@@ -121,8 +121,9 @@ export class ServerSyncClient {
    * We push only *locally-authored* ops. Merge-derived content (clean three-way
    * merges) is not pushed: every device that pulls the same source ops recomputes
    * the identical result (the D1 CRDT-replay property), so an op for it would be
-   * redundant. (User-resolved text conflicts are the one case this does not yet
-   * cover — a follow-up, tracked in the plan.)
+   * redundant. The one exception is a *user-resolved* text conflict — a fresh
+   * decision replay can't reproduce; the applicator re-emits it as an op (see
+   * SyncApplicator's `conflict` case) so it replicates like any other edit.
    */
   async runSync(): Promise<void> {
     if (!this.crypto.isReady()) throw new Error('Vault key not derived');
@@ -148,8 +149,13 @@ export class ServerSyncClient {
     // ── 4. Merge remote into local and apply ─────────────────────────────────
     this.onProgress?.('Merging…');
     const merge = mergeVaultStates(local, remote);
-    await this.host.applyMerge(merge.actions, local, remote);
+    // Advance the clock past the merged HLC *before* applying: a user-resolved
+    // conflict mints an op inside applyMerge, and it must dominate the remote
+    // content it supersedes so peers accept the resolution (last-writer-wins)
+    // rather than re-conflicting. Doing this after apply would let the
+    // resolution be timestamped below the remote it resolves.
     this.hlc.setCurrent(merge.mergedHlc);
+    await this.host.applyMerge(merge.actions, local, remote);
 
     // ── 5. Advance the cursor past everything we consumed ────────────────────
     // Persist the *pull* cursor, not the append's headCursor: another device may

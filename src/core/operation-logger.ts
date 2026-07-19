@@ -7,7 +7,7 @@
 //  Debounces rapid saves so only one operation is recorded per logical edit.
 
 import { App, TFile, normalizePath } from 'obsidian';
-import { Operation } from '../types';
+import { HLC, Operation } from '../types';
 import { HybridLogicalClock } from './hlc';
 import { FileRegistry } from './file-registry';
 import { ContentStore, hashContent } from './content-store';
@@ -190,6 +190,30 @@ export class OperationLogger {
   async clearOps(): Promise<void> {
     this.pendingOps = [];
     await this.saveOpLog();
+  }
+
+  /**
+   * Record an `update` op for content produced by sync itself — specifically a
+   * user-resolved merge conflict. Ordinary edits are captured through vault
+   * events, but a conflict is resolved *while listeners are paused* and the
+   * pending log is then cleared, so the resolution would otherwise never become
+   * an op and never reach peers (they'd keep their own version and diverge).
+   *
+   * Call this *after* the applicator has cleared the already-pushed pending ops,
+   * so the resolution survives as a fresh pending op for the next round. The
+   * caller supplies an HLC that dominates the remote content being superseded,
+   * so the resolution wins last-writer-wins when peers pull it.
+   */
+  async recordResolvedUpdate(fileId: string, path: string, contentHash: string, hlcTs: HLC): Promise<void> {
+    await this.recordOp({
+      id: this.opId(),
+      deviceId: this.deviceId,
+      hlcTimestamp: hlcTs,
+      fileId,
+      type: 'update',
+      path,
+      contentHash,
+    });
   }
 
   private async recordOp(op: Operation): Promise<void> {

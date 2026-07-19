@@ -379,15 +379,26 @@ Implement [`server-api-spec.md`](server-api-spec.md).
 client↔server contract suite against the real Go server, green). What remains, grouped:
 
 **Correctness — must-fix before shipping v1:**
-- **User-resolved conflicts don't replicate.** Known gap carried from P3: a hand-resolved text
-  conflict is a fresh decision the CRDT replay can't reproduce, yet it emits **no op** — so peer
-  devices never learn the resolution and can diverge. Make conflict resolution emit an op.
-  (Client-side; server-independent.)
+- **User-resolved conflicts don't replicate. DONE (2026-07-19).** A hand-resolved text conflict
+  now emits an op so peers learn the resolution instead of diverging. The applicator's `conflict`
+  case (`network/sync-applicator.ts`), on a non-null resolution, advances the registry to the
+  resolved content + records it as the new ancestor, and returns a `PendingResolution`;
+  `applyActions` re-emits these via a new `OperationLogger.recordResolvedUpdate` **after** the
+  `clearOps` that would otherwise wipe them, so the resolution becomes a fresh pending op for the
+  next round. `server-sync.ts` now advances the clock (`setCurrent(mergedHlc)`) **before** apply so
+  the resolution op dominates the remote content it supersedes (last-writer-wins) rather than being
+  timestamped beneath it. Convergence is by LWW replay: the resolving device pushes the resolution
+  op (higher HLC); a peer that concurrently edited the same lines re-merges against the resolution
+  (not the raw edits) and, accepting it, echoes the same content → the round settles to a no-op.
+  (Client-side; server-independent — no wire/contract change, the op rides the existing `ciphertext`.)
 
 **Integration testing:**
-- **Two-client convergence** — extend the single-client suite to *two* clients + the server:
-  concurrent edits, deletes, and renames all converge. (The server repo's `seed` subcommand
-  scaffolds multi-actor setups.)
+- **Two-client convergence — conflict case DONE (2026-07-19); deletes/renames still TODO.** The
+  shared contract suite (`__tests__/helpers/contract-suite.ts`) gained a two-device
+  concurrent-overlapping-edit → resolve → converge scenario, and it passes against **both** the
+  in-memory fake and the **real Go server** (`npm run test:integration`, 8/8). `MemoryHost` mirrors
+  the applicator's resolve-and-re-emit behaviour behind an injectable `resolveConflict`. Still to
+  add: concurrent **deletes** and **renames** convergence across two clients.
 - **Real-device pass** — desktop + iOS/Android; verify the `requestUrl` transport works on mobile
   (the biggest still-untested surface).
 
