@@ -248,6 +248,45 @@ Build the client half of the API spec. This is the core of the pivot.
 
 **Exit:** a user can configure a server + passphrase and sync from the UI; maintenance buttons work.
 
+**Status (2026-07-19): DONE.**
+- **Concrete `VaultSyncHost`** (`src/network/vault-sync-host.ts`) — the production bridge deferred
+  from P3. Implements the four host methods against the live stores: `buildLocalState()` snapshots
+  the registry + pending oplog and reads current file bytes (plus retained ancestors) into a content
+  store; `applyMerge()` → `SyncApplicator.applyActions`; `clearPendingOps()` → `OperationLogger.clearOps`;
+  cursor load/save → `CursorStore`. Only genuinely new logic file this phase; lint-clean.
+- **`main.ts` reworked to the server flow** — dropped the client/server-role selection, the P2P
+  `SyncClient`/`SyncServer` imports, `PairingModal`, `WaitingForConnectionModal`, and the
+  `populateContentStore`/`syncWithDevice` peer machinery. A single `triggerSync('manual' | 'auto')`
+  builds `HttpServerApi` + `PluginVaultSyncHost` and runs `ServerSyncClient.runSync()`. Ribbon,
+  `sync-now` command, and the settings "Sync now" button all route through it; `pair-new-device`
+  removed. Status bar/`view-sync-status` now report server URL + key fingerprint + pending count.
+- **At-rest key wired** — a plugin-owned `VaultCrypto` is derived on load (and lazily before a sync)
+  via `applyVaultKey()`. Salt is **deterministic from the vaultId** (`SHA-256("vault-sync:salt:"+id)`),
+  so no separate salt to transfer between devices — only server URL, vaultId, token, and passphrase.
+  `vaultKeyFingerprint()` surfaces the HKDF verify tag so two devices confirm the same passphrase.
+- **Auto-sync** — new `autoSyncIntervalMinutes` setting drives a `window.setInterval` armed by
+  `setupAutoSync()` (re-armed on change, registered via `registerInterval`, cleared on unload).
+  `0` = manual only.
+- **Settings UI rebuilt** (`src/ui/settings-tab.ts`) — server (URL / vault ID / token), encryption
+  (passphrase + "Derive & verify" showing the fingerprint), sync behavior (Sync now, auto-sync
+  interval, debounce, delete-conflict strategy, Obsidian-config toggle), exclusions, and storage.
+  Typed against a `SettingsHost extends Plugin` interface the plugin conforms to. Section headers use
+  `Setting.setHeading()` (no more injected `<style>`).
+- **Stubbed buttons wired** — "Clear sync cache" → `clearContentCache()` GCs the content store down
+  to registry-referenced hashes (live content + ancestors) and reports the count removed; "Reset
+  sync state" → `resetSyncState()` reconciles the registry against the vault and clears the oplog.
+- **New settings fields** (`types.ts`): `serverUrl`, `vaultId`, `serverToken`, `vaultPassphrase`,
+  `autoSyncIntervalMinutes`, `lastSyncTime`. Legacy `pairedDevices`/`syncPort` kept (unused) for P5
+  to remove with the rest of the P2P types.
+- **Build + tests green** (52 pass / 0 skip, unchanged — no obsidian test-mock exists, so the new
+  obsidian-coupled host isn't unit-tested here; the P3 orchestrator tests cover the round vs fakes).
+  Total lint **142 → 98 errors**; the survivors in touched files are the deferred UI-guideline
+  category only (sentence-case false positives on the "Vault Sync" product name, emoji-prefixed
+  headings, and example placeholders; `.obsidian` hardcoded-config defaults still needing runtime
+  `Vault.configDir`). No `eslint-disable`/ignore added; CI `lint` stays advisory.
+- **Not done here:** `pairing-modal.ts` left on disk but fully unimported (tree-shaken) — deleted
+  with the rest of the P2P path in **P5**. Real-device desktop/mobile verification is **P7**.
+
 ---
 
 ## Phase 5 — Retire P2P  🟢 (client-only)

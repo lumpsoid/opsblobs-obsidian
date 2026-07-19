@@ -91,19 +91,36 @@ export interface PairedDevice {
 export interface SyncSettings {
   deviceId: string;
   deviceName: string;
-  pairedDevices: PairedDevice[];
+
+  // ── Server (E2E-encrypted sync target) ──────────────────────────────────
+  serverUrl: string;         // e.g. https://sync.example.com
+  vaultId: string;           // vault scope on the server (shared across devices)
+  serverToken: string;       // Bearer token (spec §9.2)
+  vaultPassphrase: string;   // derives the at-rest vault key (never leaves the device)
+
+  // ── Sync behavior ───────────────────────────────────────────────────────
+  autoSyncIntervalMinutes: number;  // 0 = manual only
+  lastSyncTime: number | null;      // wall-clock ms of last successful round
   debounceMs: number;
   excludedPatterns: string[];
   deleteConflictStrategy: 'ask' | 'keep_deleted' | 'keep_modified';
   syncObsidianConfig: boolean;
   ancestorRetentionDays: number;
-  syncPort: number;  // port this device listens on when acting as server
+
+  // ── Legacy P2P (removed in P5) ──────────────────────────────────────────
+  pairedDevices: PairedDevice[];
+  syncPort: number;
 }
 
 export const DEFAULT_SETTINGS: SyncSettings = {
   deviceId: '',
   deviceName: '',
-  pairedDevices: [],
+  serverUrl: '',
+  vaultId: '',
+  serverToken: '',
+  vaultPassphrase: '',
+  autoSyncIntervalMinutes: 0,
+  lastSyncTime: null,
   debounceMs: 1500,
   excludedPatterns: [
     '.obsidian/workspace.json',
@@ -114,6 +131,7 @@ export const DEFAULT_SETTINGS: SyncSettings = {
   deleteConflictStrategy: 'ask',
   syncObsidianConfig: false,
   ancestorRetentionDays: 30,
+  pairedDevices: [],
   syncPort: 47821,
 };
 

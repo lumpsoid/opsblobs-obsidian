@@ -3,14 +3,17 @@
 // ─────────────────────────────────────────────
 
 import { App, Plugin, Notice, Modal, addIcon } from 'obsidian';
-import { SyncSettings, DEFAULT_SETTINGS, VaultState } from './types';
+import { SyncSettings, DEFAULT_SETTINGS } from './types';
 import { HybridLogicalClock } from './core/hlc';
 import { FileRegistry } from './core/file-registry';
 import { ContentStore } from './core/content-store';
 import { OperationLogger } from './core/operation-logger';
 import { SyncApplicator } from './network/sync-applicator';
+import { VaultCrypto } from './network/encryption';
+import { ServerSyncClient } from './network/server-sync';
+import { HttpServerApi, CursorStore } from './network/server-http';
+import { PluginVaultSyncHost } from './network/vault-sync-host';
 import { ConflictResolutionModal } from './ui/conflict-modal';
-import { PairingModal } from './ui/pairing-modal';
 import { SyncSettingTab } from './ui/settings-tab';
 
 // ─── Ribbon icon SVG ────────────────────────────────────────────────────────
@@ -24,11 +27,13 @@ export default class VaultSyncPlugin extends Plugin {
   private contentStore!: ContentStore;
   private opLogger!: OperationLogger;
   private applicator!: SyncApplicator;
+  private crypto = new VaultCrypto();
 
   private ribbonIcon: HTMLElement | null = null;
   private statusBarItem: HTMLElement | null = null;
   private syncInProgress = false;
   private pendingConflicts = 0;
+  private autoSyncHandle: number | null = null;
 
   // ─── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -93,9 +98,12 @@ export default class VaultSyncPlugin extends Plugin {
     // Start listening for vault changes
     this.opLogger.startListening();
 
+    // Derive the vault key up front so auto-sync can run unattended.
+    await this.tryDeriveVaultKey();
+
     // ── UI ─────────────────────────────────────────────────────────────────
     this.ribbonIcon = this.addRibbonIcon(SYNC_ICON_ID, 'Vault Sync', () => {
-      this.triggerManualSync();
+      void this.triggerSync('manual');
     });
     this.updateRibbonState('idle');
 
@@ -106,19 +114,7 @@ export default class VaultSyncPlugin extends Plugin {
     this.addCommand({
       id: 'sync-now',
       name: 'Sync now',
-      callback: () => this.triggerManualSync(),
-    });
-
-    this.addCommand({
-      id: 'pair-new-device',
-      name: 'Pair new device',
-      callback: () => {
-        new PairingModal(this.app, this.settings, async (device) => {
-          this.settings.pairedDevices.push(device);
-          await this.saveSettings();
-          new Notice(`✅ Paired with ${device.deviceName}`);
-        }).open();
-      },
+      callback: () => this.triggerSync('manual'),
     });
 
     this.addCommand({
@@ -130,18 +126,20 @@ export default class VaultSyncPlugin extends Plugin {
     // ── Settings ───────────────────────────────────────────────────────────
     this.addSettingTab(new SyncSettingTab(this.app, this));
 
-    console.log('Vault Sync: loaded.');
+    // ── Auto-sync ──────────────────────────────────────────────────────────
+    this.setupAutoSync();
   }
 
-  async onunload() {
+  onunload() {
     this.opLogger.stopListening();
-    console.log('Vault Sync: unloaded.');
+    if (this.autoSyncHandle !== null) window.clearInterval(this.autoSyncHandle);
   }
 
   // ─── Settings ─────────────────────────────────────────────────────────────
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const stored = (await this.loadData()) as Partial<SyncSettings> | null;
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, stored);
   }
 
   async saveSettings() {
@@ -162,138 +160,150 @@ export default class VaultSyncPlugin extends Plugin {
     return `device-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
 
-  // ─── Sync ─────────────────────────────────────────────────────────────────
+  // ─── Vault key (E2E) ────────────────────────────────────────────────────────
 
-  private async triggerManualSync() {
-    if (this.syncInProgress) {
-      new Notice('Sync already in progress.');
-      return;
-    }
-
-    if (this.settings.pairedDevices.length === 0) {
-      new Notice('No paired devices. Go to Settings → Vault Sync to pair a device first.');
-      return;
-    }
-
-    // For simplicity, sync with the first paired device
-    // In a full implementation, you'd choose which device or sync with all
-    const target = this.settings.pairedDevices[0]!;
-    await this.syncWithDevice(target);
+  private isServerConfigured(): boolean {
+    return Boolean(this.settings.serverUrl && this.settings.vaultId && this.settings.vaultPassphrase);
   }
 
-  private async syncWithDevice(device: typeof this.settings.pairedDevices[0]) {
+  /**
+   * Derive the at-rest vault key from the configured passphrase, salted by the
+   * vaultId (deterministic across devices, so no separate salt to transfer). A
+   * no-op with no passphrase configured; throws are the caller's to surface.
+   */
+  async applyVaultKey(): Promise<void> {
+    if (!this.settings.vaultPassphrase || !this.settings.vaultId) {
+      throw new Error('Set a server vault ID and passphrase first.');
+    }
+    const salt = await saltForVault(this.settings.vaultId);
+    await this.crypto.deriveFromPassphrase(this.settings.vaultPassphrase, salt);
+  }
+
+  private async tryDeriveVaultKey(): Promise<void> {
+    if (!this.settings.vaultPassphrase || !this.settings.vaultId) return;
+    try {
+      await this.applyVaultKey();
+    } catch (err) {
+      console.error('Vault Sync: key derivation failed:', err);
+    }
+  }
+
+  /** Fingerprint of the derived key, or null if none — shown in settings so two
+   *  devices can confirm they share the same passphrase before trusting data. */
+  vaultKeyFingerprint(): string | null {
+    return this.crypto.isReady() ? this.crypto.fingerprint() : null;
+  }
+
+  // ─── Sync ─────────────────────────────────────────────────────────────────
+
+  private async triggerSync(source: 'manual' | 'auto'): Promise<void> {
+    if (this.syncInProgress) {
+      if (source === 'manual') new Notice('Sync already in progress.');
+      return;
+    }
+    if (!this.isServerConfigured()) {
+      if (source === 'manual') {
+        new Notice('Vault Sync: configure a server and passphrase in Settings → Vault Sync first.');
+      }
+      return;
+    }
+    if (!this.crypto.isReady()) {
+      await this.tryDeriveVaultKey();
+      if (!this.crypto.isReady()) {
+        if (source === 'manual') new Notice('Vault Sync: could not derive the vault key from the passphrase.');
+        return;
+      }
+    }
+
     this.syncInProgress = true;
     this.updateRibbonState('syncing');
 
     try {
-      // Build local vault state — read all file content into the in-memory store
-      const localState: VaultState = {
-        deviceId: this.settings.deviceId,
-        hlc: this.hlc.getCurrent(),
-        fileEntries: this.registry.getAllEntries(),
-        pendingOps: this.opLogger.getPendingOps(),
-        contentStore: new Map(),
-      };
-      await this.populateContentStore(localState);
+      const api = new HttpServerApi({
+        baseUrl: this.settings.serverUrl,
+        vaultId: this.settings.vaultId,
+        token: this.settings.serverToken,
+      });
+      const host = new PluginVaultSyncHost(
+        this.app,
+        this.settings.deviceId,
+        this.registry,
+        this.contentStore,
+        this.opLogger,
+        this.applicator,
+        this.hlc,
+        new CursorStore(this.app),
+      );
+      const client = new ServerSyncClient({
+        api,
+        crypto: this.crypto,
+        host,
+        hlc: this.hlc,
+        onProgress: (label) => this.statusBarItem?.setText(`⟳ ${label}`),
+      });
 
-      const { SyncClient } = await import('./network/sync-client');
-      const { SyncServer, getLocalIPs } = await import('./network/sync-server');
+      await client.runSync();
 
-      const onProgress = (label: string) => {
-        this.statusBarItem?.setText(`⟳ ${label}`);
-      };
-
-      if (device.lastKnownIp && device.lastKnownPort) {
-        // ── Client mode: connect to the other device ──────────────────────
-        new Notice(`🔄 Connecting to ${device.deviceName}...`);
-        const client = new SyncClient({
-          remoteIp: device.lastKnownIp,
-          remotePort: device.lastKnownPort,
-          pairedDevice: device,
-          localState,
-          localDeviceName: this.settings.deviceName || 'Unknown Device',
-          hlc: this.hlc,
-          applicator: this.applicator,
-          onProgress: (label, current, total) => onProgress(`${label} (${current}/${total})`),
-        });
-        await client.runSync();
-
-      } else {
-        // ── Server mode: start listening, wait for the other device ───────
-        const server = new SyncServer({
-          localState,
-          pairedDevice: device,
-          settings: this.settings,
-          hlc: this.hlc,
-          applicator: this.applicator,
-          onProgress: (label, current, total) => onProgress(`${label} (${current}/${total})`),
-        });
-
-        const port = await server.start();
-        const ips = getLocalIPs();
-        const ipStr = ips.length > 0 ? ips[0]! : '(your IP)';
-
-        // Show a modal so the user sees the connection info and can cancel
-        await new Promise<void>((resolve, reject) => {
-          const modal = new WaitingForConnectionModal(
-            this.app,
-            ipStr,
-            port,
-            () => {
-              server.stop();
-              reject(new Error('Sync cancelled'));
-            },
-          );
-          modal.open();
-
-          server.onComplete = () => {
-            modal.close();
-            resolve();
-          };
-          server.onError = (err: Error) => {
-            modal.close();
-            reject(err);
-          };
-        });
-
-        await server.stop();
-      }
-
-      // ── Post-sync bookkeeping ──────────────────────────────────────────
-      device.lastSyncTime = Date.now();
-      device.lastSyncHlc = this.hlc.getCurrent();
+      this.settings.lastSyncTime = Date.now();
       await this.saveSettings();
 
-      new Notice(`✅ Sync complete with ${device.deviceName}`);
-
+      if (source === 'manual') new Notice('✅ Vault sync complete');
+      this.updateRibbonState('idle');
     } catch (err) {
       console.error('Vault Sync error:', err);
-      if ((err as Error).message !== 'Sync cancelled') {
-        new Notice(`❌ Sync failed: ${(err as Error).message}`);
-      }
+      new Notice(`❌ Sync failed: ${(err as Error).message}`);
       this.updateRibbonState('error');
     } finally {
       this.syncInProgress = false;
-      this.updateRibbonState(this.pendingConflicts > 0 ? 'conflict' : 'idle');
       this.updateStatusBar();
     }
   }
 
-  private async populateContentStore(state: VaultState): Promise<void> {
-    for (const [, entry] of state.fileEntries) {
-      if (!entry.deleted && !state.contentStore.has(entry.contentHash)) {
-        const file = this.app.vault.getAbstractFileByPath(entry.path);
-        if (file) {
-          const content = await this.app.vault.readBinary(file as any);
-          state.contentStore.set(entry.contentHash, new Uint8Array(content));
-        }
-      }
-      // Include ancestor if we have it
-      if (entry.ancestorContentHash) {
-        const ancestor = await this.contentStore.get(entry.ancestorContentHash);
-        if (ancestor) state.contentStore.set(entry.ancestorContentHash, ancestor);
-      }
+  /** Public entry point for the settings "Sync now" button. */
+  async syncNow(): Promise<void> {
+    await this.triggerSync('manual');
+  }
+
+  // ─── Auto-sync ──────────────────────────────────────────────────────────────
+
+  /** (Re)arm the periodic sync timer from settings. Idempotent — safe to call
+   *  again whenever the interval setting changes. */
+  setupAutoSync(): void {
+    if (this.autoSyncHandle !== null) {
+      window.clearInterval(this.autoSyncHandle);
+      this.autoSyncHandle = null;
     }
+    const mins = this.settings.autoSyncIntervalMinutes;
+    if (mins > 0) {
+      this.autoSyncHandle = window.setInterval(() => {
+        void this.triggerSync('auto');
+      }, mins * 60_000);
+      this.registerInterval(this.autoSyncHandle);
+    }
+  }
+
+  // ─── Maintenance (wired from settings) ───────────────────────────────────────
+
+  /** Garbage-collect the content store down to what the registry still
+   *  references (live content + retained ancestors). Returns the count removed. */
+  async clearContentCache(): Promise<number> {
+    const keep = new Set<string>();
+    for (const entry of this.registry.getAllEntries().values()) {
+      if (!entry.deleted && entry.contentHash) keep.add(entry.contentHash);
+      if (entry.ancestorContentHash) keep.add(entry.ancestorContentHash);
+    }
+    const before = (await this.contentStore.listHashes()).length;
+    await this.contentStore.gc(keep);
+    const after = (await this.contentStore.listHashes()).length;
+    return before - after;
+  }
+
+  /** Rebuild sync metadata: re-scan the vault into the registry and drop the
+   *  pending oplog. Vault content is never touched. */
+  async resetSyncState(): Promise<void> {
+    await this.registry.reconcileWithVault(this.hlc.now());
+    await this.opLogger.clearOps();
+    this.updateStatusBar();
   }
 
   // ─── UI helpers ───────────────────────────────────────────────────────────
@@ -315,10 +325,8 @@ export default class VaultSyncPlugin extends Plugin {
   private updateStatusBar() {
     if (!this.statusBarItem) return;
     const pending = this.opLogger.getPendingOps().length;
-    const lastSynced = this.settings.pairedDevices[0]?.lastSyncTime;
-    const lastSyncedStr = lastSynced
-      ? this.relativeTime(lastSynced)
-      : 'Never synced';
+    const lastSynced = this.settings.lastSyncTime;
+    const lastSyncedStr = lastSynced ? this.relativeTime(lastSynced) : 'Never synced';
 
     this.statusBarItem.setText(
       pending > 0
@@ -329,10 +337,11 @@ export default class VaultSyncPlugin extends Plugin {
 
   private showSyncStatus() {
     const pending = this.opLogger.getPendingOps().length;
-    const devices = this.settings.pairedDevices.length;
+    const fingerprint = this.vaultKeyFingerprint();
     new Notice(
       `Vault Sync Status\n` +
-      `• Paired devices: ${devices}\n` +
+      `• Server: ${this.settings.serverUrl || '(not configured)'}\n` +
+      `• Vault key: ${fingerprint ? `ready (${fingerprint})` : 'not derived'}\n` +
       `• Pending operations: ${pending}\n` +
       `• Device ID: ${this.settings.deviceId.slice(0, 8)}…`,
       8000,
@@ -348,51 +357,11 @@ export default class VaultSyncPlugin extends Plugin {
   }
 }
 
-// ─── Waiting-for-connection modal ──────────────────────────────────────────────
-// Shown on the server side while waiting for the client to connect.
-
-class WaitingForConnectionModal extends Modal {
-  constructor(
-    app: App,
-    private ip: string,
-    private port: number,
-    private onCancel: () => void,
-  ) {
-    super(app);
-  }
-
-  onOpen() {
-    const { contentEl } = this;
-    contentEl.createEl('h2', { text: '📡 Waiting for Connection' });
-    contentEl.createEl('p', {
-      text: 'On the other device, press Sync and enter these details:',
-    });
-
-    const dl = contentEl.createEl('dl', { cls: 'waiting-connection-info' });
-    dl.createEl('dt', { text: 'IP' });
-    dl.createEl('dd', { text: this.ip });
-    dl.createEl('dt', { text: 'Port' });
-    dl.createEl('dd', { text: String(this.port) });
-
-    const style = document.createElement('style');
-    style.textContent = `
-      .waiting-connection-info { display: grid; grid-template-columns: auto 1fr; gap: 0.25rem 1rem;
-        font-size: 1rem; margin: 1rem 0 1.5rem; }
-      .waiting-connection-info dt { color: var(--text-muted); font-weight: 600; }
-      .waiting-connection-info dd { margin: 0; font-family: var(--font-monospace); font-size: 1.1rem; }
-    `;
-    contentEl.appendChild(style);
-
-    const btn = contentEl.createEl('button', { text: 'Cancel', cls: 'mod-warning' });
-    btn.addEventListener('click', () => {
-      this.close();
-      this.onCancel();
-    });
-  }
-
-  onClose() {
-    this.contentEl.empty();
-  }
+/** Deterministic 32-byte salt for a vault, derived from its (shared) vaultId so
+ *  every device produces the same PBKDF2 salt without transferring one. */
+async function saltForVault(vaultId: string): Promise<Uint8Array> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`vault-sync:salt:${vaultId}`));
+  return new Uint8Array(digest);
 }
 
 // ─── Delete-conflict modal ─────────────────────────────────────────────────────
@@ -435,12 +404,6 @@ class DeleteConflictModal extends Modal {
       cls: 'mod-warning',
     });
     deleteBtn.addEventListener('click', () => this.decide('keep_deleted'));
-
-    const style = document.createElement('style');
-    style.textContent = `
-      .delete-conflict-buttons { display: flex; gap: 0.75rem; margin-top: 1.25rem; justify-content: flex-end; }
-    `;
-    contentEl.appendChild(style);
   }
 
   private decide(decision: 'keep_deleted' | 'restore') {

@@ -1,8 +1,14 @@
-/*
+/* Delete-conflict modal (main.ts) */
+.delete-conflict-buttons {
+  display: flex;
+  gap: 0.75rem;
+  margin-top: 1.25rem;
+  justify-content: flex-end;
+}
 
-This CSS file will be included with your plugin, and
-available in the app when your plugin is enabled.
-
-If your plugin does not need CSS, delete this file.
-
-*/
+/* Settings — exclusions textarea */
+textarea.vault-sync-exclusions {
+  width: 100%;
+  font-family: var(--font-monospace);
+  font-size: 0.85rem;
+}

@@ -1,39 +1,56 @@
 // ─────────────────────────────────────────────
-//  Settings Tab
-//  Phase 4.4
+//  Settings Tab  (Phase 4)
 // ─────────────────────────────────────────────
+//
+//  Server config + at-rest encryption for the client↔server pivot. The P2P
+//  pairing flow is gone: a device is configured by a server URL, a vault ID +
+//  token, and a vault passphrase. The passphrase-derived key never leaves the
+//  device; its fingerprint lets two devices confirm they share the same key.
 
-import { App, PluginSettingTab, Setting, ButtonComponent } from 'obsidian';
-import { SyncSettings, PairedDevice } from '../types';
-import { PairingModal } from './pairing-modal';
+import { App, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { SyncSettings } from '../types';
+
+/** The slice of the plugin the settings tab drives. Implemented by the plugin. */
+export interface SettingsHost extends Plugin {
+  settings: SyncSettings;
+  saveSettings(): Promise<void>;
+  applyVaultKey(): Promise<void>;
+  vaultKeyFingerprint(): string | null;
+  setupAutoSync(): void;
+  clearContentCache(): Promise<number>;
+  resetSyncState(): Promise<void>;
+  syncNow(): Promise<void>;
+}
 
 export class SyncSettingTab extends PluginSettingTab {
-  constructor(
-    app: App,
-    private plugin: { settings: SyncSettings; saveSettings: () => Promise<void> },
-  ) {
-    super(app, plugin as any);
+  constructor(app: App, private host: SettingsHost) {
+    super(app, host);
+  }
+
+  private get settings(): SyncSettings {
+    return this.host.settings;
+  }
+
+  private save(): Promise<void> {
+    return this.host.saveSettings();
   }
 
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.addClass('vault-sync-settings');
-
-    containerEl.createEl('h2', { text: 'Vault Sync' });
 
     // ── Device identity ───────────────────────────────────────────────────
-    containerEl.createEl('h3', { text: 'This Device' });
+    new Setting(containerEl).setName('This device').setHeading();
 
     new Setting(containerEl)
-      .setName('Device Name')
-      .setDesc('A friendly name for this device (shown to paired devices).')
+      .setName('Device name')
+      .setDesc('A friendly name for this device.')
       .addText(t => {
-        t.setValue(this.plugin.settings.deviceName)
+        t.setValue(this.settings.deviceName)
           .setPlaceholder('My MacBook')
           .onChange(async v => {
-            this.plugin.settings.deviceName = v;
-            await this.plugin.saveSettings();
+            this.settings.deviceName = v;
+            await this.save();
           });
       });
 
@@ -41,79 +58,157 @@ export class SyncSettingTab extends PluginSettingTab {
       .setName('Device ID')
       .setDesc('Unique identifier for this device (read-only).')
       .addText(t => {
-        t.setValue(this.plugin.settings.deviceId).setDisabled(true);
+        t.setValue(this.settings.deviceId).setDisabled(true);
       });
 
-    // ── Paired devices ────────────────────────────────────────────────────
-    containerEl.createEl('h3', { text: 'Paired Devices' });
-
-    if (this.plugin.settings.pairedDevices.length === 0) {
-      containerEl.createEl('p', {
-        text: 'No devices paired yet. Add a device to start syncing.',
-        cls: 'settings-empty-state',
-      });
-    }
-
-    for (const device of this.plugin.settings.pairedDevices) {
-      this.renderPairedDevice(containerEl, device);
-    }
+    // ── Server ────────────────────────────────────────────────────────────
+    new Setting(containerEl).setName('Server').setHeading();
 
     new Setting(containerEl)
-      .addButton(btn => {
-        btn.setButtonText('+ Pair New Device')
-          .setClass('mod-cta')
-          .onClick(() => {
-            new PairingModal(this.app, this.plugin.settings, async (device) => {
-              this.plugin.settings.pairedDevices.push(device);
-              await this.plugin.saveSettings();
-              this.display();
-            }).open();
+      .setName('Server URL')
+      .setDesc('Base URL of the sync server, e.g. https://sync.example.com')
+      .addText(t => {
+        t.setValue(this.settings.serverUrl)
+          .setPlaceholder('https://sync.example.com')
+          .onChange(async v => {
+            this.settings.serverUrl = v.trim();
+            await this.save();
           });
       });
 
-    // ── Sync behavior ─────────────────────────────────────────────────────
-    containerEl.createEl('h3', { text: 'Sync Behavior' });
+    new Setting(containerEl)
+      .setName('Vault ID')
+      .setDesc('Identifies this vault on the server. Use the same value on every device.')
+      .addText(t => {
+        t.setValue(this.settings.vaultId)
+          .setPlaceholder('my-notes')
+          .onChange(async v => {
+            this.settings.vaultId = v.trim();
+            await this.save();
+          });
+      });
 
     new Setting(containerEl)
-      .setName('Debounce Delay')
+      .setName('Access token')
+      .setDesc('Bearer token authorizing this device for the vault.')
+      .addText(t => {
+        t.setValue(this.settings.serverToken)
+          .setPlaceholder('token…')
+          .onChange(async v => {
+            this.settings.serverToken = v.trim();
+            await this.save();
+          });
+        t.inputEl.type = 'password';
+      });
+
+    // ── Encryption ────────────────────────────────────────────────────────
+    new Setting(containerEl).setName('Encryption').setHeading();
+
+    containerEl.createEl('p', {
+      text: 'The passphrase derives the key that encrypts everything before it leaves this device. ' +
+        'The server never sees it. Use the same passphrase on every device — the fingerprint below ' +
+        'must match across devices.',
+      cls: 'setting-item-description',
+    });
+
+    new Setting(containerEl)
+      .setName('Vault passphrase')
+      .setDesc('Encrypts your notes end-to-end. If lost, encrypted data cannot be recovered.')
+      .addText(t => {
+        t.setValue(this.settings.vaultPassphrase)
+          .setPlaceholder('correct horse battery staple')
+          .onChange(async v => {
+            this.settings.vaultPassphrase = v;
+            await this.save();
+          });
+        t.inputEl.type = 'password';
+      });
+
+    const fingerprintSetting = new Setting(containerEl)
+      .setName('Key fingerprint')
+      .setDesc(this.fingerprintDesc());
+    fingerprintSetting.addButton(btn => {
+      btn.setButtonText('Derive & verify').onClick(async () => {
+        try {
+          await this.host.applyVaultKey();
+          fingerprintSetting.setDesc(this.fingerprintDesc());
+        } catch (e) {
+          fingerprintSetting.setDesc(`Could not derive key: ${(e as Error).message}`);
+        }
+      });
+    });
+
+    // ── Sync behavior ─────────────────────────────────────────────────────
+    new Setting(containerEl).setName('Sync behavior').setHeading();
+
+    new Setting(containerEl)
+      .setName('Sync now')
+      .setDesc('Run a full pull → merge → push round against the server.')
+      .addButton(btn => {
+        btn.setButtonText('Sync now').setCta().onClick(async () => {
+          btn.setButtonText('Syncing…').setDisabled(true);
+          try {
+            await this.host.syncNow();
+          } finally {
+            btn.setButtonText('Sync now').setDisabled(false);
+          }
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('Auto-sync interval')
+      .setDesc('Sync automatically this often. Set to 0 for manual sync only.')
+      .addSlider(s => {
+        s.setLimits(0, 60, 5)
+          .setValue(this.settings.autoSyncIntervalMinutes)
+          .setDynamicTooltip()
+          .onChange(async v => {
+            this.settings.autoSyncIntervalMinutes = v;
+            await this.save();
+            this.host.setupAutoSync();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName('Debounce delay')
       .setDesc('Wait this many milliseconds after a file stops changing before recording an operation.')
       .addSlider(s => {
         s.setLimits(500, 5000, 100)
-          .setValue(this.plugin.settings.debounceMs)
+          .setValue(this.settings.debounceMs)
           .setDynamicTooltip()
           .onChange(async v => {
-            this.plugin.settings.debounceMs = v;
-            await this.plugin.saveSettings();
+            this.settings.debounceMs = v;
+            await this.save();
           });
       });
 
     new Setting(containerEl)
-      .setName('Delete Conflict Strategy')
+      .setName('Delete conflict strategy')
       .setDesc('What to do when one device deletes a file and the other modifies it.')
       .addDropdown(d => {
         d.addOption('ask', 'Ask me each time')
           .addOption('keep_deleted', 'Always keep the deletion')
           .addOption('keep_modified', 'Always keep the modified version')
-          .setValue(this.plugin.settings.deleteConflictStrategy)
+          .setValue(this.settings.deleteConflictStrategy)
           .onChange(async v => {
-            this.plugin.settings.deleteConflictStrategy = v as any;
-            await this.plugin.saveSettings();
+            this.settings.deleteConflictStrategy = v as SyncSettings['deleteConflictStrategy'];
+            await this.save();
           });
       });
 
     new Setting(containerEl)
-      .setName('Sync Obsidian Config')
+      .setName('Sync Obsidian config')
       .setDesc('Sync files inside .obsidian/ (snippets, templates). Workspace layout is always excluded.')
       .addToggle(t => {
-        t.setValue(this.plugin.settings.syncObsidianConfig)
+        t.setValue(this.settings.syncObsidianConfig)
           .onChange(async v => {
-            this.plugin.settings.syncObsidianConfig = v;
-            await this.plugin.saveSettings();
+            this.settings.syncObsidianConfig = v;
+            await this.save();
           });
       });
 
     // ── Exclusions ────────────────────────────────────────────────────────
-    containerEl.createEl('h3', { text: 'Excluded Paths' });
+    new Setting(containerEl).setName('Excluded paths').setHeading();
     containerEl.createEl('p', {
       text: 'Files and folders to exclude from sync (glob patterns, one per line).',
       cls: 'setting-item-description',
@@ -121,105 +216,63 @@ export class SyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .addTextArea(ta => {
-        ta.setValue(this.plugin.settings.excludedPatterns.join('\n'))
+        ta.setValue(this.settings.excludedPatterns.join('\n'))
           .setPlaceholder('.obsidian/workspace.json\n.vault-sync/**')
           .onChange(async v => {
-            this.plugin.settings.excludedPatterns = v.split('\n').map(s => s.trim()).filter(Boolean);
-            await this.plugin.saveSettings();
+            this.settings.excludedPatterns = v.split('\n').map(s => s.trim()).filter(Boolean);
+            await this.save();
           });
         ta.inputEl.rows = 5;
-        ta.inputEl.style.width = '100%';
-        ta.inputEl.style.fontFamily = 'var(--font-monospace)';
-        ta.inputEl.style.fontSize = '0.85rem';
-      });
-
-    // ── Network ───────────────────────────────────────────────────────────
-    containerEl.createEl('h3', { text: 'Network' });
-
-    new Setting(containerEl)
-      .setName('Sync Port')
-      .setDesc('Port this device listens on when acting as server. The other device must be able to reach this port on your local network.')
-      .addText(t => {
-        t.setValue(String(this.plugin.settings.syncPort))
-          .setPlaceholder('47821')
-          .onChange(async v => {
-            const n = parseInt(v, 10);
-            if (n > 1024 && n < 65536) {
-              this.plugin.settings.syncPort = n;
-              await this.plugin.saveSettings();
-            }
-          });
+        ta.inputEl.addClass('vault-sync-exclusions');
       });
 
     // ── Storage ───────────────────────────────────────────────────────────
-    containerEl.createEl('h3', { text: 'Storage' });
+    new Setting(containerEl).setName('Storage').setHeading();
 
     new Setting(containerEl)
-      .setName('Ancestor Retention')
+      .setName('Ancestor retention')
       .setDesc('Keep ancestor content for this many days before garbage collection.')
       .addSlider(s => {
         s.setLimits(7, 90, 1)
-          .setValue(this.plugin.settings.ancestorRetentionDays)
+          .setValue(this.settings.ancestorRetentionDays)
           .setDynamicTooltip()
           .onChange(async v => {
-            this.plugin.settings.ancestorRetentionDays = v;
-            await this.plugin.saveSettings();
+            this.settings.ancestorRetentionDays = v;
+            await this.save();
           });
       });
 
     new Setting(containerEl)
-      .setName('Clear Sync Cache')
-      .setDesc('Remove ancestor content cache. Safe to do — only affects three-way merge quality, not vault content.')
+      .setName('Clear sync cache')
+      .setDesc('Remove content-store blobs the registry no longer references. ' +
+        'Safe — only affects three-way merge quality, not vault content.')
       .addButton(btn => {
-        btn.setButtonText('Clear Cache').setWarning().onClick(async () => {
-          // Would call contentStore.gc(new Set()) in real impl
-          btn.setButtonText('Cleared!').setDisabled(true);
-          setTimeout(() => { btn.setButtonText('Clear Cache').setDisabled(false); }, 2000);
+        btn.setButtonText('Clear cache').setWarning().onClick(async () => {
+          btn.setDisabled(true);
+          const removed = await this.host.clearContentCache();
+          btn.setButtonText(`Removed ${removed}`);
+          setTimeout(() => { btn.setButtonText('Clear cache').setDisabled(false); }, 2000);
         });
       });
 
     new Setting(containerEl)
-      .setName('Reset Sync State')
-      .setDesc('Rebuild file registry from scratch. Use if sync metadata is corrupted. Vault content is never touched.')
+      .setName('Reset sync state')
+      .setDesc('Rebuild the file registry from the vault and clear pending operations. ' +
+        'Use if sync metadata is corrupted. Vault content is never touched.')
       .addButton(btn => {
         btn.setButtonText('Reset').setWarning().onClick(async () => {
-          // Would call registry.reconcileWithVault() and clear oplog
-          btn.setButtonText('Done').setDisabled(true);
+          btn.setDisabled(true);
+          await this.host.resetSyncState();
+          btn.setButtonText('Done');
           setTimeout(() => { btn.setButtonText('Reset').setDisabled(false); }, 2000);
         });
       });
-
-    this.injectStyles();
   }
 
-  private renderPairedDevice(container: HTMLElement, device: PairedDevice): void {
-    const lastSync = device.lastSyncTime
-      ? new Date(device.lastSyncTime).toLocaleString()
-      : 'Never';
-
-    new Setting(container)
-      .setName(device.deviceName)
-      .setDesc(`ID: ${device.deviceId.slice(0, 12)}… | Last sync: ${lastSync}`)
-      .addButton(btn => {
-        btn.setButtonText('Unpair').setWarning().onClick(async () => {
-          this.plugin.settings.pairedDevices = this.plugin.settings.pairedDevices
-            .filter(d => d.deviceId !== device.deviceId);
-          await this.plugin.saveSettings();
-          this.display();
-        });
-      });
-  }
-
-  private injectStyles() {
-    const existing = document.getElementById('vault-sync-settings-styles');
-    if (existing) return;
-
-    const style = document.createElement('style');
-    style.id = 'vault-sync-settings-styles';
-    style.textContent = `
-      .vault-sync-settings .settings-empty-state { color: var(--text-muted); font-style: italic; margin: 0.5rem 0 1rem; }
-      .vault-sync-settings h3 { margin: 1.5rem 0 0.75rem; color: var(--text-normal); border-bottom: 1px solid var(--background-modifier-border); padding-bottom: 0.25rem; }
-    `;
-    document.head.appendChild(style);
+  private fingerprintDesc(): string {
+    const fp = this.host.vaultKeyFingerprint();
+    return fp
+      ? `Key ready — fingerprint ${fp}. This must match on every device.`
+      : 'No key derived yet. Enter a passphrase and vault ID, then derive.';
   }
 }
