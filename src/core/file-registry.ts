@@ -7,8 +7,9 @@
 //  through renames and moves. Stored at .vault-sync/file-registry.json.
 
 import { App, TFile, normalizePath } from 'obsidian';
-import { FileEntry, HLC } from '../types';
+import { FileEntry, HLC, SyncSettings } from '../types';
 import { hlcCompare } from './hlc';
+import { isExcluded } from './exclusion-policy';
 
 const REGISTRY_PATH = '.vault-sync/file-registry.json';
 
@@ -21,7 +22,11 @@ export class FileRegistry {
   private entries: Map<string, FileEntry> = new Map();  // uuid → entry
   private pathIndex: Map<string, string> = new Map();   // path → uuid
 
-  constructor(private app: App, private deviceId: string) {}
+  constructor(
+    private app: App,
+    private deviceId: string,
+    private getSettings: () => SyncSettings,
+  ) {}
 
   // ─── Persistence ──────────────────────────────────────────────────────────
 
@@ -238,7 +243,7 @@ export class FileRegistry {
   }
 
   private isExcluded(path: string): boolean {
-    return path.startsWith('.vault-sync/');
+    return isExcluded(path, this.getSettings());
   }
 
   private generateUUID(): string {

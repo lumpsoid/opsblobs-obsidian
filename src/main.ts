@@ -45,7 +45,7 @@ export default class VaultSyncPlugin extends Plugin {
 
     // Initialize core components
     this.hlc = new HybridLogicalClock(this.settings.deviceId);
-    this.registry = new FileRegistry(this.app, this.settings.deviceId);
+    this.registry = new FileRegistry(this.app, this.settings.deviceId, () => this.settings);
     this.contentStore = new ContentStore(this.app);
     this.opLogger = new OperationLogger(
       this.app,
@@ -53,6 +53,7 @@ export default class VaultSyncPlugin extends Plugin {
       this.hlc,
       this.registry,
       this.contentStore,
+      () => this.settings,
       this.settings.debounceMs,
     );
 

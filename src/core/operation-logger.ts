@@ -7,10 +7,11 @@
 //  Debounces rapid saves so only one operation is recorded per logical edit.
 
 import { App, TFile, normalizePath } from 'obsidian';
-import { HLC, Operation } from '../types';
+import { HLC, Operation, SyncSettings } from '../types';
 import { HybridLogicalClock } from './hlc';
 import { FileRegistry } from './file-registry';
 import { ContentStore, hashContent } from './content-store';
+import { isExcluded } from './exclusion-policy';
 
 const OPLOG_PATH = '.vault-sync/oplog.json';
 
@@ -25,6 +26,7 @@ export class OperationLogger {
     private hlc: HybridLogicalClock,
     private registry: FileRegistry,
     private contentStore: ContentStore,
+    private getSettings: () => SyncSettings,
     private debounceMs: number = 1500,
   ) {}
 
@@ -362,7 +364,7 @@ export class OperationLogger {
   }
 
   private isExcluded(path: string): boolean {
-    return path.startsWith('.vault-sync/');
+    return isExcluded(path, this.getSettings());
   }
 
   private opId(): string {
