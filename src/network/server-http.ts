@@ -14,6 +14,7 @@ import {
   PullOpsResult,
   AppendOp,
   AppendResult,
+  StaleCursorError,
 } from './server-sync';
 
 export interface HttpServerConfig {
@@ -22,14 +23,6 @@ export interface HttpServerConfig {
   vaultId: string;
   /** Bearer token scoped to the vault (issuance is out of scope — spec §9.2). */
   token: string;
-}
-
-/** A too-stale `baseCursor` was rejected (spec §9.3 — a server MAY 409). */
-export class StaleCursorError extends Error {
-  constructor() {
-    super('Server rejected append: cursor too stale, re-pull first');
-    this.name = 'StaleCursorError';
-  }
 }
 
 export class HttpServerApi implements ServerApi {

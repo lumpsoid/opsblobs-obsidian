@@ -15,6 +15,7 @@ import {
   PullOpsResult,
   AppendOp,
   AppendResult,
+  StaleCursorError,
   reconstructRemoteState,
 } from '../src/network/server-sync';
 import { FakeSyncServer, MissingBlobError } from '../src/network/fake-server';
@@ -37,6 +38,24 @@ class BlobGatedServer implements ServerApi {
   async getBlob(hash: string): Promise<Uint8Array | null> {
     return this.blobAvailable ? this.inner.getBlob(hash) : null;
   }
+}
+
+/** Wraps a FakeSyncServer so its first `appendOps` 409s with a StaleCursorError
+ *  (the spec §9.3 optional stale-writer rejection), then delegates on every
+ *  later call. Reproduces the wedge F4 guards against: without a catch+retry the
+ *  first append throws and the round never clears its pending ops. */
+class StaleOnceServer implements ServerApi {
+  appendCalls = 0;
+  constructor(private readonly inner: FakeSyncServer) {}
+  pullOps(since: number, limit: number): Promise<PullOpsResult> { return this.inner.pullOps(since, limit); }
+  async appendOps(baseCursor: number, ops: AppendOp[]): Promise<AppendResult> {
+    this.appendCalls++;
+    if (this.appendCalls === 1) throw new StaleCursorError();
+    return this.inner.appendOps(baseCursor, ops);
+  }
+  checkBlobs(hashes: string[]): Promise<{ missing: string[] }> { return this.inner.checkBlobs(hashes); }
+  putBlob(hash: string, bytes: Uint8Array): Promise<void> { return this.inner.putBlob(hash, bytes); }
+  getBlob(hash: string): Promise<Uint8Array | null> { return this.inner.getBlob(hash); }
 }
 
 function client(api: FakeSyncServer, crypto: VaultCrypto, device: TestDevice): ServerSyncClient {
@@ -206,6 +225,41 @@ describe('ServerSyncClient — full round against the fake', () => {
     expect(onDisk && new TextDecoder().decode(onDisk)).toBe(body);
     expect(deviceB.entry(id)!.contentHash).toBe(hash);
     expect(deviceB.entry(id)!.deleted).toBe(false);
+  });
+
+  test('a stale-cursor 409 on append is recovered, not wedged (F4)', async () => {
+    const inner = new FakeSyncServer();
+    const staleOnce = new StaleOnceServer(inner);
+    const deviceA = await device('dev-a');
+    const deviceB = await device('dev-b');
+
+    // A publishes a file the normal way so the server head is ahead of B's cursor.
+    const bodyA = '# A\nfrom a\n';
+    const idA = await deviceA.seedFile('a.md', bodyA, 1000);
+    await client(inner, vc, deviceA).runSync();
+    expect(inner.opCount).toBe(1);
+
+    // B has its own pending edit and a stale cursor (0). Its round pulls A's op,
+    // then pushes — where the server 409s the first append (stale baseCursor).
+    // Pre-fix, that StaleCursorError escapes runSync and the round throws.
+    const bodyB = '# B\nfrom b\n';
+    const idB = await deviceB.seedFile('b.md', bodyB, 2000);
+    const clientB = new ServerSyncClient({ api: staleOnce, crypto: vc, host: deviceB.host, hlc: deviceB.hlc });
+
+    await expect(clientB.runSync()).resolves.toBeUndefined(); // completes, no throw escapes
+
+    // The append was retried after refreshing the cursor: two calls, one 409'd.
+    expect(staleOnce.appendCalls).toBe(2);
+    // B's op landed on the server (idempotent by clientOpId), pending cleared.
+    expect(inner.opCount).toBe(2);
+    expect(deviceB.pendingOps).toHaveLength(0);
+    // B's own file survives and A's file was merged onto B.
+    const bOnDisk = await deviceB.files.read('b.md');
+    expect(bOnDisk && new TextDecoder().decode(bOnDisk)).toBe(bodyB);
+    const aOnDisk = await deviceB.files.read('a.md');
+    expect(aOnDisk && new TextDecoder().decode(aOnDisk)).toBe(bodyA);
+    expect(deviceB.entry(idA)).toBeTruthy();
+    expect(deviceB.entry(idB)).toBeTruthy();
   });
 
   test('blobs are deduplicated across devices via blobs:check', async () => {

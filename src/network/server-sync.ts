@@ -49,6 +49,16 @@ export interface AppendResult {
   headCursor: number;
 }
 
+/** A too-stale `baseCursor` was rejected (spec §9.3 — a server MAY 409). Lives
+ *  here (not in the obsidian-coupled server-http.ts) so this obsidian-free
+ *  orchestrator can catch it without a cycle; HttpServerApi imports it from here. */
+export class StaleCursorError extends Error {
+  constructor() {
+    super('Server rejected append: cursor too stale, re-pull first');
+    this.name = 'StaleCursorError';
+  }
+}
+
 /**
  * The five spec endpoints (§4–§5). Implemented over `requestUrl` in prod
  * (HttpServerApi) and in memory for tests (FakeSyncServer). Blob bytes are the
@@ -269,9 +279,37 @@ export class ServerSyncClient {
       }
     }
 
-    await this.api.appendOps(baseCursor, records);
+    // Append with `baseCursor` advisory (spec §9.3). A server MAY 409 a too-stale
+    // writer; since we always append with our pull cursor — which is stale the
+    // moment anyone else appends — a 409 must be recovered, not fatal, or sync
+    // wedges (F4). Refresh the cursor by re-pulling to the current head and
+    // re-append; the append is idempotent by `clientOpId`, so a partial prior
+    // attempt can't duplicate. Ops others slipped in during the 409 window sit at
+    // seq > head and are re-pulled next round (we don't merge them mid-retry).
+    let cursor = baseCursor;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await this.api.appendOps(cursor, records);
+        return;
+      } catch (err) {
+        if (!(err instanceof StaleCursorError)) throw err;
+        if (attempt >= MAX_STALE_APPEND_RETRIES) {
+          throw new Error(
+            `Append rejected as stale after ${MAX_STALE_APPEND_RETRIES} re-pull retries; ` +
+              'server head is advancing faster than this client can catch up',
+          );
+        }
+        const refreshed = await this.pullAll(cursor);
+        cursor = refreshed.cursor;
+      }
+    }
   }
 }
+
+/** How many times a stale-cursor 409 is recovered by re-pulling before we give
+ *  up and surface a clear error (F4). Bounded so a pathologically busy server
+ *  can't spin us forever. */
+const MAX_STALE_APPEND_RETRIES = 3;
 
 // ─── Pure helpers (independently testable) ─────────────────────────────────────
 
