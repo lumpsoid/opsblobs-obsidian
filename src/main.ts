@@ -8,6 +8,7 @@ import { HybridLogicalClock } from './core/hlc';
 import { FileRegistry } from './core/file-registry';
 import { ContentStore } from './core/content-store';
 import { OperationLogger } from './core/operation-logger';
+import { resolveDeleteStrategy } from './core/conflict-policy';
 import { SyncApplicator } from './network/sync-applicator';
 import { VaultCrypto } from './network/encryption';
 import { ServerSyncClient } from './network/server-sync';
@@ -78,9 +79,8 @@ export default class VaultSyncPlugin extends Plugin {
       },
       // Delete conflict handler
       async (action) => {
-        const strategy = this.settings.deleteConflictStrategy;
-        if (strategy === 'keep_deleted') return 'keep_deleted';
-        if (strategy === 'keep_modified') return 'restore';
+        const resolved = resolveDeleteStrategy(this.settings.deleteConflictStrategy);
+        if (resolved !== 'ask') return resolved;
         // 'ask' — let the user decide per file.
         return new Promise(resolve => {
           new DeleteConflictModal(this.app, action.path, action.side, resolve).open();
