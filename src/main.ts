@@ -18,6 +18,7 @@ import { VaultCrypto, saltForVault } from './network/encryption';
 import { ServerSyncClient } from './network/server-sync';
 import { HttpServerApi } from './network/server-http';
 import { CursorStore } from './network/cursor-store';
+import { HlcStore } from './network/hlc-store';
 import { PluginVaultSyncHost } from './network/vault-sync-host';
 import { ConflictResolutionModal } from './ui/conflict-modal';
 import { DeleteConflictModal } from './ui/delete-conflict-modal';
@@ -30,6 +31,7 @@ const SYNC_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 2
 export default class VaultSyncPlugin extends Plugin {
   settings!: SyncSettings;
   private hlc!: HybridLogicalClock;
+  private hlcStore!: HlcStore;
   private registry!: FileRegistry;
   private contentStore!: ContentStore;
   private metadata!: ObsidianMetadataStore;
@@ -53,9 +55,16 @@ export default class VaultSyncPlugin extends Plugin {
     addIcon(SYNC_ICON_ID, SYNC_ICON_SVG);
 
     // Initialize core components
-    this.hlc = new HybridLogicalClock(this.settings.deviceId);
     const metadata = new ObsidianMetadataStore(this.app);
     this.metadata = metadata;
+    // Seed the clock from the persisted HLC (F7) so locally-issued logical time
+    // never regresses below what this device already emitted, even if the wall
+    // clock jumped backward while we were off. `now()` takes max(wall,
+    // current.wallTime), so a regressed wall still advances the counter above the
+    // seed rather than rewinding. A fresh device has no persisted state → start clean.
+    this.hlcStore = new HlcStore(metadata);
+    const persistedHlc = await this.hlcStore.load();
+    this.hlc = new HybridLogicalClock(this.settings.deviceId, persistedHlc ?? undefined);
     const vaultFiles = new ObsidianVaultFiles(this.app);
     this.vaultFiles = vaultFiles;
     this.registry = new FileRegistry(metadata, vaultFiles, this.settings.deviceId, () => this.settings);
@@ -71,6 +80,7 @@ export default class VaultSyncPlugin extends Plugin {
       this.contentStore,
       () => this.settings,
       this.settings.debounceMs,
+      this.hlcStore, // persist the HLC after each op (F7)
     );
 
     this.applicator = new SyncApplicator(
@@ -151,6 +161,9 @@ export default class VaultSyncPlugin extends Plugin {
 
   onunload() {
     this.opLogger.stopListening();
+    // Final HLC persist on shutdown (F7) so time issued since the last op/sync
+    // survives the restart. Fire-and-forget — onunload can't await.
+    void this.hlcStore.save(this.hlc.getCurrent()).catch(console.error);
     if (this.autoSyncHandle !== null) window.clearInterval(this.autoSyncHandle);
   }
 
@@ -264,6 +277,11 @@ export default class VaultSyncPlugin extends Plugin {
       });
 
       await client.runSync();
+
+      // Persist logical time after the round (F7): the merge/apply path advances
+      // the clock via merge()/setCurrent() outside op-recording, so capture it
+      // here in addition to the per-op cadence in OperationLogger.
+      await this.hlcStore.save(this.hlc.getCurrent());
 
       this.settings.lastSyncTime = Date.now();
       await this.saveSettings();

@@ -17,6 +17,12 @@ import { VaultFiles } from '../ports/vault-files';
 import { VaultWatcher } from '../ports/vault-watcher';
 import { MetadataStore } from '../ports/metadata-store';
 
+/** Minimal HLC persistence surface (satisfied by `network/HlcStore`). Typed
+ *  structurally so `core/` needn't depend on `network/`. */
+export interface HlcPersister {
+  save(hlc: HLC): Promise<void>;
+}
+
 const OPLOG_DIR = '.vault-sync';
 const OPLOG_PATH = '.vault-sync/oplog.json';
 
@@ -34,6 +40,12 @@ export class OperationLogger {
     private contentStore: ContentStore,
     private getSettings: () => SyncSettings,
     private debounceMs: number = 1500,
+    // Persists the HLC alongside the oplog (F7). Every op is stamped with
+    // `hlc.now()` and saved via `saveOpLog`, so piggybacking the HLC write there
+    // means logical time is durable the instant it is issued — a crash + wall
+    // regression can't rewind below an emitted timestamp. Optional so tests /
+    // callers that don't need persistence omit it.
+    private hlcStore?: HlcPersister,
   ) {}
 
   // ─── Lifecycle ────────────────────────────────────────────────────────────
@@ -347,6 +359,10 @@ export class OperationLogger {
       await this.metadata.mkdir(OPLOG_DIR);
     }
     await this.metadata.write(OPLOG_PATH, JSON.stringify(this.pendingOps, null, 2));
+    // Persist the current logical time whenever we persist ops (F7). This is the
+    // per-op cadence; `main.ts` additionally persists after each sync round and
+    // on unload, so time issued outside op-recording (merge/setCurrent) is durable.
+    await this.hlcStore?.save(this.hlc.getCurrent());
   }
 
   /**
