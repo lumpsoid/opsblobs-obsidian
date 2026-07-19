@@ -33,6 +33,7 @@ export default class VaultSyncPlugin extends Plugin {
   private registry!: FileRegistry;
   private contentStore!: ContentStore;
   private metadata!: ObsidianMetadataStore;
+  private vaultFiles!: ObsidianVaultFiles;
   private opLogger!: OperationLogger;
   private applicator!: SyncApplicator;
   private crypto = new VaultCrypto();
@@ -56,6 +57,7 @@ export default class VaultSyncPlugin extends Plugin {
     const metadata = new ObsidianMetadataStore(this.app);
     this.metadata = metadata;
     const vaultFiles = new ObsidianVaultFiles(this.app);
+    this.vaultFiles = vaultFiles;
     this.registry = new FileRegistry(metadata, vaultFiles, this.settings.deviceId, () => this.settings);
     this.contentStore = new ContentStore(metadata);
     const watcher = new ObsidianVaultWatcher(this.app);
@@ -244,7 +246,7 @@ export default class VaultSyncPlugin extends Plugin {
         token: this.settings.serverToken,
       });
       const host = new PluginVaultSyncHost(
-        this.app,
+        this.vaultFiles,
         this.settings.deviceId,
         this.registry,
         this.contentStore,

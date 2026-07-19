@@ -19,19 +19,20 @@ export class FakeVaultWatcher implements VaultWatcher {
     this.handlers = null;
   }
 
-  emitCreate(path: string): void {
-    this.handlers?.onCreate(path);
+  async emitCreate(path: string): Promise<void> {
+    await this.handlers?.onCreate(path);
   }
 
   emitModify(path: string): void {
-    this.handlers?.onModify(path);
+    // Modify is debounced (handler only arms a timer); tests await it via flush().
+    void this.handlers?.onModify(path);
   }
 
-  emitDelete(path: string): void {
-    this.handlers?.onDelete(path);
+  async emitDelete(path: string): Promise<void> {
+    await this.handlers?.onDelete(path);
   }
 
-  emitRename(path: string, oldPath: string): void {
-    this.handlers?.onRename(path, oldPath);
+  async emitRename(path: string, oldPath: string): Promise<void> {
+    await this.handlers?.onRename(path, oldPath);
   }
 }

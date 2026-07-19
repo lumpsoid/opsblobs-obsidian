@@ -8,9 +8,9 @@
 //  Deferred out of P3 (which tested the round against in-memory fakes); this is
 //  the production wiring.
 
-import { App, TFile } from 'obsidian';
 import { VaultState, FileEntry, MergeAction } from '../types';
 import { VaultSyncHost } from './server-sync';
+import { VaultFiles } from '../ports/vault-files';
 import { FileRegistry } from '../core/file-registry';
 import { ContentStore, hashContent } from '../core/content-store';
 import { OperationLogger } from '../core/operation-logger';
@@ -20,7 +20,7 @@ import { CursorStore } from './cursor-store';
 
 export class PluginVaultSyncHost implements VaultSyncHost {
   constructor(
-    private app: App,
+    private files: VaultFiles,
     private deviceId: string,
     private registry: FileRegistry,
     private contentStore: ContentStore,
@@ -44,9 +44,8 @@ export class PluginVaultSyncHost implements VaultSyncHost {
       let resolved = entry;
 
       if (!entry.deleted) {
-        const file = this.app.vault.getAbstractFileByPath(entry.path);
-        if (file instanceof TFile) {
-          const content = new Uint8Array(await this.app.vault.readBinary(file));
+        const content = await this.files.read(entry.path);
+        if (content !== null) {
           const hash = await hashContent(content);
           // Key the bytes under their *actual* hash, never the registry's
           // recorded one. If an edit hasn't been logged yet the recorded hash is

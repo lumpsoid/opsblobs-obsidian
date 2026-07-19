@@ -14,7 +14,11 @@ import { HLC } from '../types';
 export class HybridLogicalClock {
   private current: HLC;
 
-  constructor(deviceId: string, initial?: HLC) {
+  constructor(
+    deviceId: string,
+    initial?: HLC,
+    private wallClock: () => number = () => Date.now(),
+  ) {
     this.current = initial ?? { wallTime: 0, counter: 0, deviceId };
   }
 
@@ -23,7 +27,7 @@ export class HybridLogicalClock {
    * Increments counter if wall clock hasn't advanced.
    */
   now(): HLC {
-    const wall = Date.now();
+    const wall = this.wallClock();
     if (wall > this.current.wallTime) {
       this.current = { wallTime: wall, counter: 0, deviceId: this.current.deviceId };
     } else {
@@ -41,7 +45,7 @@ export class HybridLogicalClock {
    * Advances the local clock past the remote's timestamp.
    */
   merge(remote: HLC): HLC {
-    const wall = Date.now();
+    const wall = this.wallClock();
     const maxWall = Math.max(wall, this.current.wallTime, remote.wallTime);
 
     let counter: number;

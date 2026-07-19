@@ -9,10 +9,10 @@
 //  emits synthetic events to drive the real device stack in tests.
 
 export interface VaultChangeHandlers {
-  onCreate(path: string): void;
-  onModify(path: string): void;
-  onDelete(path: string): void;
-  onRename(path: string, oldPath: string): void;
+  onCreate(path: string): void | Promise<void>;
+  onModify(path: string): void | Promise<void>;
+  onDelete(path: string): void | Promise<void>;
+  onRename(path: string, oldPath: string): void | Promise<void>;
 }
 
 export interface VaultWatcher {

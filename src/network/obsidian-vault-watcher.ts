@@ -17,16 +17,16 @@ export class ObsidianVaultWatcher implements VaultWatcher {
 
   start(handlers: VaultChangeHandlers): void {
     const onCreate = this.app.vault.on('create', file => {
-      if (file instanceof TFile) handlers.onCreate(file.path);
+      if (file instanceof TFile) void handlers.onCreate(file.path);
     });
     const onModify = this.app.vault.on('modify', file => {
-      if (file instanceof TFile) handlers.onModify(file.path);
+      if (file instanceof TFile) void handlers.onModify(file.path);
     });
     const onDelete = this.app.vault.on('delete', file => {
-      if (file instanceof TFile) handlers.onDelete(file.path);
+      if (file instanceof TFile) void handlers.onDelete(file.path);
     });
     const onRename = this.app.vault.on('rename', (file, oldPath) => {
-      if (file instanceof TFile) handlers.onRename(file.path, oldPath);
+      if (file instanceof TFile) void handlers.onRename(file.path, oldPath);
     });
 
     this.removers.push(

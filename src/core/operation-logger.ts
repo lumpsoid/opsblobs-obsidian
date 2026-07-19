@@ -114,10 +114,13 @@ export class OperationLogger {
 
   startListening(): void {
     this.watcher.start({
-      onCreate: path => void this.handleCreate(path),
+      // Return the handler promise so a test-driven watcher can await the async
+      // create/delete/rename path deterministically. `handleModify` stays void:
+      // it only arms a debounce timer, and `flush()` awaits the eventual work.
+      onCreate: path => this.handleCreate(path),
       onModify: path => this.handleModify(path),
-      onDelete: path => void this.handleDelete(path),
-      onRename: (path, oldPath) => void this.handleRename(path, oldPath),
+      onDelete: path => this.handleDelete(path),
+      onRename: (path, oldPath) => this.handleRename(path, oldPath),
     });
   }
 
