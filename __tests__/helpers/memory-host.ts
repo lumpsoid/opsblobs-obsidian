@@ -16,6 +16,10 @@ import { hlcMax } from '../../src/core/hlc';
  *  resolved bytes (as a real user's modal choice would). */
 export type ConflictResolver = (action: Extract<MergeAction, { type: 'conflict' }>) => Uint8Array;
 
+/** How a device resolves a delete/modify(-or-rename) conflict. */
+export type DeleteConflictResolver =
+  (action: Extract<MergeAction, { type: 'delete_conflict' }>) => 'keep_deleted' | 'restore';
+
 /** An HLC that strictly dominates both inputs — what the client's clock holds
  *  after `setCurrent(mergedHlc)` + `now()`, so a resolution wins on peers. */
 function dominatingHlc(a: HLC, b: HLC, deviceId: string): HLC {
@@ -50,6 +54,10 @@ export class MemoryHost implements VaultSyncHost {
    *  as an op — mirroring SyncApplicator's production behaviour. Unset devices
    *  leave a conflict unresolved (as if the modal was dismissed). */
   resolveConflict?: ConflictResolver;
+
+  /** When set, `delete_conflict` actions are resolved with this decision,
+   *  mirroring SyncApplicator's `onDeleteConflict`. Unset ⇒ 'keep_deleted'. */
+  resolveDeleteConflict?: DeleteConflictResolver;
 
   constructor(private deviceId: string) {}
 
@@ -92,12 +100,32 @@ export class MemoryHost implements VaultSyncHost {
         this.disk.set(a.fileId, a.content);
         this.fileEntries.set(a.fileId, {
           id: a.fileId, path: a.path, contentHash: hash,
-          hlcTimestamp: a.hlc, deleted: false, ancestorContentHash: hash,
+          hlcTimestamp: a.hlc, deleted: false, ancestorContentHash: hash, ancestorPath: a.path,
         });
       } else if (a.type === 'delete_local') {
         const e = this.fileEntries.get(a.fileId);
         if (e) this.fileEntries.set(a.fileId, { ...e, deleted: true });
         this.disk.delete(a.fileId);
+      } else if (a.type === 'delete_conflict') {
+        // Mirror SyncApplicator: ask the resolver (default keep_deleted). On
+        // 'restore' the file survives at a.path with a.content; the id is
+        // preserved. Not re-emitted as an op — same as production today.
+        const decision = this.resolveDeleteConflict ? this.resolveDeleteConflict(a) : 'keep_deleted';
+        const e = this.fileEntries.get(a.fileId);
+        if (decision === 'restore') {
+          const hash = await sha256Hex(a.content);
+          this.content.set(hash, a.content);
+          this.disk.set(a.fileId, a.content);
+          this.fileEntries.set(a.fileId, {
+            id: a.fileId, path: a.path, contentHash: hash,
+            hlcTimestamp: e?.hlcTimestamp ?? { wallTime: 0, counter: 0, deviceId: this.deviceId },
+            deleted: false, ancestorContentHash: e?.ancestorContentHash ?? null,
+            ancestorPath: e?.ancestorPath ?? null,
+          });
+        } else {
+          if (e) this.fileEntries.set(a.fileId, { ...e, deleted: true });
+          this.disk.delete(a.fileId);
+        }
       } else if (a.type === 'move_local') {
         // Mirror SyncApplicator.moveLocalFile: the file id is unchanged, only its
         // path moves to the winning side's path.
@@ -121,7 +149,7 @@ export class MemoryHost implements VaultSyncHost {
         this.disk.set(a.fileId, resolved);
         this.fileEntries.set(a.fileId, {
           id: a.fileId, path: a.localPath, contentHash: hash,
-          hlcTimestamp: hlc, deleted: false, ancestorContentHash: hash,
+          hlcTimestamp: hlc, deleted: false, ancestorContentHash: hash, ancestorPath: a.localPath,
         });
         this.pendingOps.push({
           id: `${this.deviceId}-resolve-${a.fileId}-${hash.slice(0, 12)}`,

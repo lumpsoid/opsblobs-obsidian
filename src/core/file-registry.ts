@@ -149,16 +149,20 @@ export class FileRegistry {
       hlcTimestamp: hlc,
       deleted: false,
       ancestorContentHash: contentHash,
+      ancestorPath: path,
     });
     this.pathIndex.set(path, id);
     await this.save();
   }
 
-  /** Set the ancestor hash after a successful sync. */
+  /** Set the ancestor (content hash + path) after a successful sync. The current
+   *  path *is* the synced path at this point, so it becomes the ancestor path —
+   *  a later local rename then reads as a change since the last sync. */
   async setAncestorHash(fileId: string, hash: string): Promise<void> {
     const entry = this.entries.get(fileId);
     if (!entry) return;
     entry.ancestorContentHash = hash;
+    entry.ancestorPath = entry.path;
     this.entries.set(fileId, entry);
     await this.save();
   }

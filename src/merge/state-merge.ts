@@ -215,13 +215,20 @@ function resolveRenameConflict(fileId: string, le: FileEntry, re: FileEntry): Me
 
 /**
  * Has this entry been left untouched since the last common sync? True only when
- * we have a recorded ancestor hash and the current content still equals it — the
- * signal that the *other* side's deletion can be applied cleanly rather than
- * surfaced as a delete/modify conflict. A null ancestor (never synced) is treated
- * as "changed" so we err toward asking.
+ * we have a recorded ancestor hash, the current content still equals it, *and*
+ * the path is unchanged — the signal that the *other* side's deletion can be
+ * applied cleanly rather than surfaced as a delete/modify(-or-rename) conflict.
+ * A null content ancestor (never synced) is treated as "changed" so we err
+ * toward asking. A renamed file (path differs from the ancestor path) counts as
+ * touched: a concurrent delete of it is a delete/rename conflict, not a silent
+ * removal. A legacy entry lacking an ancestor path is treated as un-renamed so
+ * the migration doesn't manufacture false conflicts.
  */
 function isUnchangedSinceAncestor(entry: FileEntry): boolean {
-  return entry.ancestorContentHash !== null && entry.contentHash === entry.ancestorContentHash;
+  const contentUnchanged =
+    entry.ancestorContentHash !== null && entry.contentHash === entry.ancestorContentHash;
+  const pathUnchanged = entry.ancestorPath == null || entry.path === entry.ancestorPath;
+  return contentUnchanged && pathUnchanged;
 }
 
 /** Heuristic binary detection: check for null bytes in the first 8KB. */

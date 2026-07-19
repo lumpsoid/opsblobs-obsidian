@@ -15,6 +15,11 @@ export interface FileEntry {
   hlcTimestamp: HLC;                   // hybrid logical clock at last modification
   deleted: boolean;                    // tombstone flag
   ancestorContentHash: string | null;  // hash at last successful sync (for three-way merge)
+  // Path at last successful sync. Lets the merge tell a *rename* since the last
+  // sync from an untouched file: a concurrent delete of an untouched file
+  // propagates cleanly, but of a renamed one is a delete/rename conflict.
+  // Optional for migration — a legacy entry without it is treated as un-renamed.
+  ancestorPath?: string | null;
   // Content hashes this entry's content resolved/superseded. Set only on a
   // user-resolved conflict: the two conflicting sides the human chose between.
   // A peer that still holds one of these hashes adopts this content cleanly
