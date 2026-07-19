@@ -9,6 +9,7 @@ import { FileRegistry } from '../core/file-registry';
 import { ContentStore, hashContent } from '../core/content-store';
 import { OperationLogger } from '../core/operation-logger';
 import { HybridLogicalClock } from '../core/hlc';
+import { nextAncestorHash } from '../merge/ancestor-policy';
 
 export type ConflictHandler = (action: Extract<MergeAction, { type: 'conflict' }>) => Promise<Uint8Array | null>;
 export type DeleteConflictHandler = (action: Extract<MergeAction, { type: 'delete_conflict' }>) => Promise<'keep_deleted' | 'restore'>;
@@ -211,27 +212,20 @@ export class SyncApplicator {
     local: VaultState,
     remote: VaultState,
   ): Promise<void> {
+    // The advance *decision* (first-sync / action-type branching, and the
+    // send_remote-only-on-first-sync rule whose violation caused the reported
+    // data loss) lives in the pure `nextAncestorHash` domain policy. The shell
+    // only performs effects: `write_local` must hash freshly written bytes
+    // (async I/O the policy can't do), so its branch stays here; everything else
+    // asks the policy for the hash to set.
     for (const action of actions) {
       if (action.type === 'write_local') {
         const hash = await hashContent(action.content);
         await this.registry.setAncestorHash(action.fileId, hash);
-      } else if (action.type === 'no_op' || action.type === 'send_remote') {
-        const entry = local.fileEntries.get(action.fileId);
-        if (entry && !entry.deleted) {
-          // `send_remote` must only *establish* a missing ancestor — the first
-          // ever sync of a never-synced file, where a null ancestor means no
-          // peer holds a divergent copy, so the current content is a safe common
-          // base. It must NOT advance an existing ancestor: pushing our own edit
-          // to the server is not a peer acknowledgement, and a peer that edited
-          // the same file concurrently still diverged from the *previous* base.
-          // Advancing here would make our next merge treat our un-acknowledged
-          // edit as the base, see "local unchanged", and silently adopt the
-          // peer's version — the reported data-loss bug. `no_op` means both
-          // sides already hold this content, so advancing is always safe.
-          const isFirstSync = entry.ancestorContentHash === null;
-          if (action.type === 'no_op' || isFirstSync) {
-            await this.registry.setAncestorHash(action.fileId, entry.contentHash);
-          }
+      } else {
+        const next = nextAncestorHash(action, local.fileEntries.get(action.fileId));
+        if (next !== null) {
+          await this.registry.setAncestorHash(action.fileId, next);
         }
       }
     }
