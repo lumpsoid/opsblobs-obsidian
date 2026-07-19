@@ -300,6 +300,33 @@ Only after P3/P4 prove the server path.
 
 **Exit:** no P2P code paths remain; bundle shrinks; docs reflect server-only.
 
+**Status (2026-07-19): DONE.**
+- **Deleted the three P2P source files** — `src/network/sync-server.ts` (Node-`http` peer
+  responder), `src/network/sync-client.ts` (peer pull→merge→push, superseded by
+  `server-sync.ts`), and `src/ui/pairing-modal.ts` (IP/port/pairing-code UI). All three were
+  already unimported after P4, so removal is a pure subtraction — `main.ts` and `settings-tab.ts`
+  needed no change.
+- **`encryption.ts` slimmed to `VaultCrypto` only** — removed the legacy pairing-transport
+  `Encryption` class (`importKey`/`generateKey`/`deriveKey`/`encrypt`/`decrypt`/`keyFingerprint`)
+  and the pairing helpers `generatePairingCode` / `generateSalt`. Kept the shared byte/base64/hex
+  helpers (`bytesToBase64`, `base64ToBytes`, `bytesToHex`) — used internally by `VaultCrypto`.
+- **`types.ts` — protocol + pairing types retired** — dropped `SyncSession`, `PairedDevice`, the
+  whole `Proto*` message family (`ProtoHello`/`ProtoOpsExchange`/`ProtoStateExchange`/
+  `ProtoContentRequest`/`ProtoContentResponse`/`ProtoContentPush`/`ProtoSyncComplete`/`ProtoError`
+  + the `ProtoMessage` union), and the legacy `pairedDevices` / `syncPort` settings fields (from
+  both `SyncSettings` and `DEFAULT_SETTINGS`). The reused payload types (`HLC`, `FileEntry`,
+  `Operation`, `VaultState`, `MergeAction`, merge-result types) stay.
+- **Docs** — README rewritten off the "mid-pivot / legacy P2P" framing to describe the server-only
+  design as the actual architecture: new encryption-model + architecture/file-structure sections
+  reflecting the current tree, "What's left" narrowed to the P6 server service + P7 release, and
+  the roadmap updated (M3–M5 done). One stale `sync-client.ts` reference in the `server-sync.ts`
+  header comment reworded.
+- **Build + tests green** (52 pass / 0 skip, unchanged — nothing tested the deleted P2P path).
+  Lint **98 → 25 problems**: `types.ts` and `encryption.ts` are now clean; every survivor is the
+  deferred UI-guideline category in `conflict-modal.ts` / `settings-tab.ts` (sentence-case,
+  `.obsidian` config-path, a `<style>` element). No `eslint-disable`/ignore added; CI `lint` stays
+  advisory pending a UI polish pass.
+
 ---
 
 ## Phase 6 — Server service  🔴 (separate service/repo, parallel from P2)

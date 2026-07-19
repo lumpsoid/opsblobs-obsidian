@@ -4,8 +4,8 @@
 //
 //  The client half of docs/server-api-spec.md. Speaks to an *untrusted* server
 //  that stores only ciphertext + routing metadata and never merges. A sync round
-//  is the same pull → merge → push shape sync-client.ts used peer-to-peer,
-//  retargeted from a peer to the oplog endpoints.
+//  is a pull → merge → push flow retargeted onto the oplog endpoints (the shape
+//  the retired P2P client used, now against the server rather than a peer).
 //
 //  This module is deliberately free of any `obsidian` import so it can be unit-
 //  tested against an in-memory fake (see fake-server.ts). The two sides it talks

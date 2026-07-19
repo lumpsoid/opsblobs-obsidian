@@ -69,25 +69,6 @@ export interface StateMergeResult {
   mergedHlc: HLC;
 }
 
-export interface SyncSession {
-  sessionId: string;
-  remoteDeviceId: string;
-  startedAt: number;
-  status: 'connecting' | 'exchanging' | 'merging' | 'transferring' | 'applying' | 'complete' | 'error';
-  progress?: { current: number; total: number; label: string };
-  error?: string;
-}
-
-export interface PairedDevice {
-  deviceId: string;
-  deviceName: string;
-  encryptionKeyBase64: string;
-  lastSyncHlc: HLC | null;
-  lastSyncTime: number | null;
-  lastKnownIp?: string;    // IP of this device on its local network
-  lastKnownPort?: number;  // port of this device's sync server
-}
-
 export interface SyncSettings {
   deviceId: string;
   deviceName: string;
@@ -106,10 +87,6 @@ export interface SyncSettings {
   deleteConflictStrategy: 'ask' | 'keep_deleted' | 'keep_modified';
   syncObsidianConfig: boolean;
   ancestorRetentionDays: number;
-
-  // ── Legacy P2P (removed in P5) ──────────────────────────────────────────
-  pairedDevices: PairedDevice[];
-  syncPort: number;
 }
 
 export const DEFAULT_SETTINGS: SyncSettings = {
@@ -131,64 +108,4 @@ export const DEFAULT_SETTINGS: SyncSettings = {
   deleteConflictStrategy: 'ask',
   syncObsidianConfig: false,
   ancestorRetentionDays: 30,
-  pairedDevices: [],
-  syncPort: 47821,
 };
-
-// ─── Protocol messages ────────────────────────────────────────────────────────
-
-export interface ProtoHello {
-  type: 'HELLO';
-  deviceId: string;
-  deviceName: string;
-  hlc: HLC;
-  sessionId: string;
-}
-
-export interface ProtoOpsExchange {
-  type: 'OPS_SINCE';
-  ops: Operation[];
-  lastSyncHlc: HLC | null;
-}
-
-export interface ProtoStateExchange {
-  type: 'STATE';
-  fileEntries: Array<[string, FileEntry]>;  // serialised map entries
-  hashesNeeded?: string[];  // hashes the responding side needs from the sender
-}
-
-export interface ProtoContentRequest {
-  type: 'CONTENT_REQUEST';
-  hashes: string[];
-}
-
-export interface ProtoContentResponse {
-  type: 'CONTENT';
-  chunks: Array<{ hash: string; dataBase64: string }>;
-}
-
-export interface ProtoSyncComplete {
-  type: 'SYNC_COMPLETE';
-  newHlc: HLC;
-}
-
-export interface ProtoContentPush {
-  type: 'CONTENT_PUSH';
-  chunks: Array<{ hash: string; dataBase64: string }>;
-}
-
-export interface ProtoError {
-  type: 'ERROR';
-  code: string;
-  message: string;
-}
-
-export type ProtoMessage =
-  | ProtoHello
-  | ProtoOpsExchange
-  | ProtoStateExchange
-  | ProtoContentRequest
-  | ProtoContentResponse
-  | ProtoContentPush
-  | ProtoSyncComplete
-  | ProtoError;
