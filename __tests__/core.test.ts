@@ -333,6 +333,67 @@ describe('mergeVaultStates', () => {
     );
   });
 
+  // ── F1: never fabricate empty content when the winner's bytes are missing ──
+  test('both modified, remote wins by HLC but remote content missing → no_op (never write empty)', () => {
+    // Both sides edited file1; remote wins last-writer-wins, but its winning
+    // blob is transiently absent from its content store (e.g. fetchRemoteBlobs
+    // skipped it). Writing must be declined, not fabricated as zero bytes.
+    const local = makeState('A', [
+      { id: 'file1', contentHash: 'local-hash', ancestorContentHash: 'base', hlcTimestamp: { wallTime: 1000, counter: 0, deviceId: 'A' } },
+    ]);
+    const remote = makeState('B', [
+      { id: 'file1', contentHash: 'remote-hash', ancestorContentHash: 'base', hlcTimestamp: { wallTime: 2000, counter: 0, deviceId: 'B' } },
+    ]);
+    remote.contentStore.delete('remote-hash'); // winning side's bytes unavailable
+
+    const { actions } = mergeVaultStates(local, remote);
+    const action = actions.find(a => a.fileId === 'file1')!;
+    expect(action.type).toBe('no_op');
+    // Must NOT fabricate an empty write_local that truncates the local file.
+    expect(actions).not.toContainEqual(
+      expect.objectContaining({ type: 'write_local', fileId: 'file1' }),
+    );
+  });
+
+  test('local deleted / remote modified but surviving content missing → no_op (no empty delete_conflict)', () => {
+    // A delete/modify conflict where the surviving (remote) side's bytes are
+    // absent: emitting a delete_conflict carrying empty content would restore an
+    // empty file. Decline instead.
+    const local = makeState('A', [
+      { id: 'file1', deleted: true, hlcTimestamp: { wallTime: 1000, counter: 0, deviceId: 'A' } },
+    ]);
+    const remote = makeState('B', [
+      { id: 'file1', contentHash: 'remote-hash', hlcTimestamp: { wallTime: 2000, counter: 0, deviceId: 'B' } },
+    ]);
+    remote.contentStore.delete('remote-hash'); // surviving side's bytes unavailable
+
+    const { actions } = mergeVaultStates(local, remote);
+    const action = actions.find(a => a.fileId === 'file1')!;
+    expect(action.type).toBe('no_op');
+    expect(actions).not.toContainEqual(
+      expect.objectContaining({ type: 'delete_conflict', fileId: 'file1' }),
+    );
+  });
+
+  test('remote deleted / local modified but surviving content missing → no_op (no empty delete_conflict)', () => {
+    // Symmetric delete/modify conflict: the surviving (local) side's bytes are
+    // absent, so the delete_conflict would carry empty content. Decline instead.
+    const local = makeState('A', [
+      { id: 'file1', contentHash: 'local-hash', hlcTimestamp: { wallTime: 2000, counter: 0, deviceId: 'A' } },
+    ]);
+    const remote = makeState('B', [
+      { id: 'file1', deleted: true, hlcTimestamp: { wallTime: 1000, counter: 0, deviceId: 'B' } },
+    ]);
+    local.contentStore.delete('local-hash'); // surviving side's bytes unavailable
+
+    const { actions } = mergeVaultStates(local, remote);
+    const action = actions.find(a => a.fileId === 'file1')!;
+    expect(action.type).toBe('no_op');
+    expect(actions).not.toContainEqual(
+      expect.objectContaining({ type: 'delete_conflict', fileId: 'file1' }),
+    );
+  });
+
   test('commutativity: merge(A,B).type == merge(B,A).type', () => {
     const stateA = makeState('A', [{ id: 'f1' }, { id: 'f2' }]);
     const stateB = makeState('B', [{ id: 'f2', contentHash: 'different' }, { id: 'f3' }]);

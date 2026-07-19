@@ -131,6 +131,27 @@ export function runContractSuite(label: string, newServer: () => ContractServer)
       expect(stored && new TextDecoder().decode(stored)).toBe('# Groceries\nmilk\n');
     });
 
+    test('two devices: a genuinely empty file syncs and is created on the peer', async () => {
+      // Guards the F1 defense-in-depth: refusing to write empty content must NOT
+      // block a legitimately-empty file from being created on first sync (its
+      // empty-hash blob isn't in the peer's persistent store yet). The applicator
+      // gates on the current on-disk content (truncation), not the content store.
+      const server = newServer();
+      const vault = server.freshVault();
+      const deviceA = await TestDevice.create('dev-a');
+      const deviceB = await TestDevice.create('dev-b');
+      await deviceA.seedFile('empty.md', '', 1000);
+
+      await client(server.connect(vault), deviceA).runSync();
+      await client(server.connect(vault), deviceB).runSync();
+
+      // B materialised the empty file locally — present, zero-length, not skipped.
+      const materialised = await deviceB.files.read('empty.md');
+      expect(materialised).not.toBeNull();
+      expect(materialised!.length).toBe(0);
+      expect(deviceB.entryByPath('empty.md')).toBeDefined();
+    });
+
     test('blobs dedupe across devices with identical content', async () => {
       const server = newServer();
       const vault = server.freshVault();

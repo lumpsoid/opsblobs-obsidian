@@ -102,7 +102,11 @@ function classifyAndResolve(
     if (isUnchangedSinceAncestor(re)) {
       return { type: 'delete_remote', fileId, path: re.path };
     }
-    const content = remote.contentStore.get(re.contentHash) ?? new Uint8Array();
+    // Content is hash-addressed: an unchanged-content rename's bytes are skipped
+    // by fetchRemoteBlobs (we already hold them locally), so fall back to the
+    // local store before declining.
+    const content = remote.contentStore.get(re.contentHash) ?? local.contentStore.get(re.contentHash);
+    if (!content) return { type: 'no_op', fileId }; // surviving bytes unavailable — defer, don't restore empty
     return { type: 'delete_conflict', fileId, path: re.path, side: 'local_deleted', content, parentHashes: [le.contentHash, re.contentHash] };
   }
 
@@ -116,7 +120,10 @@ function classifyAndResolve(
     if (isUnchangedSinceAncestor(le)) {
       return { type: 'delete_local', fileId, path: le.path };
     }
-    const content = local.contentStore.get(le.contentHash) ?? new Uint8Array();
+    // Hash-addressed: fall back to the remote store in case the local copy was
+    // GC'd but the same bytes are held remotely, before declining.
+    const content = local.contentStore.get(le.contentHash) ?? remote.contentStore.get(le.contentHash);
+    if (!content) return { type: 'no_op', fileId }; // surviving bytes unavailable — defer, don't restore empty
     return { type: 'delete_conflict', fileId, path: le.path, side: 'remote_deleted', content, parentHashes: [le.contentHash, re.contentHash] };
   }
 
@@ -162,10 +169,18 @@ function resolveContentConflict(
   const remoteContent = remote.contentStore.get(re.contentHash);
 
   if (!localContent || !remoteContent) {
-    // Can't merge without content — defer to higher HLC
+    // Can't merge without content — defer to higher HLC.
     const winner = hlcCompare(le.hlcTimestamp, re.hlcTimestamp) >= 0 ? le : re;
-    const content = (winner === le ? localContent : remoteContent) ?? new Uint8Array();
-    return { type: 'write_local', fileId, path: winner.path, content, hlc: winner.hlcTimestamp };
+    const winnerContent = winner === le ? localContent : remoteContent;
+    if (!winnerContent) {
+      // The winning side's bytes are unavailable (transient blob absence). We
+      // must NOT fabricate an empty buffer and overwrite the local file with
+      // zero bytes — that turns a transient availability issue into permanent
+      // local destruction. Keep local bytes untouched and defer; the op is
+      // retried once the content appears.
+      return { type: 'no_op', fileId };
+    }
+    return { type: 'write_local', fileId, path: winner.path, content: winnerContent, hlc: winner.hlcTimestamp };
   }
 
   const localText = new TextDecoder().decode(localContent);

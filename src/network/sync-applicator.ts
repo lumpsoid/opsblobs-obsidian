@@ -93,6 +93,10 @@ export class SyncApplicator {
     switch (action.type) {
       case 'write_local': {
         const hash = await hashContent(action.content);
+        if (await this.wouldTruncateNonEmpty(action.path, action.content)) {
+          console.warn(`Vault Sync: skipping write_local for ${action.path} — refusing to truncate a non-empty file with empty content`);
+          return null;
+        }
         await this.files.write(action.path, action.content);
         await this.contentStore.put(hash, action.content);
         // Adopt the remote file's identity (its UUID) so both devices track this
@@ -156,6 +160,10 @@ export class SyncApplicator {
         const hlcTs = this.hlc.now();
         const hash = await hashContent(action.content);
         if (decision === 'restore') {
+          if (await this.wouldTruncateNonEmpty(action.path, action.content)) {
+            console.warn(`Vault Sync: skipping delete_conflict restore for ${action.path} — refusing to overwrite a non-empty file with empty content`);
+            return null;
+          }
           // Keep the file. Re-assert its presence (undeleting our own copy if we
           // were the deleting side) and make the restored content the new ancestor.
           await this.files.write(action.path, action.content);
@@ -176,6 +184,24 @@ export class SyncApplicator {
         // These are handled by the transport layer, not the applicator
         return null;
     }
+  }
+
+  /**
+   * Defense-in-depth for F1: a destructive write must never *truncate* a file —
+   * i.e. replace existing non-empty bytes with an empty buffer. State-merge
+   * already declines to emit a write/restore when the winning side's bytes are
+   * missing; this is the backstop if an empty buffer nonetheless reaches the
+   * applicator. It targets the real hazard (silent truncation of a non-empty
+   * file) rather than "any empty content": writing empty over an already-empty
+   * or absent file is harmless, and — crucially — a peer's genuinely-empty file
+   * must still be created here on first sync (its empty-hash blob isn't in this
+   * device's persistent store yet), so we gate on the *current on-disk* content,
+   * not the content store. The read only happens for the rare empty-buffer case.
+   */
+  private async wouldTruncateNonEmpty(path: string, content: Uint8Array): Promise<boolean> {
+    if (content.length > 0) return false;
+    const current = await this.files.read(path);
+    return current !== null && current.length > 0;
   }
 
   private async updateAncestorHashes(
