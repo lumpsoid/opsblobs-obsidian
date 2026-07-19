@@ -11,6 +11,10 @@
 import { describe, test, expect, beforeAll } from 'vitest';
 import {
   ServerSyncClient,
+  ServerApi,
+  PullOpsResult,
+  AppendOp,
+  AppendResult,
   reconstructRemoteState,
 } from '../src/network/server-sync';
 import { FakeSyncServer, MissingBlobError } from '../src/network/fake-server';
@@ -19,6 +23,21 @@ import { Operation } from '../src/types';
 import { TestDevice } from './helpers/test-device';
 
 const SALT = new Uint8Array([9, 9, 9, 9, 9, 9, 9, 9, 8, 8, 8, 8, 8, 8, 8, 8]);
+
+/** Wraps a FakeSyncServer so its blob store can be gated off: while
+ *  `blobAvailable` is false, `getBlob` returns null (the "blob momentarily
+ *  absent at pull" condition F3 guards against). Everything else delegates. */
+class BlobGatedServer implements ServerApi {
+  blobAvailable = true;
+  constructor(private readonly inner: FakeSyncServer) {}
+  pullOps(since: number, limit: number): Promise<PullOpsResult> { return this.inner.pullOps(since, limit); }
+  appendOps(baseCursor: number, ops: AppendOp[]): Promise<AppendResult> { return this.inner.appendOps(baseCursor, ops); }
+  checkBlobs(hashes: string[]): Promise<{ missing: string[] }> { return this.inner.checkBlobs(hashes); }
+  putBlob(hash: string, bytes: Uint8Array): Promise<void> { return this.inner.putBlob(hash, bytes); }
+  async getBlob(hash: string): Promise<Uint8Array | null> {
+    return this.blobAvailable ? this.inner.getBlob(hash) : null;
+  }
+}
 
 function client(api: FakeSyncServer, crypto: VaultCrypto, device: TestDevice): ServerSyncClient {
   // The client shares the device's HLC so `setCurrent(mergedHlc)` + `now()` land
@@ -150,6 +169,43 @@ describe('ServerSyncClient — full round against the fake', () => {
     expect(deviceA.pendingOps).toHaveLength(0);
     const onDisk = await deviceA.files.read('a.md');
     expect(onDisk && new TextDecoder().decode(onDisk)).toBe('hello');
+  });
+
+  test('a temporarily-unavailable blob is retried; the cursor never strands the op (F3)', async () => {
+    const inner = new FakeSyncServer();
+    const gated = new BlobGatedServer(inner);
+    const deviceA = await device('dev-a');
+    const deviceB = await device('dev-b');
+    const body = '# Later\nappears eventually\n';
+    const id = await deviceA.seedFile('later.md', body, 1000);
+    const hash = deviceA.entry(id)!.contentHash;
+
+    const clientFor = (d: TestDevice) =>
+      new ServerSyncClient({ api: gated, crypto: vc, host: d.host, hlc: d.hlc });
+
+    // ── A pushes the create: both the blob and the op land on the server. ──
+    await clientFor(deviceA).runSync();
+    expect(inner.opCount).toBe(1);
+    expect(inner.blobCount).toBe(1);
+
+    // ── B pulls while the blob is unavailable — the op is consumed but its
+    //    content can't be fetched, so the file must NOT be applied and the
+    //    cursor must NOT advance past that op. ──
+    gated.blobAvailable = false;
+    await clientFor(deviceB).runSync();
+    expect(await deviceB.files.read('later.md')).toBeNull();  // not applied
+    expect(deviceB.entry(id)).toBeUndefined();                // no registry entry
+    expect(await deviceB.cursor()).toBe(0);                   // cursor stranded → not advanced past seq 1
+
+    // ── The blob becomes available; B syncs again → the op is re-pulled and
+    //    the file finally applies. No permanent skip. ──
+    gated.blobAvailable = true;
+    await clientFor(deviceB).runSync();
+    expect(await deviceB.cursor()).toBe(1);
+    const onDisk = await deviceB.files.read('later.md');
+    expect(onDisk && new TextDecoder().decode(onDisk)).toBe(body);
+    expect(deviceB.entry(id)!.contentHash).toBe(hash);
+    expect(deviceB.entry(id)!.deleted).toBe(false);
   });
 
   test('blobs are deduplicated across devices via blobs:check', async () => {

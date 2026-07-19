@@ -62,6 +62,14 @@ export interface ServerApi {
   getBlob(hash: string): Promise<Uint8Array | null>;
 }
 
+/** A pulled, decrypted op paired with its server `seq`. The decrypted
+ *  {@link Operation} doesn't carry a seq, so we keep it alongside to compute a
+ *  cursor that never strands an op whose content was unavailable (F3). */
+interface PulledOp {
+  seq: number;
+  op: Operation;
+}
+
 // ─── Local vault side (Obsidian-coupled impl injected by the plugin) ────────────
 
 /**
@@ -133,14 +141,14 @@ export class ServerSyncClient {
 
     // ── 1. Pull remote ops since our cursor ──────────────────────────────────
     this.onProgress?.('Pulling changes…');
-    const { ops: remoteOps, cursor: pulledCursor } = await this.pullAll(startCursor);
+    const { ops: pulled, cursor: pulledCursor } = await this.pullAll(startCursor);
 
     // ── 2. Reconstruct the remote projection and fetch the content it needs ──
     // Exclude our own re-pulled ops — projecting them would make a fresh local
     // edit merge against our own history and corrupt the ancestor (see the
     // reconstructRemoteState docs).
-    const remote = reconstructRemoteState(remoteOps, local.deviceId);
-    await this.fetchRemoteBlobs(remote, local);
+    const remote = reconstructRemoteState(pulled.map(p => p.op), local.deviceId);
+    const missingContent = await this.fetchRemoteBlobs(remote, local);
 
     // ── 3. Push our pending ops (blobs first, then the append) ───────────────
     if (local.pendingOps.length > 0) {
@@ -165,18 +173,29 @@ export class ServerSyncClient {
     // have appended between our pull and our push, and those ops sit at
     // seq ∈ (pulledCursor, headCursor]. Jumping to headCursor would skip them.
     // Our own just-pushed ops re-pull once next round and merge to a no-op.
-    await this.host.saveCursor(pulledCursor);
+    //
+    // But never advance *past* an op whose content we couldn't obtain this round
+    // (F3). Its merge no-op'd (F1: unavailable content is deferred, not lost);
+    // if we advanced past it, nothing would ever re-pull it once the blob
+    // appeared and the file would be stranded. Cap the saved cursor just below
+    // the earliest op referencing a still-missing content hash so the next round
+    // re-pulls and retries it.
+    await this.host.saveCursor(safeCursor(pulled, pulledCursor, missingContent));
   }
 
-  /** Loop `GET /ops?since` until drained, decrypting each record to an Operation. */
-  private async pullAll(startCursor: number): Promise<{ ops: Operation[]; cursor: number }> {
-    const ops: Operation[] = [];
+  /**
+   * Loop `GET /ops?since` until drained, decrypting each record to an Operation.
+   * Each op keeps its server `seq` (the decrypted Operation doesn't carry one) so
+   * the caller can compute a cursor that never strands an unapplied op (F3).
+   */
+  private async pullAll(startCursor: number): Promise<{ ops: PulledOp[]; cursor: number }> {
+    const ops: PulledOp[] = [];
     let cursor = startCursor;
     // Bounded to avoid an accidental infinite loop if a server misreports hasMore.
     for (;;) {
       const page = await this.api.pullOps(cursor, this.opsLimit);
       for (const rec of page.ops) {
-        ops.push(await this.crypto.decryptOp<Operation>(rec.ciphertext));
+        ops.push({ seq: rec.seq, op: await this.crypto.decryptOp<Operation>(rec.ciphertext) });
       }
       cursor = page.nextCursor;
       if (!page.hasMore || page.ops.length === 0) break;
@@ -189,26 +208,32 @@ export class ServerSyncClient {
    * fetch its blob (by the *blinded* hash), decrypt it, verify it hashes back to
    * the asserted content hash, and stage it in the remote content store so the
    * merge can read it.
+   *
+   * Returns the set of content hashes that were needed (live, not already held)
+   * but could NOT be obtained this round — the caller uses it to hold the cursor
+   * back so the ops referencing them are re-pulled and retried (F3).
    */
-  private async fetchRemoteBlobs(remote: VaultState, local: VaultState): Promise<void> {
+  private async fetchRemoteBlobs(remote: VaultState, local: VaultState): Promise<Set<string>> {
     const wanted = new Set<string>();
     for (const entry of remote.fileEntries.values()) {
       if (entry.deleted) continue;
       if (!local.contentStore.has(entry.contentHash)) wanted.add(entry.contentHash);
     }
-    if (wanted.size === 0) return;
+    const missing = new Set<string>();
+    if (wanted.size === 0) return missing;
 
     this.onProgress?.(`Downloading ${wanted.size} file(s)…`);
     for (const contentHash of wanted) {
       const blinded = await this.crypto.blindHash(contentHash);
       const envelope = await this.api.getBlob(blinded);
-      if (!envelope) continue; // referenced blob absent — skip; merge will no-op it
+      if (!envelope) { missing.add(contentHash); continue; } // absent — merge no-ops it; hold the cursor (F3)
       const content = await this.crypto.decryptBlob(envelope);
       if ((await sha256Hex(content)) !== contentHash) {
         throw new Error(`Blob ${blinded} failed content-hash verification`);
       }
       remote.contentStore.set(contentHash, content);
     }
+    return missing;
   }
 
   /**
@@ -249,6 +274,27 @@ export class ServerSyncClient {
 }
 
 // ─── Pure helpers (independently testable) ─────────────────────────────────────
+
+/**
+ * The cursor to persist for a round: `pulledCursor` normally, but capped below
+ * the earliest pulled op that references content we couldn't obtain this round
+ * (F3). Such ops merged to a no-op (F1), so advancing past them would strand the
+ * file until a manual cursor rewind. `missingContent` is already scoped to *live*
+ * remote files whose bytes weren't available (see `fetchRemoteBlobs`), so a
+ * create later superseded by a delete never holds the cursor back. Returns
+ * `min(pulledCursor, minBlockedSeq - 1)`.
+ */
+export function safeCursor(pulled: PulledOp[], pulledCursor: number, missingContent: Set<string>): number {
+  if (missingContent.size === 0) return pulledCursor;
+  let minBlocked = Infinity;
+  for (const { seq, op } of pulled) {
+    if (op.type !== 'delete' && missingContent.has(op.contentHash) && seq < minBlocked) {
+      minBlocked = seq;
+    }
+  }
+  if (minBlocked === Infinity) return pulledCursor;
+  return Math.min(pulledCursor, minBlocked - 1);
+}
 
 /**
  * Fold a stream of decrypted ops into a projected `VaultState` — "what the vault
