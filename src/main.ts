@@ -92,8 +92,11 @@ export default class VaultSyncPlugin extends Plugin {
     await this.registry.load();
     await this.opLogger.load();
 
-    // Reconcile registry with current vault
-    await this.registry.reconcileWithVault(this.hlc.now());
+    // Reconcile registry with current vault AND emit ops for anything that
+    // changed while we weren't listening — crucially, the files already present
+    // on a first enable (no create event ever fires for them). Without this the
+    // existing vault would never be pushed; only post-enable edits would sync.
+    await this.opLogger.captureOfflineChanges();
 
     // Start listening for vault changes
     this.opLogger.startListening();
@@ -219,6 +222,11 @@ export default class VaultSyncPlugin extends Plugin {
     this.updateRibbonState('syncing');
 
     try {
+      // Capture any edit still waiting in the debounce window as an op *before*
+      // building local state, so an edit-then-immediately-sync isn't raced and
+      // silently dropped by the merge.
+      await this.opLogger.flush();
+
       const api = new HttpServerApi({
         baseUrl: this.settings.serverUrl,
         vaultId: this.settings.vaultId,
@@ -304,6 +312,19 @@ export default class VaultSyncPlugin extends Plugin {
     await this.registry.reconcileWithVault(this.hlc.now());
     await this.opLogger.clearOps();
     this.updateStatusBar();
+  }
+
+  /**
+   * Re-check for conflicts: rewind the sync cursor to the start so the next sync
+   * re-pulls the whole server log and recomputes every merge. A conflict that was
+   * skipped (or dismissed) — whose remote op the cursor has already moved past,
+   * so it would never re-appear on a normal sync — is surfaced again. Local
+   * content and pending ops are untouched; already-converged files merge to a
+   * no-op, so this is safe to run anytime. Then it runs a sync.
+   */
+  async recheckConflicts(): Promise<void> {
+    await new CursorStore(this.app).save(0);
+    await this.triggerSync('manual');
   }
 
   // ─── UI helpers ───────────────────────────────────────────────────────────

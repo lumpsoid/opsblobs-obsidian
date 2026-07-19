@@ -39,6 +39,73 @@ export class OperationLogger {
     }
   }
 
+  /**
+   * Emit ops for changes that happened while we weren't listening — above all,
+   * the *first* enable on a vault that already contains files. No `create` event
+   * ever fires for pre-existing files (they were there before listeners
+   * attached), so without this pass their content never becomes an op and never
+   * reaches the server. This diffs the live vault against the registry and
+   * records the missing create/update/delete ops.
+   *
+   * Idempotent: a file whose current content already matches its registry entry
+   * produces nothing, so running it on every load never duplicates ops. Call it
+   * after `load()` and *before* `startListening()` — it mutates the registry and
+   * content store but never the vault, so it fires no vault events of its own.
+   */
+  async captureOfflineChanges(): Promise<void> {
+    let changed = false;
+    const onDisk = new Set<string>();
+
+    // ── Live files: untracked → create, content drifted → update ─────────────
+    for (const file of this.app.vault.getFiles()) {
+      if (this.isExcluded(file.path)) continue;
+      onDisk.add(file.path);
+
+      const content = await this.readFile(file);
+      const hash = await hashContent(content);
+      const entry = this.registry.getByPath(file.path);
+
+      if (entry && entry.contentHash === hash) continue; // already captured/synced
+
+      await this.contentStore.put(hash, content);
+      const hlcTs = this.hlc.now();
+
+      if (!entry) {
+        const id = await this.registry.registerFile(file, hlcTs, hash);
+        this.pendingOps.push({
+          id: this.opId(), deviceId: this.deviceId, hlcTimestamp: hlcTs,
+          fileId: id, type: 'create', path: file.path, contentHash: hash,
+        });
+      } else {
+        // A drifted hash means either a placeholder from an older op-less
+        // reconcile ('') or an edit made while the plugin was off. Either way
+        // the op carries the current content, so peers converge; `create` when
+        // it was never really captured, `update` otherwise.
+        const type = entry.contentHash === '' ? 'create' : 'update';
+        await this.registry.updateContentHash(file.path, hash, hlcTs);
+        this.pendingOps.push({
+          id: this.opId(), deviceId: this.deviceId, hlcTimestamp: hlcTs,
+          fileId: entry.id, type, path: file.path, contentHash: hash,
+        });
+      }
+      changed = true;
+    }
+
+    // ── Registry entries whose file vanished while offline → delete ──────────
+    for (const entry of this.registry.getActiveEntries()) {
+      if (this.isExcluded(entry.path) || onDisk.has(entry.path)) continue;
+      const hlcTs = this.hlc.now();
+      await this.registry.markDeleted(entry.path, hlcTs);
+      this.pendingOps.push({
+        id: this.opId(), deviceId: this.deviceId, hlcTimestamp: hlcTs,
+        fileId: entry.id, type: 'delete', path: entry.path, contentHash: entry.contentHash,
+      });
+      changed = true;
+    }
+
+    if (changed) await this.saveOpLog();
+  }
+
   startListening(): void {
     const onCreate = this.app.vault.on('create', file => {
       if (file instanceof TFile) void this.handleCreate(file);
@@ -67,6 +134,26 @@ export class OperationLogger {
     this.eventHandlers = [];
     for (const timer of this.debounceTimers.values()) clearTimeout(timer);
     this.debounceTimers.clear();
+  }
+
+  /**
+   * Immediately record any *debounced* modify that is still waiting out its
+   * timer, instead of letting the delay elapse. Call this before a sync: an
+   * edit made moments before the user hits sync would otherwise still be sitting
+   * in the debounce window, so its op wouldn't exist yet — and the sync would
+   * then merge a file whose registry hash is stale and silently drop the edit.
+   * Flushing first guarantees the edit is captured as an op (and the registry
+   * updated) before the local state is built.
+   */
+  async flush(): Promise<void> {
+    const paths = [...this.debounceTimers.keys()];
+    for (const path of paths) {
+      const timer = this.debounceTimers.get(path);
+      if (timer) clearTimeout(timer);
+      this.debounceTimers.delete(path);
+      const file = this.app.vault.getAbstractFileByPath(path);
+      if (file instanceof TFile) await this.flushModify(file);
+    }
   }
 
   // ─── Event handlers ───────────────────────────────────────────────────────

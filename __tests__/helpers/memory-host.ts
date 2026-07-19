@@ -34,10 +34,17 @@ export async function sha256Hex(content: Uint8Array): Promise<string> {
  *  so a device converges across successive rounds. */
 export class MemoryHost implements VaultSyncHost {
   fileEntries = new Map<string, FileEntry>();
-  content = new Map<string, Uint8Array>();
+  content = new Map<string, Uint8Array>();   // retained content store (by hash; ancestors etc.)
   pendingOps: Operation[] = [];
   cursor = 0;
   applied: MergeAction[] = [];
+
+  /** Current on-"disk" bytes per fileId, modelling what a device's files
+   *  actually hold — kept separate from the hash-keyed content store, exactly as
+   *  the vault (files) is separate from the ContentStore in production. When a
+   *  fileId has no override the retained content under its registry hash is used.
+   *  A divergent override models an edit not yet logged as an op. */
+  disk = new Map<string, Uint8Array>();
 
   /** When set, `conflict` actions are resolved with these bytes and re-emitted
    *  as an op — mirroring SyncApplicator's production behaviour. Unset devices
@@ -47,12 +54,32 @@ export class MemoryHost implements VaultSyncHost {
   constructor(private deviceId: string) {}
 
   async buildLocalState(): Promise<VaultState> {
+    const fileEntries = new Map<string, FileEntry>();
+    const contentStore = new Map(this.content); // retained content (ancestors, history)
+
+    for (const [id, entry] of this.fileEntries) {
+      let resolved = entry;
+      if (!entry.deleted) {
+        // Mirror the fixed PluginVaultSyncHost.buildLocalState: read the current
+        // file bytes and key them under their *real* hash, never the (possibly
+        // stale) registry hash — so a not-yet-logged edit can't alias its bytes
+        // over the ancestor and vanish in the merge.
+        const bytes = this.disk.get(id) ?? this.content.get(entry.contentHash);
+        if (bytes) {
+          const hash = await sha256Hex(bytes);
+          if (hash !== entry.contentHash) resolved = { ...entry, contentHash: hash };
+          contentStore.set(hash, bytes);
+        }
+      }
+      fileEntries.set(id, resolved);
+    }
+
     return {
       deviceId: this.deviceId,
       hlc: { wallTime: 0, counter: 0, deviceId: this.deviceId },
-      fileEntries: new Map(this.fileEntries),
+      fileEntries,
       pendingOps: [...this.pendingOps],
-      contentStore: new Map(this.content),
+      contentStore,
     };
   }
 
@@ -62,6 +89,7 @@ export class MemoryHost implements VaultSyncHost {
       if (a.type === 'write_local') {
         const hash = await sha256Hex(a.content);
         this.content.set(hash, a.content);
+        this.disk.set(a.fileId, a.content);
         this.fileEntries.set(a.fileId, {
           id: a.fileId, path: a.path, contentHash: hash,
           hlcTimestamp: a.hlc, deleted: false, ancestorContentHash: hash,
@@ -69,6 +97,7 @@ export class MemoryHost implements VaultSyncHost {
       } else if (a.type === 'delete_local') {
         const e = this.fileEntries.get(a.fileId);
         if (e) this.fileEntries.set(a.fileId, { ...e, deleted: true });
+        this.disk.delete(a.fileId);
       } else if (a.type === 'move_local') {
         // Mirror SyncApplicator.moveLocalFile: the file id is unchanged, only its
         // path moves to the winning side's path.
@@ -82,6 +111,7 @@ export class MemoryHost implements VaultSyncHost {
         const hash = await sha256Hex(resolved);
         const hlc = dominatingHlc(local.hlc, remote.hlc, this.deviceId);
         this.content.set(hash, resolved);
+        this.disk.set(a.fileId, resolved);
         this.fileEntries.set(a.fileId, {
           id: a.fileId, path: a.localPath, contentHash: hash,
           hlcTimestamp: hlc, deleted: false, ancestorContentHash: hash,
@@ -108,6 +138,7 @@ export async function seedFile(
   const hash = await sha256Hex(content);
   const hlc: HLC = { wallTime: wall, counter: 0, deviceId };
   host.content.set(hash, content);
+  host.disk.set(fileId, content);
   host.fileEntries.set(fileId, { id: fileId, path, contentHash: hash, hlcTimestamp: hlc, deleted: false, ancestorContentHash: null });
   host.pendingOps.push({ id: `${deviceId}-op-${fileId}`, deviceId, hlcTimestamp: hlc, fileId, type: 'create', path, contentHash: hash });
   return { hash };
@@ -123,6 +154,7 @@ export async function editFile(
   const hash = await sha256Hex(content);
   const hlc: HLC = { wallTime: wall, counter: 0, deviceId };
   host.content.set(hash, content);
+  host.disk.set(fileId, content);
   const entry = host.fileEntries.get(fileId)!;
   host.fileEntries.set(fileId, { ...entry, path, contentHash: hash, hlcTimestamp: hlc });
   host.pendingOps.push({ id: `${deviceId}-edit-${fileId}-${wall}`, deviceId, hlcTimestamp: hlc, fileId, type: 'update', path, contentHash: hash });
@@ -138,6 +170,7 @@ export function deleteFile(
   const hlc: HLC = { wallTime: wall, counter: 0, deviceId };
   const entry = host.fileEntries.get(fileId)!;
   host.fileEntries.set(fileId, { ...entry, deleted: true, hlcTimestamp: hlc });
+  host.disk.delete(fileId);
   host.pendingOps.push({ id: `${deviceId}-del-${fileId}-${wall}`, deviceId, hlcTimestamp: hlc, fileId, type: 'delete', path, contentHash: entry.contentHash });
 }
 

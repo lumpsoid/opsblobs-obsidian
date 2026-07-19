@@ -136,7 +136,10 @@ export class ServerSyncClient {
     const { ops: remoteOps, cursor: pulledCursor } = await this.pullAll(startCursor);
 
     // ── 2. Reconstruct the remote projection and fetch the content it needs ──
-    const remote = reconstructRemoteState(remoteOps);
+    // Exclude our own re-pulled ops — projecting them would make a fresh local
+    // edit merge against our own history and corrupt the ancestor (see the
+    // reconstructRemoteState docs).
+    const remote = reconstructRemoteState(remoteOps, local.deviceId);
     await this.fetchRemoteBlobs(remote, local);
 
     // ── 3. Push our pending ops (blobs first, then the append) ───────────────
@@ -252,17 +255,29 @@ export class ServerSyncClient {
  * looks like on the server since our cursor". Latest op per file wins by HLC
  * (the server's `seq` linearizes appends, but logical last-writer is by HLC).
  *
+ * `ownDeviceId`, when given, filters out ops this device itself authored. We
+ * re-pull our own just-pushed ops every round (we persist the pull cursor, not
+ * the append head), and projecting them as "remote" is actively harmful: merging
+ * a fresh local edit against the stale projection of our *own* earlier op yields
+ * a clean `write_local` of our own content, which then advances our ancestor to
+ * that un-acknowledged edit — so a peer's genuinely-concurrent edit later merges
+ * against the wrong base and is silently clobbered. Our local state already
+ * reflects our own ops, so excluding them is both correct and what makes the
+ * re-pull the intended no-op.
+ *
  * Ancestor hashes are intentionally null: the shared ancestor for a three-way
  * merge is whatever the *local* side recorded at its last sync, which the merge
  * already prefers. The projection is partial (only files touched since the
  * cursor) — untouched files are simply absent, which the merge treats as
  * "already in sync", producing no local change.
  */
-export function reconstructRemoteState(ops: Operation[]): VaultState {
+export function reconstructRemoteState(ops: Operation[], ownDeviceId?: string): VaultState {
   const fileEntries = new Map<string, FileEntry>();
   let maxHlc: HLC | null = null;
 
   for (const op of ops) {
+    if (ownDeviceId !== undefined && op.deviceId === ownDeviceId) continue;
+
     if (!maxHlc || hlcCompare(op.hlcTimestamp, maxHlc) > 0) maxHlc = op.hlcTimestamp;
 
     const existing = fileEntries.get(op.fileId);

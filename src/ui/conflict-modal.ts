@@ -30,13 +30,17 @@ export class ConflictResolutionModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.addClass('vault-sync-conflict-modal');
+    // Size the *modal* element (not the content), so the content never overflows
+    // its container into a horizontal scrollbar.
+    this.modalEl.addClass('vault-sync-conflict-modal');
 
     // ── Header ────────────────────────────────────────────────────────────
     const header = contentEl.createDiv('conflict-header');
     header.createEl('h2', { text: '⚠️ Merge Conflict' });
     header.createEl('p', {
-      text: `Both devices modified "${this.filePath}". Choose how to resolve each conflict below.`,
+      text: `Both devices modified "${this.filePath}". Choose how to resolve each conflict below. ` +
+        'Skipping keeps your current version (nothing is lost) — you can revisit it later with ' +
+        '“Re-check for conflicts” in Settings → Vault Sync.',
       cls: 'conflict-subtitle',
     });
 
@@ -73,14 +77,12 @@ export class ConflictResolutionModal extends Modal {
       });
 
     new ButtonComponent(footer)
-      .setButtonText('Skip This File')
+      .setButtonText('Skip for now')
+      .setTooltip('Keep your current version unchanged. Re-check later from Settings → Vault Sync.')
       .onClick(() => {
         this.resolve(null);
         this.close();
       });
-
-    // ── Styles ────────────────────────────────────────────────────────────
-    this.injectStyles();
   }
 
   onClose() {
@@ -104,7 +106,7 @@ export class ConflictResolutionModal extends Modal {
       });
 
       const resolved = current.resolution;
-      const statusBadge = chunkHeader.createEl('span', {
+      chunkHeader.createEl('span', {
         text: this.resolutionLabel(resolved),
         cls: `resolution-badge resolution-${resolved ?? 'unset'}`,
       });
@@ -179,38 +181,5 @@ export class ConflictResolutionModal extends Modal {
       case 'custom': return '✓ Custom';
       default: return '? Unresolved';
     }
-  }
-
-  private injectStyles(): void {
-    const existing = document.getElementById('vault-sync-conflict-styles');
-    if (existing) return;
-
-    const style = document.createElement('style');
-    style.id = 'vault-sync-conflict-styles';
-    style.textContent = `
-      .vault-sync-conflict-modal { max-width: 900px; width: 90vw; }
-      .vault-sync-conflict-modal .modal-content { padding: 1.5rem; }
-      .conflict-header h2 { margin: 0 0 0.25rem; font-size: 1.2rem; }
-      .conflict-subtitle { color: var(--text-muted); margin: 0 0 1rem; font-size: 0.9rem; }
-      .conflict-global-bar { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
-      .conflict-list { display: flex; flex-direction: column; gap: 1rem; max-height: 55vh; overflow-y: auto; padding-right: 0.25rem; }
-      .conflict-chunk { border: 1px solid var(--background-modifier-border); border-radius: 6px; overflow: hidden; }
-      .chunk-header { display: flex; align-items: center; gap: 0.75rem; padding: 0.5rem 0.75rem; background: var(--background-secondary); }
-      .chunk-index { font-weight: 600; font-size: 0.85rem; }
-      .resolution-badge { font-size: 0.75rem; padding: 0.15rem 0.5rem; border-radius: 12px; font-weight: 500; }
-      .resolution-local { background: var(--color-green); color: white; }
-      .resolution-remote { background: var(--color-blue); color: white; }
-      .resolution-both { background: var(--color-purple); color: white; }
-      .resolution-unset { background: var(--color-orange); color: white; }
-      .conflict-panes { display: grid; grid-template-columns: 1fr 1fr; gap: 0; }
-      .conflict-pane { padding: 0.5rem 0.75rem; border-top: 1px solid var(--background-modifier-border); }
-      .pane-local { border-right: 1px solid var(--background-modifier-border); background: color-mix(in srgb, var(--color-red) 5%, transparent); }
-      .pane-remote { background: color-mix(in srgb, var(--color-blue) 5%, transparent); }
-      .pane-label { font-size: 0.75rem; font-weight: 600; color: var(--text-muted); margin-bottom: 0.25rem; }
-      .conflict-code { margin: 0; font-size: 0.8rem; white-space: pre-wrap; word-break: break-word; max-height: 120px; overflow-y: auto; }
-      .chunk-actions { display: flex; gap: 0.5rem; padding: 0.5rem 0.75rem; background: var(--background-secondary); border-top: 1px solid var(--background-modifier-border); flex-wrap: wrap; }
-      .conflict-footer { display: flex; gap: 0.75rem; margin-top: 1.25rem; justify-content: flex-end; }
-    `;
-    document.head.appendChild(style);
   }
 }

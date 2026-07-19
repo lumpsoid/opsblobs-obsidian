@@ -9,10 +9,10 @@
 //  the production wiring.
 
 import { App, TFile } from 'obsidian';
-import { VaultState, MergeAction } from '../types';
+import { VaultState, FileEntry, MergeAction } from '../types';
 import { VaultSyncHost } from './server-sync';
 import { FileRegistry } from '../core/file-registry';
-import { ContentStore } from '../core/content-store';
+import { ContentStore, hashContent } from '../core/content-store';
 import { OperationLogger } from '../core/operation-logger';
 import { SyncApplicator } from './sync-applicator';
 import { HybridLogicalClock } from '../core/hlc';
@@ -37,29 +37,43 @@ export class PluginVaultSyncHost implements VaultSyncHost {
    * live entry's) plus any retained ancestor content the three-way merge needs.
    */
   async buildLocalState(): Promise<VaultState> {
-    const state: VaultState = {
-      deviceId: this.deviceId,
-      hlc: this.hlc.getCurrent(),
-      fileEntries: this.registry.getAllEntries(),
-      pendingOps: this.opLogger.getPendingOps(),
-      contentStore: new Map(),
-    };
+    const fileEntries = new Map<string, FileEntry>();
+    const contentStore = new Map<string, Uint8Array>();
 
-    for (const entry of state.fileEntries.values()) {
-      if (!entry.deleted && entry.contentHash && !state.contentStore.has(entry.contentHash)) {
+    for (const [id, entry] of this.registry.getAllEntries()) {
+      let resolved = entry;
+
+      if (!entry.deleted) {
         const file = this.app.vault.getAbstractFileByPath(entry.path);
         if (file instanceof TFile) {
           const content = new Uint8Array(await this.app.vault.readBinary(file));
-          state.contentStore.set(entry.contentHash, content);
+          const hash = await hashContent(content);
+          // Key the bytes under their *actual* hash, never the registry's
+          // recorded one. If an edit hasn't been logged yet the recorded hash is
+          // stale; keying under it would alias the current bytes over the
+          // ancestor, making the three-way merge see the file as unchanged and
+          // silently adopt the remote (data loss). If they differ, trust the
+          // disk and correct this snapshot so the merge compares real content.
+          if (hash !== entry.contentHash) resolved = { ...entry, contentHash: hash };
+          contentStore.set(hash, content);
         }
       }
-      if (entry.ancestorContentHash) {
-        const ancestor = await this.contentStore.get(entry.ancestorContentHash);
-        if (ancestor) state.contentStore.set(entry.ancestorContentHash, ancestor);
+
+      fileEntries.set(id, resolved);
+
+      if (resolved.ancestorContentHash && !contentStore.has(resolved.ancestorContentHash)) {
+        const ancestor = await this.contentStore.get(resolved.ancestorContentHash);
+        if (ancestor) contentStore.set(resolved.ancestorContentHash, ancestor);
       }
     }
 
-    return state;
+    return {
+      deviceId: this.deviceId,
+      hlc: this.hlc.getCurrent(),
+      fileEntries,
+      pendingOps: this.opLogger.getPendingOps(),
+      contentStore,
+    };
   }
 
   async applyMerge(actions: MergeAction[], local: VaultState, remote: VaultState): Promise<void> {

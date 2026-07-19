@@ -128,6 +128,32 @@ export class FileRegistry {
     await this.save();
   }
 
+  /**
+   * Adopt a file's identity from the remote side after its content has been
+   * written locally: track `path` under the remote's `id` so both devices key it
+   * the same way. The state merge is id-based — if each device kept its own id
+   * for the same path, their edits would look like unrelated files and could
+   * never conflict or converge (permanent divergence). Any pre-existing local
+   * entry at this path under a *different* id is dropped as a divergent
+   * duplicate. The just-written content becomes the new synced ancestor.
+   */
+  async adoptRemote(id: string, path: string, contentHash: string, hlc: HLC): Promise<void> {
+    const existingId = this.pathIndex.get(path);
+    if (existingId && existingId !== id) {
+      this.entries.delete(existingId);
+    }
+    this.entries.set(id, {
+      id,
+      path,
+      contentHash,
+      hlcTimestamp: hlc,
+      deleted: false,
+      ancestorContentHash: contentHash,
+    });
+    this.pathIndex.set(path, id);
+    await this.save();
+  }
+
   /** Set the ancestor hash after a successful sync. */
   async setAncestorHash(fileId: string, hash: string): Promise<void> {
     const entry = this.entries.get(fileId);

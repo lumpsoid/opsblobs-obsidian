@@ -84,10 +84,15 @@ export class SyncApplicator {
         const hash = await hashContent(action.content);
         await this.writeLocalFile(action.path, action.content);
         await this.contentStore.put(hash, action.content);
-        // Keep the registry in sync so that if a vault modify event fires for
-        // this write after we resume listening, flushModify's hash-equality
-        // guard ("skip if content hasn't changed") will correctly suppress it.
-        await this.registry.updateContentHash(action.path, hash, action.hlc);
+        // Adopt the remote file's identity (its UUID) so both devices track this
+        // path under ONE id. The merge is id-keyed; without this each device
+        // keeps its own id for the same path and their edits never reconcile —
+        // permanent divergence with no conflict ever raised. This also keeps the
+        // registry consistent so a vault event fired for our own write is
+        // suppressed by flushModify's hash-equality guard, and (by registering
+        // the id before the create event fires) stops that event from minting a
+        // fresh duplicate id for the same path.
+        await this.registry.adoptRemote(action.fileId, action.path, hash, action.hlc);
         return null;
       }
 
@@ -188,7 +193,20 @@ export class SyncApplicator {
       } else if (action.type === 'no_op' || action.type === 'send_remote') {
         const entry = local.fileEntries.get(action.fileId);
         if (entry && !entry.deleted) {
-          await this.registry.setAncestorHash(action.fileId, entry.contentHash);
+          // `send_remote` must only *establish* a missing ancestor — the first
+          // ever sync of a never-synced file, where a null ancestor means no
+          // peer holds a divergent copy, so the current content is a safe common
+          // base. It must NOT advance an existing ancestor: pushing our own edit
+          // to the server is not a peer acknowledgement, and a peer that edited
+          // the same file concurrently still diverged from the *previous* base.
+          // Advancing here would make our next merge treat our un-acknowledged
+          // edit as the base, see "local unchanged", and silently adopt the
+          // peer's version — the reported data-loss bug. `no_op` means both
+          // sides already hold this content, so advancing is always safe.
+          const isFirstSync = entry.ancestorContentHash === null;
+          if (action.type === 'no_op' || isFirstSync) {
+            await this.registry.setAncestorHash(action.fileId, entry.contentHash);
+          }
         }
       }
     }

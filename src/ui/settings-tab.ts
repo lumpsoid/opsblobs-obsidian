@@ -19,6 +19,7 @@ export interface SettingsHost extends Plugin {
   setupAutoSync(): void;
   clearContentCache(): Promise<number>;
   resetSyncState(): Promise<void>;
+  recheckConflicts(): Promise<void>;
   syncNow(): Promise<void>;
 }
 
@@ -252,6 +253,20 @@ export class SyncSettingTab extends PluginSettingTab {
           const removed = await this.host.clearContentCache();
           btn.setButtonText(`Removed ${removed}`);
           setTimeout(() => { btn.setButtonText('Clear cache').setDisabled(false); }, 2000);
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('Re-check for conflicts')
+      .setDesc('Re-pull the whole server history and recompute every merge, then sync. ' +
+        'Use this to bring back a conflict you skipped or dismissed by accident. ' +
+        'Local content and pending changes are untouched.')
+      .addButton(btn => {
+        btn.setButtonText('Re-check').onClick(async () => {
+          btn.setDisabled(true);
+          await this.host.recheckConflicts();
+          btn.setButtonText('Done');
+          setTimeout(() => { btn.setButtonText('Re-check').setDisabled(false); }, 2000);
         });
       });
 
