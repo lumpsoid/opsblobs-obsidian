@@ -21,15 +21,34 @@ export function mergeVaultStates(local: VaultState, remote: VaultState): StateMe
     ...remote.fileEntries.keys(),
   ]);
 
+  // F2: path → live fileId lookups. A single-sided ("only one side knows this
+  // id") entry may still *collide* with a DIFFERENT live id already occupying its
+  // path — two devices that independently created the same file mint different
+  // UUIDs. These maps let each single-sided branch detect that collision instead
+  // of blindly overwriting.
+  const localLiveByPath = liveByPath(local);
+  const remoteLiveByPath = liveByPath(remote);
+
   for (const fileId of allIds) {
     const localEntry = local.fileEntries.get(fileId);
     const remoteEntry = remote.fileEntries.get(fileId);
 
-    const action = classifyAndResolve(fileId, localEntry, remoteEntry, local, remote);
+    const action = classifyAndResolve(
+      fileId, localEntry, remoteEntry, local, remote, localLiveByPath, remoteLiveByPath,
+    );
     actions.push(action);
   }
 
   return { actions, mergedHlc };
+}
+
+/** Build a path → fileId index over a state's live (non-deleted) entries. */
+function liveByPath(state: VaultState): Map<string, string> {
+  const index = new Map<string, string>();
+  for (const [id, entry] of state.fileEntries) {
+    if (!entry.deleted) index.set(entry.path, id);
+  }
+  return index;
 }
 
 function classifyAndResolve(
@@ -38,11 +57,21 @@ function classifyAndResolve(
   remoteEntry: FileEntry | undefined,
   local: VaultState,
   remote: VaultState,
+  localLiveByPath: Map<string, string>,
+  remoteLiveByPath: Map<string, string>,
 ): MergeAction {
 
   // ── Only one side knows about this file ─────────────────────────────────
   if (!localEntry && remoteEntry) {
     if (remoteEntry.deleted) return { type: 'no_op', fileId };
+    // F2: does a *different* live local id already hold this path? If so it's a
+    // create/create collision (two independently-minted UUIDs for one path), not
+    // a brand-new remote file — reconcile it instead of clobbering the local one.
+    const collidingLocalId = localLiveByPath.get(remoteEntry.path);
+    if (collidingLocalId !== undefined && collidingLocalId !== fileId) {
+      const le = local.fileEntries.get(collidingLocalId)!;
+      return resolveCreateCollision(le, remoteEntry, local, remote, /* selfIsRemote */ true);
+    }
     const content = remote.contentStore.get(remoteEntry.contentHash);
     if (!content) return { type: 'no_op', fileId }; // can't write without content
     return {
@@ -56,6 +85,17 @@ function classifyAndResolve(
 
   if (localEntry && !remoteEntry) {
     if (localEntry.deleted) return { type: 'no_op', fileId };
+    // F2 (symmetric): a different live remote id holding this path is the same
+    // create/create collision seen from the other side. Reachable: after the peer
+    // resolves the collision it re-emits the resolution under the winning id, so
+    // this device pulls that id at the same path while still keying it under its
+    // own. Defer to the shared resolver (only the *winner's* branch acts; the
+    // loser's branch no-ops and is dropped when the winner's write adopts the id).
+    const collidingRemoteId = remoteLiveByPath.get(localEntry.path);
+    if (collidingRemoteId !== undefined && collidingRemoteId !== fileId) {
+      const re = remote.fileEntries.get(collidingRemoteId)!;
+      return resolveCreateCollision(localEntry, re, local, remote, /* selfIsRemote */ false);
+    }
     const content = local.contentStore.get(localEntry.contentHash);
     if (!content) return { type: 'no_op', fileId };
     return {
@@ -256,6 +296,109 @@ function resolveContentConflict(
     remoteContent: remoteText,
     parentHashes: [le.contentHash, re.contentHash],
   };
+}
+
+/**
+ * F2 — reconcile a create/create path collision: `le` (a live *local* entry) and
+ * `re` (a live *remote* entry) hold the SAME path under DIFFERENT ids because two
+ * devices independently created the file. Called from BOTH single-sided branches
+ * with the same `(le, re)` pair; `selfIsRemote` says which id this call is
+ * processing (`re.id` when true, `le.id` when false). It returns a deterministic,
+ * commutative decision so both devices converge to ONE id at the path:
+ *
+ *   · identical content  → same file. Adopt the deterministic winner's id (higher
+ *     HLC, tie-break by lexicographic fileId); the loser's branch no-ops and its
+ *     entry is dropped when the winner's `write_local` runs `adoptRemote`.
+ *   · already-resolved   → if one side's entry `supersedes` the other's content
+ *     (a peer already settled this exact collision), adopt that resolution's id
+ *     and content cleanly, no re-prompt.
+ *   · different content  → a genuine conflict. Only the WINNER's branch emits the
+ *     `conflict` (keyed to the winning id); the loser's branch no-ops so exactly
+ *     one prompt is raised. If either side's bytes are unavailable, defer with a
+ *     `no_op` (F1: never clobber to fabricate a decision).
+ *
+ * The applicator's `write_local`/`conflict` cases both `adoptRemote(fileId, …)`,
+ * so whichever id wins becomes the single id both devices key the path under.
+ */
+function resolveCreateCollision(
+  le: FileEntry,
+  re: FileEntry,
+  local: VaultState,
+  remote: VaultState,
+  selfIsRemote: boolean,
+): MergeAction {
+  const selfId = selfIsRemote ? re.id : le.id;
+  const noOp: MergeAction = { type: 'no_op', fileId: selfId };
+
+  const localContent = local.contentStore.get(le.contentHash);
+  const remoteContent = remote.contentStore.get(re.contentHash);
+
+  // Emit the remote-id adoption (write remote bytes, converge id to re.id). Only
+  // the remote-processing branch performs the write; the local branch defers so
+  // its entry is dropped by the write's adoptRemote rather than double-acted.
+  const adoptRemoteId = (): MergeAction => {
+    if (!selfIsRemote) return noOp;
+    const content = remoteContent ?? localContent; // identical-content: local holds it
+    if (!content) return noOp; // bytes unavailable — defer (F1)
+    return { type: 'write_local', fileId: re.id, path: re.path, content, hlc: re.hlcTimestamp };
+  };
+
+  // ── Identical content: the same file under two ids. Converge id, no conflict. ─
+  if (le.contentHash === re.contentHash) {
+    const winner = pickCollisionWinner(le, re);
+    // Winner keeps its id: if it is the remote id, adopt it (dropping the local
+    // duplicate); if it is the local id, keep it and let the remote-only branch
+    // no-op. Either way the loser branch no-ops.
+    return winner === re ? adoptRemoteId() : noOp;
+  }
+
+  // ── Already-resolved by a peer (supersedes names the other side's content). ──
+  if (re.supersedes?.includes(le.contentHash)) {
+    // Remote is a resolution superseding our content → adopt its id + content.
+    return adoptRemoteId();
+  }
+  if (le.supersedes?.includes(re.contentHash)) {
+    // Our content is the resolution superseding the remote side → keep local id,
+    // drop the remote duplicate (its branch no-ops; ours keeps the file as-is).
+    return noOp;
+  }
+
+  // ── Genuine create/create conflict (different, unrelated content). ──────────
+  // Defer if either side's bytes are missing — never fabricate a decision (F1).
+  if (!localContent || !remoteContent) return noOp;
+
+  const winner = pickCollisionWinner(le, re);
+  const self = selfIsRemote ? re : le;
+  // Only the winner's branch raises the prompt so exactly one conflict surfaces;
+  // the loser's branch no-ops (its id is dropped when the resolution is adopted).
+  if (self !== winner) return noOp;
+
+  const localText = new TextDecoder().decode(localContent);
+  const remoteText = new TextDecoder().decode(remoteContent);
+  return {
+    type: 'conflict',
+    fileId: winner.id,          // resolution converges identity to the winning id
+    localPath: le.path,
+    remotePath: re.path,
+    mergeResult: wholeFileConflict(localText, remoteText),
+    localContent: localText,
+    remoteContent: remoteText,
+    parentHashes: [le.contentHash, re.contentHash],
+  };
+}
+
+/**
+ * Deterministic, commutative winner of a create/create collision: higher HLC
+ * wins; ties break by lexicographically greater fileId. Both devices compare the
+ * same two entries and pick the same one regardless of argument order, so they
+ * converge on one identity. Mirrors the `hlcCompare`-then-id tie-break used
+ * elsewhere for last-writer-wins.
+ */
+function pickCollisionWinner(le: FileEntry, re: FileEntry): FileEntry {
+  const cmp = hlcCompare(le.hlcTimestamp, re.hlcTimestamp);
+  if (cmp > 0) return le;
+  if (cmp < 0) return re;
+  return le.id > re.id ? le : re;
 }
 
 /**

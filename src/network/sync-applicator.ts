@@ -141,11 +141,14 @@ export class SyncApplicator {
         const hash = await hashContent(resolved);
         await this.files.write(action.localPath, resolved);
         await this.contentStore.put(hash, resolved);
-        // Advance the registry to the resolved content (mirrors write_local's
-        // echo-suppression) and record it as the new synced ancestor — this
-        // resolution is the base future three-way merges align against.
-        await this.registry.updateContentHash(action.localPath, hash, hlcTs);
-        await this.registry.setAncestorHash(action.fileId, hash);
+        // Converge identity to the resolution's fileId and record the resolved
+        // content as the new synced ancestor (mirrors write_local's echo
+        // suppression). `adoptRemote` also drops any *different* live id already
+        // at this path: for a create/create collision (F2) the winning id may
+        // differ from the id this device keyed the path under, and adopting it is
+        // what makes both devices settle on ONE id. For an ordinary conflict the
+        // fileId already matches, so this reduces to update-content + set-ancestor.
+        await this.registry.adoptRemote(action.fileId, action.localPath, hash, hlcTs);
         // Tag the resolution with the two sides it settles so peers still
         // holding either version adopt it instead of re-prompting.
         return { kind: 'update', fileId: action.fileId, path: action.localPath, contentHash: hash, hlc: hlcTs, supersedes: action.parentHashes };
