@@ -296,11 +296,7 @@ export default class VaultSyncPlugin extends Plugin {
   /** Garbage-collect the content store down to what the registry still
    *  references (live content + retained ancestors). Returns the count removed. */
   async clearContentCache(): Promise<number> {
-    const keep = new Set<string>();
-    for (const entry of this.registry.getAllEntries().values()) {
-      if (!entry.deleted && entry.contentHash) keep.add(entry.contentHash);
-      if (entry.ancestorContentHash) keep.add(entry.ancestorContentHash);
-    }
+    const keep = this.registry.referencedHashes();
     const before = (await this.contentStore.listHashes()).length;
     await this.contentStore.gc(keep);
     const after = (await this.contentStore.listHashes()).length;

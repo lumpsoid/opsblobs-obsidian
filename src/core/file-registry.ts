@@ -231,6 +231,20 @@ export class FileRegistry {
     return Array.from(this.entries.values()).filter(e => !e.deleted);
   }
 
+  /**
+   * The content hashes still referenced by the registry — the keep-set for
+   * garbage-collecting the content store. A live (non-deleted) entry keeps its
+   * current content; every entry with a synced ancestor keeps that ancestor.
+   */
+  referencedHashes(): Set<string> {
+    const keep = new Set<string>();
+    for (const entry of this.entries.values()) {
+      if (!entry.deleted && entry.contentHash) keep.add(entry.contentHash);
+      if (entry.ancestorContentHash) keep.add(entry.ancestorContentHash);
+    }
+    return keep;
+  }
+
   // ─── Private helpers ──────────────────────────────────────────────────────
 
   private rebuildPathIndex(): void {
