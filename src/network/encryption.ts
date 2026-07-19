@@ -14,6 +14,11 @@
 //  Running PBKDF2 once and HKDF-expanding avoids paying the KDF cost per sub-key
 //  while still giving each sub-key an independent value (distinct HKDF `info`).
 
+import { bytesToBase64, base64ToBytes, bytesToHex } from '../core/encoding';
+
+// Re-exported so existing importers of these names from encryption keep working.
+export { bytesToBase64, base64ToBytes, bytesToHex };
+
 /**
  * PBKDF2 work factor. Deliberately below the OWASP-2023 600k figure: this runs
  * in a mobile WebView (Obsidian mobile is a target), where 600k is ~0.75–1.5 s
@@ -169,23 +174,4 @@ export class VaultCrypto {
 export async function saltForVault(vaultId: string): Promise<Uint8Array> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`vault-sync:salt:${vaultId}`));
   return new Uint8Array(digest);
-}
-
-export function bytesToBase64(bytes: Uint8Array): string {
-  let binary = '';
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!);
-  return btoa(binary);
-}
-
-export function base64ToBytes(b64: string): Uint8Array {
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-  return bytes;
-}
-
-export function bytesToHex(bytes: Uint8Array): string {
-  let hex = '';
-  for (let i = 0; i < bytes.length; i++) hex += bytes[i]!.toString(16).padStart(2, '0');
-  return hex;
 }

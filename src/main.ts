@@ -7,6 +7,7 @@ import { SyncSettings, DEFAULT_SETTINGS } from './types';
 import { HybridLogicalClock } from './core/hlc';
 import { FileRegistry } from './core/file-registry';
 import { ContentStore } from './core/content-store';
+import { randomUuid } from './core/encoding';
 import { OperationLogger } from './core/operation-logger';
 import { resolveDeleteStrategy } from './core/conflict-policy';
 import { SyncApplicator } from './network/sync-applicator';
@@ -159,10 +160,7 @@ export default class VaultSyncPlugin extends Plugin {
   }
 
   private generateDeviceId(): string {
-    if (typeof crypto !== 'undefined' && crypto.randomUUID) {
-      return crypto.randomUUID();
-    }
-    return `device-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return randomUuid();
   }
 
   // ─── Vault key (E2E) ────────────────────────────────────────────────────────

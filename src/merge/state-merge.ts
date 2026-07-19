@@ -248,9 +248,12 @@ function isUnchangedSinceAncestor(entry: FileEntry): boolean {
   return contentUnchanged && pathUnchanged;
 }
 
+/** Number of leading bytes sniffed for a null byte when detecting binary content. */
+const BINARY_SNIFF_BYTES = 8192;
+
 /** Heuristic binary detection: check for null bytes in the first 8KB. */
 function isBinary(content: Uint8Array): boolean {
-  const sample = content.slice(0, 8192);
+  const sample = content.slice(0, BINARY_SNIFF_BYTES);
   for (let i = 0; i < sample.length; i++) {
     if (sample[i] === 0) return true;
   }

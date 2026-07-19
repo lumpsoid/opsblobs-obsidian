@@ -97,9 +97,14 @@ export function hlcFromString(s: string): HLC {
   const parts = s.split('-');
   if (parts.length < 3) throw new Error(`Invalid HLC string: ${s}`);
   // deviceId may contain hyphens; everything from index 2 onward is the deviceId
+  const wallTime = parseInt(parts[0]!, 10);
+  const counter = parseInt(parts[1]!, 10);
+  if (!Number.isInteger(wallTime) || !Number.isInteger(counter)) {
+    throw new Error(`Invalid HLC string: ${s}`);
+  }
   return {
-    wallTime: parseInt(parts[0]!, 10),
-    counter: parseInt(parts[1]!, 10),
+    wallTime,
+    counter,
     deviceId: parts.slice(2).join('-'),
   };
 }

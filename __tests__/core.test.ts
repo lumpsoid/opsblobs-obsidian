@@ -59,6 +59,15 @@ describe('HybridLogicalClock', () => {
     expect(deserialized.deviceId).toBe(t.deviceId);
   });
 
+  test('hlcFromString throws on too-few parts', () => {
+    expect(() => hlcFromString('123-456')).toThrow(/Invalid HLC string/);
+  });
+
+  test('hlcFromString throws on non-numeric wallTime/counter', () => {
+    expect(() => hlcFromString('abc-456-device')).toThrow(/Invalid HLC string/);
+    expect(() => hlcFromString('123-xyz-device')).toThrow(/Invalid HLC string/);
+  });
+
   test('commutativity: merge(A, merge(B, C)) == merge(B, merge(A, C))', () => {
     const clocks = ['a', 'b', 'c'].map(id => new HybridLogicalClock(id));
     const merged = clocks.map(c => c.now());

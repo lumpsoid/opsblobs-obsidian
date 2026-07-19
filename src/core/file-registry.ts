@@ -10,6 +10,7 @@ import { App, TFile, normalizePath } from 'obsidian';
 import { FileEntry, HLC, SyncSettings } from '../types';
 import { hlcCompare } from './hlc';
 import { isExcluded } from './exclusion-policy';
+import { randomUuid } from './encoding';
 
 const REGISTRY_PATH = '.vault-sync/file-registry.json';
 
@@ -261,15 +262,6 @@ export class FileRegistry {
   }
 
   private generateUUID(): string {
-    // Crypto.randomUUID() is available on all modern platforms including iOS
-    if (typeof crypto !== 'undefined' && crypto.randomUUID) {
-      return crypto.randomUUID();
-    }
-    // Fallback
-    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
-      const r = (Math.random() * 16) | 0;
-      const v = c === 'x' ? r : (r & 0x3) | 0x8;
-      return v.toString(16);
-    });
+    return randomUuid();
   }
 }
