@@ -39,11 +39,17 @@ export class SyncApplicator {
     public onDeleteConflict: DeleteConflictHandler,
   ) {}
 
+  /**
+   * Apply the round's merge actions to the vault and return the set of fileIds
+   * whose destructive action was *deferred* because the file drifted on disk
+   * since the snapshot (F5) — the caller holds the cursor so their remote ops
+   * re-pull and re-merge against the now-recaptured local edit next round.
+   */
   async applyActions(
     actions: MergeAction[],
     localState: VaultState,
     remoteState: VaultState,
-  ): Promise<void> {
+  ): Promise<Set<string>> {
     // Pause op logging while we apply sync changes (we don't want to re-log them)
     this.opLogger.stopListening();
 
@@ -51,10 +57,14 @@ export class SyncApplicator {
     // resolution instead of diverging. Collected here and recorded only *after*
     // clearOps, which would otherwise wipe them.
     const resolutions: PendingResolution[] = [];
+    // Files whose on-disk bytes changed inside the sync window (F5): their
+    // destructive action was skipped to keep the user's edit; recorded so we can
+    // re-capture the edit as an op and hold the cursor for the skipped remote op.
+    const deferred = new Set<string>();
 
     try {
       for (const action of actions) {
-        const resolved = await this.applyAction(action, localState, remoteState);
+        const resolved = await this.applyAction(action, localState, remoteState, deferred);
         if (resolved) resolutions.push(resolved);
       }
     } finally {
@@ -69,8 +79,10 @@ export class SyncApplicator {
       this.opLogger.startListening();
     }
 
-    // Update ancestor hashes for all synced files
-    await this.updateAncestorHashes(actions, localState, remoteState);
+    // Update ancestor hashes for all synced files (but never for a deferred one:
+    // its destructive action was skipped, so advancing its ancestor to the
+    // remote content we didn't write would corrupt the next three-way merge).
+    await this.updateAncestorHashes(actions, localState, remoteState, deferred);
 
     // Persist the resolution ops now that the already-pushed pending log is
     // clear — they become pending for the next round and replicate the manual
@@ -83,15 +95,32 @@ export class SyncApplicator {
         await this.opLogger.recordResolvedUpdate(r.fileId, r.path, r.contentHash, r.hlc, r.supersedes);
       }
     }
+
+    // Re-capture each in-window edit we declined to overwrite as a durable
+    // pending op (F5), so next round it is a proper three-way merge / conflict
+    // against the remote change rather than a silently lost edit. Mirrors the
+    // resolution re-emit above: done after clearOps + startListening.
+    for (const fileId of deferred) {
+      const entry = localState.fileEntries.get(fileId);
+      if (entry) await this.opLogger.recaptureLocalEdit(entry.path);
+    }
+
+    return deferred;
   }
 
   private async applyAction(
     action: MergeAction,
     local: VaultState,
     remote: VaultState,
+    deferred: Set<string>,
   ): Promise<PendingResolution | null> {
     switch (action.type) {
       case 'write_local': {
+        if (await this.driftedSinceSnapshot(action.fileId, action.path, local)) {
+          deferred.add(action.fileId);
+          console.warn(`Vault Sync: deferring write_local for ${action.path} — on-disk content changed during the sync window (F5)`);
+          return null;
+        }
         const hash = await hashContent(action.content);
         if (await this.wouldTruncateNonEmpty(action.path, action.content)) {
           console.warn(`Vault Sync: skipping write_local for ${action.path} — refusing to truncate a non-empty file with empty content`);
@@ -112,6 +141,11 @@ export class SyncApplicator {
       }
 
       case 'move_local':
+        if (await this.driftedSinceSnapshot(action.fileId, action.fromPath, local)) {
+          deferred.add(action.fileId);
+          console.warn(`Vault Sync: deferring move_local for ${action.fromPath} — on-disk content changed during the sync window (F5)`);
+          return null;
+        }
         await this.files.move(action.fromPath, action.toPath);
         // Track the move in the registry too. Every other applied action updates
         // both the vault and the registry directly (write_local→adoptRemote,
@@ -124,6 +158,11 @@ export class SyncApplicator {
         return null;
 
       case 'delete_local':
+        if (await this.driftedSinceSnapshot(action.fileId, action.path, local)) {
+          deferred.add(action.fileId);
+          console.warn(`Vault Sync: deferring delete_local for ${action.path} — on-disk content changed during the sync window (F5)`);
+          return null;
+        }
         await this.files.trash(action.path);
         // Tombstone in the registry so the propagated delete survives restarts
         // and isn't re-detected as a local creation on the next reconcile.
@@ -190,6 +229,25 @@ export class SyncApplicator {
   }
 
   /**
+   * F5 drift guard: has this file's on-disk content changed since
+   * `buildLocalState` snapshotted it? An edit that landed inside the
+   * snapshot→network→apply window is on disk but not yet a durable op, and a
+   * destructive merge action (`write_local`/`move_local` source/`delete_local`)
+   * would overwrite it. Compare the live bytes at `path` against the snapshot
+   * hash the local state recorded for `fileId` (which `buildLocalState` set to
+   * the actual disk hash at snapshot time). No snapshot (a brand-new remote-only
+   * file) or a vanished file ⇒ no in-window local edit to protect. On any read
+   * we keep the safe side: only a confirmed hash mismatch defers.
+   */
+  private async driftedSinceSnapshot(fileId: string, path: string, local: VaultState): Promise<boolean> {
+    const snapshotHash = local.fileEntries.get(fileId)?.contentHash;
+    if (snapshotHash === undefined) return false;
+    const current = await this.files.read(path);
+    if (current === null) return false;
+    return (await hashContent(current)) !== snapshotHash;
+  }
+
+  /**
    * Defense-in-depth for F1: a destructive write must never *truncate* a file —
    * i.e. replace existing non-empty bytes with an empty buffer. State-merge
    * already declines to emit a write/restore when the winning side's bytes are
@@ -211,6 +269,7 @@ export class SyncApplicator {
     actions: MergeAction[],
     local: VaultState,
     remote: VaultState,
+    deferred: Set<string>,
   ): Promise<void> {
     // The advance *decision* (first-sync / action-type branching, and the
     // send_remote-only-on-first-sync rule whose violation caused the reported
@@ -219,6 +278,9 @@ export class SyncApplicator {
     // (async I/O the policy can't do), so its branch stays here; everything else
     // asks the policy for the hash to set.
     for (const action of actions) {
+      // A deferred file's destructive action was skipped (F5): its ancestor must
+      // stay the pre-round base so next round's three-way merge is correct.
+      if (deferred.has(action.fileId)) continue;
       if (action.type === 'write_local') {
         const hash = await hashContent(action.content);
         await this.registry.setAncestorHash(action.fileId, hash);

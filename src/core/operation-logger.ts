@@ -149,6 +149,21 @@ export class OperationLogger {
     }
   }
 
+  /**
+   * Re-capture a file whose on-disk bytes changed *during* a sync round but were
+   * never logged as an op (F5): the applicator declined a destructive merge
+   * action because the file drifted since `buildLocalState` snapshotted it, so
+   * that in-window edit must be turned into a durable pending op here — the
+   * debounce timer can't be trusted (it may have been cleared by
+   * `stopListening`/`clearOps`, or its hash-equality guard may suppress it after
+   * the file was briefly overwritten). Reads the current bytes and records an
+   * `update` (the same work a debounced modify does). Call *after* the apply's
+   * `clearOps` + `startListening` so the op survives the round.
+   */
+  async recaptureLocalEdit(path: string): Promise<void> {
+    await this.flushModify(path);
+  }
+
   // ─── Event handlers ───────────────────────────────────────────────────────
 
   private async handleCreate(path: string): Promise<void> {

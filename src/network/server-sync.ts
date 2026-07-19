@@ -91,8 +91,11 @@ export interface VaultSyncHost {
   /** Snapshot of the local state: fileEntries, un-pushed pendingOps, and a
    *  contentStore populated with at least every pending op's content + ancestors. */
   buildLocalState(): Promise<VaultState>;
-  /** Apply merge actions to the real vault (writes/deletes/moves, conflict prompts). */
-  applyMerge(actions: MergeAction[], local: VaultState, remote: VaultState): Promise<void>;
+  /** Apply merge actions to the real vault (writes/deletes/moves, conflict
+   *  prompts). Returns the set of fileIds whose destructive action was deferred
+   *  because the file drifted on disk during the round (F5) — the caller holds
+   *  the cursor so their remote ops re-pull next round. */
+  applyMerge(actions: MergeAction[], local: VaultState, remote: VaultState): Promise<Set<string>>;
   /** Drop the pending ops once they are durably on the server. */
   clearPendingOps(): Promise<void>;
   loadCursor(): Promise<number>;
@@ -176,7 +179,7 @@ export class ServerSyncClient {
     // rather than re-conflicting. Doing this after apply would let the
     // resolution be timestamped below the remote it resolves.
     this.hlc.setCurrent(merge.mergedHlc);
-    await this.host.applyMerge(merge.actions, local, remote);
+    const drifted = await this.host.applyMerge(merge.actions, local, remote);
 
     // ── 5. Advance the cursor past everything we consumed ────────────────────
     // Persist the *pull* cursor, not the append's headCursor: another device may
@@ -190,7 +193,12 @@ export class ServerSyncClient {
     // appeared and the file would be stranded. Cap the saved cursor just below
     // the earliest op referencing a still-missing content hash so the next round
     // re-pulls and retries it.
-    await this.host.saveCursor(safeCursor(pulled, pulledCursor, missingContent));
+    //
+    // Likewise, if the applicator deferred a destructive action because the file
+    // drifted on disk mid-round (F5), the remote op it skipped must re-pull so it
+    // re-merges against the edit we just re-captured. Its content WAS available
+    // (not F3's case), so cap the cursor at this round's start.
+    await this.host.saveCursor(safeCursor(pulled, pulledCursor, missingContent, startCursor, drifted.size > 0));
   }
 
   /**
@@ -321,8 +329,23 @@ const MAX_STALE_APPEND_RETRIES = 3;
  * remote files whose bytes weren't available (see `fetchRemoteBlobs`), so a
  * create later superseded by a delete never holds the cursor back. Returns
  * `min(pulledCursor, minBlockedSeq - 1)`.
+ *
+ * `driftDeferred` (F5): the applicator declined a destructive action because the
+ * file changed on disk mid-round and re-captured that edit as a fresh op. The
+ * skipped remote op's content WAS available, so rather than seq-threading it we
+ * simply cap at `startCursor` — re-pull the whole round so the skipped op
+ * re-merges next round against the re-captured edit. Idempotent merges no-op the
+ * files we did apply, and `startCursor ≤ any F3 minBlocked − 1`, so this also
+ * subsumes the missing-content cap.
  */
-export function safeCursor(pulled: PulledOp[], pulledCursor: number, missingContent: Set<string>): number {
+export function safeCursor(
+  pulled: PulledOp[],
+  pulledCursor: number,
+  missingContent: Set<string>,
+  startCursor: number,
+  driftDeferred: boolean,
+): number {
+  if (driftDeferred) return startCursor;
   if (missingContent.size === 0) return pulledCursor;
   let minBlocked = Infinity;
   for (const { seq, op } of pulled) {

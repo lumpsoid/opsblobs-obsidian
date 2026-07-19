@@ -75,8 +75,8 @@ export class PluginVaultSyncHost implements VaultSyncHost {
     };
   }
 
-  async applyMerge(actions: MergeAction[], local: VaultState, remote: VaultState): Promise<void> {
-    await this.applicator.applyActions(actions, local, remote);
+  async applyMerge(actions: MergeAction[], local: VaultState, remote: VaultState): Promise<Set<string>> {
+    return this.applicator.applyActions(actions, local, remote);
   }
 
   async clearPendingOps(): Promise<void> {

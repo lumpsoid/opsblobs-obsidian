@@ -111,7 +111,7 @@ export class TestDevice {
     const applyMerge = this.host.applyMerge.bind(this.host);
     this.host.applyMerge = async (actions, local, remote) => {
       this.applied.push(...actions);
-      await applyMerge(actions, local, remote);
+      return applyMerge(actions, local, remote);
     };
   }
 
