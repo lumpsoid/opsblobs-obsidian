@@ -11,6 +11,7 @@ import { randomUuid } from './core/encoding';
 import { OperationLogger } from './core/operation-logger';
 import { resolveDeleteStrategy } from './core/conflict-policy';
 import { SyncApplicator } from './network/sync-applicator';
+import { ObsidianVaultFiles } from './network/obsidian-vault-files';
 import { VaultCrypto, saltForVault } from './network/encryption';
 import { ServerSyncClient } from './network/server-sync';
 import { HttpServerApi, CursorStore } from './network/server-http';
@@ -60,8 +61,9 @@ export default class VaultSyncPlugin extends Plugin {
       this.settings.debounceMs,
     );
 
+    const vaultFiles = new ObsidianVaultFiles(this.app);
     this.applicator = new SyncApplicator(
-      this.app,
+      vaultFiles,
       this.registry,
       this.contentStore,
       this.opLogger,

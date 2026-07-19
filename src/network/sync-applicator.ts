@@ -3,8 +3,8 @@
 //  Applies merge actions to the actual vault
 // ─────────────────────────────────────────────
 
-import { App, TFile, normalizePath } from 'obsidian';
 import { HLC, MergeAction, VaultState } from '../types';
+import { VaultFiles } from '../ports/vault-files';
 import { FileRegistry } from '../core/file-registry';
 import { ContentStore, hashContent } from '../core/content-store';
 import { OperationLogger } from '../core/operation-logger';
@@ -30,7 +30,7 @@ interface PendingResolution {
 
 export class SyncApplicator {
   constructor(
-    private app: App,
+    private files: VaultFiles,
     private registry: FileRegistry,
     private contentStore: ContentStore,
     private opLogger: OperationLogger,
@@ -93,7 +93,7 @@ export class SyncApplicator {
     switch (action.type) {
       case 'write_local': {
         const hash = await hashContent(action.content);
-        await this.writeLocalFile(action.path, action.content);
+        await this.files.write(action.path, action.content);
         await this.contentStore.put(hash, action.content);
         // Adopt the remote file's identity (its UUID) so both devices track this
         // path under ONE id. The merge is id-keyed; without this each device
@@ -108,11 +108,11 @@ export class SyncApplicator {
       }
 
       case 'move_local':
-        await this.moveLocalFile(action.fromPath, action.toPath);
+        await this.files.move(action.fromPath, action.toPath);
         return null;
 
       case 'delete_local':
-        await this.deleteLocalFile(action.path);
+        await this.files.trash(action.path);
         // Tombstone in the registry so the propagated delete survives restarts
         // and isn't re-detected as a local creation on the next reconcile.
         await this.registry.markDeleted(action.path, this.hlc.now());
@@ -127,7 +127,7 @@ export class SyncApplicator {
         // content it supersedes and wins last-writer-wins on peers.
         const hlcTs = this.hlc.now();
         const hash = await hashContent(resolved);
-        await this.writeLocalFile(action.localPath, resolved);
+        await this.files.write(action.localPath, resolved);
         await this.contentStore.put(hash, resolved);
         // Advance the registry to the resolved content (mirrors write_local's
         // echo-suppression) and record it as the new synced ancestor — this
@@ -150,14 +150,14 @@ export class SyncApplicator {
         if (decision === 'restore') {
           // Keep the file. Re-assert its presence (undeleting our own copy if we
           // were the deleting side) and make the restored content the new ancestor.
-          await this.writeLocalFile(action.path, action.content);
+          await this.files.write(action.path, action.content);
           await this.contentStore.put(hash, action.content);
           await this.registry.adoptRemote(action.fileId, action.path, hash, hlcTs);
           return { kind: 'update', fileId: action.fileId, path: action.path, contentHash: hash, hlc: hlcTs, supersedes: action.parentHashes };
         }
         // 'keep_deleted' — accept the deletion: remove our copy (if present) and
         // tombstone, then replicate the delete so the modified side converges.
-        await this.deleteLocalFile(action.path);
+        await this.files.trash(action.path);
         await this.registry.markDeleted(action.path, hlcTs);
         return { kind: 'delete', fileId: action.fileId, path: action.path, contentHash: hash, hlc: hlcTs, supersedes: action.parentHashes };
       }
@@ -167,43 +167,6 @@ export class SyncApplicator {
       case 'no_op':
         // These are handled by the transport layer, not the applicator
         return null;
-    }
-  }
-
-  private async writeLocalFile(path: string, content: Uint8Array): Promise<void> {
-    const normalized = normalizePath(path);
-    // Ensure parent directory exists
-    const parts = normalized.split('/');
-    if (parts.length > 1) {
-      const dir = parts.slice(0, -1).join('/');
-      await this.ensureDir(dir);
-    }
-
-    const existing = this.app.vault.getAbstractFileByPath(normalized);
-    if (existing instanceof TFile) {
-      await this.app.vault.modifyBinary(existing, content.buffer);
-    } else {
-      await this.app.vault.createBinary(normalized, content.buffer);
-    }
-  }
-
-  private async moveLocalFile(fromPath: string, toPath: string): Promise<void> {
-    const file = this.app.vault.getAbstractFileByPath(normalizePath(fromPath));
-    if (file) {
-      await this.app.fileManager.renameFile(file, normalizePath(toPath));
-    }
-  }
-
-  private async deleteLocalFile(path: string): Promise<void> {
-    const file = this.app.vault.getAbstractFileByPath(normalizePath(path));
-    if (file) {
-      await this.app.vault.trash(file, true);
-    }
-  }
-
-  private async ensureDir(dirPath: string): Promise<void> {
-    if (!(await this.app.vault.adapter.exists(dirPath))) {
-      await this.app.vault.adapter.mkdir(dirPath);
     }
   }
 
