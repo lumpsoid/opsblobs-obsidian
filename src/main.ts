@@ -12,9 +12,11 @@ import { OperationLogger } from './core/operation-logger';
 import { resolveDeleteStrategy } from './core/conflict-policy';
 import { SyncApplicator } from './network/sync-applicator';
 import { ObsidianVaultFiles } from './network/obsidian-vault-files';
+import { ObsidianMetadataStore } from './network/obsidian-metadata-store';
 import { VaultCrypto, saltForVault } from './network/encryption';
 import { ServerSyncClient } from './network/server-sync';
-import { HttpServerApi, CursorStore } from './network/server-http';
+import { HttpServerApi } from './network/server-http';
+import { CursorStore } from './network/cursor-store';
 import { PluginVaultSyncHost } from './network/vault-sync-host';
 import { ConflictResolutionModal } from './ui/conflict-modal';
 import { DeleteConflictModal } from './ui/delete-conflict-modal';
@@ -29,6 +31,7 @@ export default class VaultSyncPlugin extends Plugin {
   private hlc!: HybridLogicalClock;
   private registry!: FileRegistry;
   private contentStore!: ContentStore;
+  private metadata!: ObsidianMetadataStore;
   private opLogger!: OperationLogger;
   private applicator!: SyncApplicator;
   private crypto = new VaultCrypto();
@@ -49,8 +52,11 @@ export default class VaultSyncPlugin extends Plugin {
 
     // Initialize core components
     this.hlc = new HybridLogicalClock(this.settings.deviceId);
-    this.registry = new FileRegistry(this.app, this.settings.deviceId, () => this.settings);
-    this.contentStore = new ContentStore(this.app);
+    const metadata = new ObsidianMetadataStore(this.app);
+    this.metadata = metadata;
+    const vaultFiles = new ObsidianVaultFiles(this.app);
+    this.registry = new FileRegistry(metadata, vaultFiles, this.settings.deviceId, () => this.settings);
+    this.contentStore = new ContentStore(metadata);
     this.opLogger = new OperationLogger(
       this.app,
       this.settings.deviceId,
@@ -61,7 +67,6 @@ export default class VaultSyncPlugin extends Plugin {
       this.settings.debounceMs,
     );
 
-    const vaultFiles = new ObsidianVaultFiles(this.app);
     this.applicator = new SyncApplicator(
       vaultFiles,
       this.registry,
@@ -242,7 +247,7 @@ export default class VaultSyncPlugin extends Plugin {
         this.opLogger,
         this.applicator,
         this.hlc,
-        new CursorStore(this.app),
+        new CursorStore(this.metadata),
       );
       const client = new ServerSyncClient({
         api,
@@ -322,7 +327,7 @@ export default class VaultSyncPlugin extends Plugin {
    * no-op, so this is safe to run anytime. Then it runs a sync.
    */
   async recheckConflicts(): Promise<void> {
-    await new CursorStore(this.app).save(0);
+    await new CursorStore(this.metadata).save(0);
     await this.triggerSync('manual');
   }
 

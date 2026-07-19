@@ -7,7 +7,7 @@
 //  Stored at .vault-sync/content/<hash>.bin
 //  Uses Web Crypto SHA-256 (available on all platforms incl. iOS).
 
-import { App, normalizePath } from 'obsidian';
+import { MetadataStore } from '../ports/metadata-store';
 import { uint8ToBase64, base64ToUint8 } from './encoding';
 
 // Re-exported so existing importers of these names from content-store keep working.
@@ -30,12 +30,11 @@ export class ContentStore {
   // In-memory cache to avoid repeated disk reads during a single sync session
   private memCache: Map<string, Uint8Array> = new Map();
 
-  constructor(private app: App) {}
+  constructor(private metadata: MetadataStore) {}
 
   async init(): Promise<void> {
-    const dir = normalizePath(CONTENT_DIR);
-    if (!(await this.app.vault.adapter.exists(dir))) {
-      await this.app.vault.adapter.mkdir(dir);
+    if (!(await this.metadata.exists(CONTENT_DIR))) {
+      await this.metadata.mkdir(CONTENT_DIR);
     }
   }
 
@@ -43,9 +42,9 @@ export class ContentStore {
   async put(hash: string, content: Uint8Array): Promise<void> {
     this.memCache.set(hash, content);
     const path = this.contentPath(hash);
-    if (!(await this.app.vault.adapter.exists(path))) {
+    if (!(await this.metadata.exists(path))) {
       // Convert Uint8Array → base64 for text-based storage
-      await this.app.vault.adapter.write(path, uint8ToBase64(content));
+      await this.metadata.write(path, uint8ToBase64(content));
     }
   }
 
@@ -54,43 +53,34 @@ export class ContentStore {
     const cached = this.memCache.get(hash);
     if (cached) return cached;
 
-    const path = this.contentPath(hash);
-    try {
-      const raw = await this.app.vault.adapter.read(path);
-      const content = base64ToUint8(raw);
-      this.memCache.set(hash, content);
-      return content;
-    } catch {
-      return null;
-    }
+    const raw = await this.metadata.read(this.contentPath(hash));
+    if (raw === null) return null;
+    const content = base64ToUint8(raw);
+    this.memCache.set(hash, content);
+    return content;
   }
 
   /** Check if content is available without loading it. */
   async has(hash: string): Promise<boolean> {
     if (this.memCache.has(hash)) return true;
-    return this.app.vault.adapter.exists(this.contentPath(hash));
+    return this.metadata.exists(this.contentPath(hash));
   }
 
   /** Remove content by hash. */
   async delete(hash: string): Promise<void> {
     this.memCache.delete(hash);
     const path = this.contentPath(hash);
-    if (await this.app.vault.adapter.exists(path)) {
-      await this.app.vault.adapter.remove(path);
+    if (await this.metadata.exists(path)) {
+      await this.metadata.remove(path);
     }
   }
 
   /** List all stored hashes. */
   async listHashes(): Promise<string[]> {
-    const dir = normalizePath(CONTENT_DIR);
-    try {
-      const result = await this.app.vault.adapter.list(dir);
-      return result.files
-        .map(p => p.split('/').pop()?.replace('.bin', '') ?? '')
-        .filter(Boolean);
-    } catch {
-      return [];
-    }
+    const files = await this.metadata.list(CONTENT_DIR);
+    return files
+      .map(p => p.split('/').pop()?.replace('.bin', '') ?? '')
+      .filter(Boolean);
   }
 
   /**
@@ -108,7 +98,7 @@ export class ContentStore {
       if (keepHashes.has(hash)) continue;
       let mtime: number | null = null;
       try {
-        const stat = await this.app.vault.adapter.stat(this.contentPath(hash));
+        const stat = await this.metadata.stat(this.contentPath(hash));
         mtime = stat?.mtime ?? null;
       } catch {
         mtime = null;
@@ -124,6 +114,6 @@ export class ContentStore {
   }
 
   private contentPath(hash: string): string {
-    return normalizePath(`${CONTENT_DIR}/${hash}.bin`);
+    return `${CONTENT_DIR}/${hash}.bin`;
   }
 }

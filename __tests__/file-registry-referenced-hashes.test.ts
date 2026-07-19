@@ -1,22 +1,18 @@
 // ─────────────────────────────────────────────
 //  Tests — FileRegistry.referencedHashes (GC keep-set, plain values)
 // ─────────────────────────────────────────────
+//
+//  Drives the real FileRegistry over a FakeMetadataStore (persistence) and a
+//  FakeVaultFiles (reconcile) — no obsidian stub. Entries are seeded by writing
+//  a serialized registry into the metadata fake and running the real `load()`.
 
-import { describe, test, expect, vi } from 'vitest';
-import type { App } from 'obsidian';
+import { describe, test, expect } from 'vitest';
 import { FileRegistry } from '../src/core/file-registry';
 import { FileEntry, HLC, SyncSettings } from '../src/types';
+import { FakeMetadataStore } from './helpers/fakes/metadata-store';
+import { FakeVaultFiles } from './helpers/fakes/vault-files';
 
-// The `obsidian` module isn't resolvable under the test runner (only its types
-// are, for tsc). FileRegistry needs `normalizePath` at runtime (in save(), which
-// these tests don't hit) and App/TFile as types — a tiny stub lets us import and
-// exercise the real class. The `import type` above is erased at runtime.
-vi.mock('obsidian', () => ({
-  App: class {},
-  TFile: class {},
-  normalizePath: (p: string) => p,
-}));
-
+const REGISTRY_PATH = '.vault-sync/file-registry.json';
 const hlc: HLC = { wallTime: 1, counter: 0, deviceId: 'dev' };
 
 function entry(over: Partial<FileEntry>): FileEntry {
@@ -32,17 +28,15 @@ function entry(over: Partial<FileEntry>): FileEntry {
 }
 
 /** Build a FileRegistry seeded with the given entries by feeding a serialized
- *  registry through its real `load()` path — no vault I/O beyond a stub read. */
+ *  registry through its real `load()` path — persistence via FakeMetadataStore. */
 async function registryWith(entries: FileEntry[]): Promise<FileRegistry> {
-  const serialized = JSON.stringify({
+  const meta = new FakeMetadataStore();
+  meta.set(REGISTRY_PATH, JSON.stringify({
     version: 1,
     entries: entries.map(e => [e.id, e]),
-  });
-  const app = {
-    vault: { adapter: { read: async () => serialized } },
-  } as unknown as App;
+  }));
   const settings = (() => ({}) as SyncSettings);
-  const reg = new FileRegistry(app, 'dev', settings);
+  const reg = new FileRegistry(meta, new FakeVaultFiles(), 'dev', settings);
   await reg.load();
   return reg;
 }

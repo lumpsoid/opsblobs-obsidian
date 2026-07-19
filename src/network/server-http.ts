@@ -8,7 +8,7 @@
 //  blob bodies. Kept in its own module (the only `obsidian` import) so the
 //  orchestrator in server-sync.ts stays unit-testable.
 
-import { App, normalizePath, requestUrl } from 'obsidian';
+import { requestUrl } from 'obsidian';
 import {
   ServerApi,
   PullOpsResult,
@@ -107,35 +107,4 @@ export class HttpServerApi implements ServerApi {
  *  view over a larger backing buffer). */
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
-}
-
-// ─── Cursor persistence ─────────────────────────────────────────────────────
-
-const CURSOR_PATH = '.vault-sync/sync-cursor.json';
-
-/**
- * Persists the scalar sync cursor (spec §D3) at `.vault-sync/sync-cursor.json`.
- * A single integer: the highest server `seq` this device has consumed. `0` means
- * "seen nothing" — a fresh device replays the whole log.
- */
-export class CursorStore {
-  constructor(private app: App) {}
-
-  async load(): Promise<number> {
-    try {
-      const raw = await this.app.vault.adapter.read(normalizePath(CURSOR_PATH));
-      const parsed = (JSON.parse(raw) as { cursor?: number }).cursor;
-      return typeof parsed === 'number' && Number.isFinite(parsed) ? parsed : 0;
-    } catch {
-      return 0;
-    }
-  }
-
-  async save(cursor: number): Promise<void> {
-    const dir = normalizePath('.vault-sync');
-    if (!(await this.app.vault.adapter.exists(dir))) {
-      await this.app.vault.adapter.mkdir(dir);
-    }
-    await this.app.vault.adapter.write(normalizePath(CURSOR_PATH), JSON.stringify({ cursor }));
-  }
 }

@@ -16,7 +16,7 @@ import { ContentStore, hashContent } from '../core/content-store';
 import { OperationLogger } from '../core/operation-logger';
 import { SyncApplicator } from './sync-applicator';
 import { HybridLogicalClock } from '../core/hlc';
-import { CursorStore } from './server-http';
+import { CursorStore } from './cursor-store';
 
 export class PluginVaultSyncHost implements VaultSyncHost {
   constructor(

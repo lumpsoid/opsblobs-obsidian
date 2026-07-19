@@ -6,8 +6,9 @@
 //  Maintains a stable UUID → path mapping so files can be tracked
 //  through renames and moves. Stored at .vault-sync/file-registry.json.
 
-import { App, TFile, normalizePath } from 'obsidian';
 import { FileEntry, HLC, SyncSettings } from '../types';
+import { MetadataStore } from '../ports/metadata-store';
+import { VaultFiles, VaultFileRef } from '../ports/vault-files';
 import { hlcCompare } from './hlc';
 import { isExcluded } from './exclusion-policy';
 import { randomUuid } from './encoding';
@@ -24,7 +25,8 @@ export class FileRegistry {
   private pathIndex: Map<string, string> = new Map();   // path → uuid
 
   constructor(
-    private app: App,
+    private metadata: MetadataStore,
+    private files: VaultFiles,
     private deviceId: string,
     private getSettings: () => SyncSettings,
   ) {}
@@ -32,16 +34,16 @@ export class FileRegistry {
   // ─── Persistence ──────────────────────────────────────────────────────────
 
   async load(): Promise<void> {
-    try {
-      const raw = await this.app.vault.adapter.read(REGISTRY_PATH);
-      const data = JSON.parse(raw) as SerializedRegistry;
-      this.entries = new Map(data.entries);
-      this.rebuildPathIndex();
-    } catch {
+    const raw = await this.metadata.read(REGISTRY_PATH);
+    if (raw === null) {
       // Registry doesn't exist yet — start fresh
       this.entries = new Map();
       this.pathIndex = new Map();
+      return;
     }
+    const data = JSON.parse(raw) as SerializedRegistry;
+    this.entries = new Map(data.entries);
+    this.rebuildPathIndex();
   }
 
   async save(): Promise<void> {
@@ -49,31 +51,30 @@ export class FileRegistry {
       version: 1,
       entries: Array.from(this.entries.entries()),
     };
-    const dir = normalizePath('.vault-sync');
-    if (!(await this.app.vault.adapter.exists(dir))) {
-      await this.app.vault.adapter.mkdir(dir);
+    if (!(await this.metadata.exists('.vault-sync'))) {
+      await this.metadata.mkdir('.vault-sync');
     }
-    await this.app.vault.adapter.write(REGISTRY_PATH, JSON.stringify(data, null, 2));
+    await this.metadata.write(REGISTRY_PATH, JSON.stringify(data, null, 2));
   }
 
   // ─── Mutation ─────────────────────────────────────────────────────────────
 
   /** Register a newly created file. Returns the assigned UUID. */
-  async registerFile(file: TFile, hlc: HLC, contentHash: string): Promise<string> {
-    const existing = this.pathIndex.get(file.path);
+  async registerFile(ref: VaultFileRef, hlc: HLC, contentHash: string): Promise<string> {
+    const existing = this.pathIndex.get(ref.path);
     if (existing) return existing;   // already tracked
 
     const id = this.generateUUID();
     const entry: FileEntry = {
       id,
-      path: file.path,
+      path: ref.path,
       contentHash,
       hlcTimestamp: hlc,
       deleted: false,
       ancestorContentHash: null,
     };
     this.entries.set(id, entry);
-    this.pathIndex.set(file.path, id);
+    this.pathIndex.set(ref.path, id);
     await this.save();
     return id;
   }
@@ -181,7 +182,7 @@ export class FileRegistry {
    * - Marks registry entries as deleted if the file is gone from disk
    */
   async reconcileWithVault(hlc: HLC): Promise<void> {
-    const allFiles = this.app.vault.getFiles();
+    const allFiles = this.files.list();
     const vaultPaths = new Set(allFiles.map(f => f.path));
 
     // Assign UUIDs to new files
