@@ -109,6 +109,14 @@ export class SyncApplicator {
 
       case 'move_local':
         await this.files.move(action.fromPath, action.toPath);
+        // Track the move in the registry too. Every other applied action updates
+        // both the vault and the registry directly (write_local→adoptRemote,
+        // delete_local→markDeleted); move_local must as well. It can't lean on a
+        // vault rename event to do it — listeners are paused for the whole apply,
+        // so the event the move fires is dropped. Without this the registry path
+        // stays stale after a synced rename, and the next reconcile reads it as a
+        // delete of the old path + a create of the new one, losing file identity.
+        await this.registry.updatePath(action.fromPath, action.toPath, this.hlc.now());
         return null;
 
       case 'delete_local':

@@ -67,8 +67,17 @@ export class HybridLogicalClock {
     return { ...this.current };
   }
 
+  /**
+   * Fast-forward the clock to at least `hlc`'s wall/counter, keeping OUR own
+   * deviceId. Used after a merge to advance past the merged HLC so a freshly
+   * minted op (e.g. a user-resolved conflict) dominates the remote it supersedes.
+   * The passed HLC may be a *remote* one — adopting its deviceId would make our
+   * future `now()` timestamps claim a foreign author and corrupt the tie-break
+   * (exactly the divergence seen when two devices rename at the same wall/counter),
+   * so we preserve `this.current.deviceId`, mirroring `now()` and `merge()`.
+   */
   setCurrent(hlc: HLC): void {
-    this.current = { ...hlc };
+    this.current = { wallTime: hlc.wallTime, counter: hlc.counter, deviceId: this.current.deviceId };
   }
 }
 

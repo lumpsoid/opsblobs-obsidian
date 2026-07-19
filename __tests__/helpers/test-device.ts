@@ -2,8 +2,8 @@
 //  TestDevice — the REAL device stack wired over fakes
 // ─────────────────────────────────────────────
 //
-//  Replaces MemoryHost's role: instead of re-implementing the merge-application
-//  logic, this wires the production classes (FileRegistry, ContentStore,
+//  Instead of re-implementing the merge-application logic in a test double, this
+//  wires the production classes (FileRegistry, ContentStore,
 //  OperationLogger, SyncApplicator, PluginVaultSyncHost, CursorStore) over the
 //  in-memory fakes (FakeVaultFiles/MetadataStore/VaultWatcher) plus a settable
 //  wall clock, so a test drives the genuine sync device deterministically.
@@ -54,12 +54,17 @@ export class TestDevice {
   readonly host: PluginVaultSyncHost;
 
   /** When set, `conflict` actions are resolved with these bytes (default: skip,
-   *  returning null). Mirrors the former MemoryHost hook. */
+   *  returning null) — a device's stand-in for the user's merge modal. */
   resolveConflict?: ConflictResolver;
 
   /** When set, `delete_conflict` actions use this decision (default:
-   *  'keep_deleted'). Mirrors the former MemoryHost hook. */
+   *  'keep_deleted') — a device's stand-in for the delete-conflict modal. */
   resolveDeleteConflict?: DeleteConflictResolver;
+
+  /** Every merge action applied across all rounds, in order — the real merge's
+   *  decisions (conflict / write_local / delete_local / …), captured so a test
+   *  can assert which decision the genuine `mergeVaultStates` produced. */
+  readonly applied: MergeAction[] = [];
 
   constructor(private deviceId: string) {
     const settings: SyncSettings = { ...DEFAULT_SETTINGS, deviceId };
@@ -99,6 +104,22 @@ export class TestDevice {
       this.hlc,
       this.cursorStore,
     );
+
+    // Record the merge actions each round applies, delegating to the real host.
+    // The actions are the genuine output of `mergeVaultStates`, so tests assert
+    // real merge decisions without the host having to expose an internal log.
+    const applyMerge = this.host.applyMerge.bind(this.host);
+    this.host.applyMerge = async (actions, local, remote) => {
+      this.applied.push(...actions);
+      await applyMerge(actions, local, remote);
+    };
+  }
+
+  /** Construct and initialise a device in one step (async ctor sugar). */
+  static async create(deviceId: string): Promise<TestDevice> {
+    const device = new TestDevice(deviceId);
+    await device.init();
+    return device;
   }
 
   /** Bring the content store online and start listening for vault events. */
@@ -111,6 +132,20 @@ export class TestDevice {
 
   entry(id: string): FileEntry | undefined {
     return this.registry.getById(id);
+  }
+
+  entryByPath(path: string): FileEntry | undefined {
+    return this.registry.getByPath(path);
+  }
+
+  /** All live (non-deleted) registry entries — thin read over the real registry. */
+  activeEntries(): FileEntry[] {
+    return this.registry.getActiveEntries();
+  }
+
+  /** Every registry entry (including tombstones), keyed by file id. */
+  allEntries(): Map<string, FileEntry> {
+    return this.registry.getAllEntries();
   }
 
   async content(hash: string): Promise<Uint8Array | null> {

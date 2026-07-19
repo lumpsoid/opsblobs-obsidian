@@ -27,29 +27,30 @@
 //  Fix (both landed): `triggerSync` flushes the debounce before building state,
 //  and `buildLocalState` keys content under the *actual* hash of the bytes on
 //  disk (correcting the entry if the registry hash is stale) so current bytes can
-//  never masquerade as the ancestor. `MemoryHost` mirrors the corrected
-//  buildLocalState (see its `disk` map), so this drives the real ServerSyncClient
-//  round against the fake and asserts the fixed behaviour: a conflict is surfaced
-//  and A keeps its edit rather than silently taking B's.
+//  never masquerade as the ancestor. This drives the REAL device stack (registry,
+//  content store, op logger, applicator, host) over in-memory fakes via
+//  `TestDevice` and asserts the fixed behaviour: a conflict is surfaced and A
+//  keeps its edit rather than silently taking B's.
 
 import { describe, test, expect, beforeAll } from 'vitest';
-import { ServerApi, ServerSyncClient } from '../src/network/server-sync';
+import { ServerSyncClient } from '../src/network/server-sync';
 import { VaultCrypto } from '../src/network/encryption';
-import { HybridLogicalClock } from '../src/core/hlc';
 import { FakeSyncServer } from '../src/network/fake-server';
-import { MemoryHost, seedFile, editFile } from './helpers/memory-host';
+import { TestDevice } from './helpers/test-device';
 
 const SALT = new Uint8Array([9, 9, 9, 9, 9, 9, 9, 9, 8, 8, 8, 8, 8, 8, 8, 8]);
 
 /**
- * Model the debounce race: the file on "disk" now reads `newText`, but the modify
- * op hasn't been logged — so the registry entry's `contentHash` (and ancestor)
- * are still the old ones and there is no pending op. This is exactly the state a
- * sync sees when it runs inside the op-logger's debounce window.
+ * Model the debounce race: the file on disk now reads `newText`, but no vault
+ * modify event was ever delivered to the op logger — so the registry entry's
+ * `contentHash` (and ancestor) are still the old ones and there is no pending op.
+ * This is exactly the state a sync sees when it runs inside the op-logger's
+ * debounce window; `buildLocalState` re-hashes the disk bytes so the merge still
+ * compares the real content against the true ancestor.
  */
-function editWithoutLogging(host: MemoryHost, fileId: string, newText: string): void {
-  host.disk.set(fileId, new TextEncoder().encode(newText));
-  // deliberately: no registry hash update, no pending op.
+async function editWithoutLogging(device: TestDevice, path: string, newText: string): Promise<void> {
+  await device.files.write(path, new TextEncoder().encode(newText));
+  // deliberately: no watcher event → no registry hash update, no pending op.
 }
 
 describe('concurrent conflicting edits (reported data-loss bug)', () => {
@@ -60,47 +61,45 @@ describe('concurrent conflicting edits (reported data-loss bug)', () => {
   });
 
   /** A device's current file content = its on-disk bytes. */
-  const onDisk = (h: MemoryHost, fileId = 'f1'): string => {
-    const bytes = h.disk.get(fileId);
+  const onDisk = async (d: TestDevice, path: string): Promise<string> => {
+    const bytes = await d.files.read(path);
     return bytes ? new TextDecoder().decode(bytes) : '<deleted>';
   };
 
   test('A must not silently lose its edit when B changed the same lines', async () => {
-    const api: ServerApi = new FakeSyncServer();
-    const client = (host: MemoryHost, deviceId: string) =>
-      new ServerSyncClient({ api, crypto: vc, host, hlc: new HybridLogicalClock(deviceId) });
+    const api = new FakeSyncServer();
+    const client = (d: TestDevice) =>
+      new ServerSyncClient({ api, crypto: vc, host: d.host, hlc: d.hlc });
 
-    const A = new MemoryHost('dev-a');
-    const B = new MemoryHost('dev-b');
+    const A = await TestDevice.create('dev-a');
+    const B = await TestDevice.create('dev-b');
+    const path = 'test-conflict.md';
 
     // ── A creates `test-conflict.md` = "1\n2\n3" and syncs. ──────────────────
-    const base = await seedFile(A, 'dev-a', 'f1', 'test-conflict.md', '1\n2\n3\n', 1000);
-    await client(A, 'dev-a').runSync();
-    // Mirror the applicator's send_remote ancestor update (MemoryHost doesn't):
-    // A's just-synced content becomes its shared ancestor.
-    A.fileEntries.get('f1')!.ancestorContentHash = base.hash;
+    await A.seedFile(path, '1\n2\n3\n', 1000);
+    await client(A).runSync();   // real applicator records A's first-sync ancestor
 
     // ── B syncs, receiving A's file exactly. ────────────────────────────────
-    await client(B, 'dev-b').runSync();
-    expect(onDisk(B)).toBe('1\n2\n3\n');
+    await client(B).runSync();
+    expect(await onDisk(B, path)).toBe('1\n2\n3\n');
 
     // ── B edits line 3 → "1\n2\n999" and syncs (a normal, logged edit). ─────
-    await editFile(B, 'dev-b', 'f1', 'test-conflict.md', '1\n2\n999\n', 2000);
-    await client(B, 'dev-b').runSync();
+    await B.editFile(path, '1\n2\n999\n', 2000);
+    await client(B).runSync();
 
     // ── Concurrently, A edits line 3 and appends → "1\n2\n4\n5". The edit
     //    reaches the file but hasn't been logged as an op when A's sync fires
     //    (the debounce race). ─────────────────────────────────────────────────
-    editWithoutLogging(A, 'f1', '1\n2\n4\n5\n');
-    await client(A, 'dev-a').runSync();
+    await editWithoutLogging(A, path, '1\n2\n4\n5\n');
+    await client(A).runSync();
 
     // ── With the fix: A's edit and B's edit touch the same line, so this is a
     //    genuine conflict — it must be surfaced, and A must keep its own edit
     //    rather than silently adopting B's "1\n2\n999". ───────────────────────
     expect(A.applied.some(a => a.type === 'conflict')).toBe(true);   // conflict surfaced
     expect(A.applied.some(a => a.type === 'write_local')).toBe(false); // NOT a silent overwrite
-    expect(onDisk(A)).toBe('1\n2\n4\n5\n');                           // A's edit preserved
-    expect(onDisk(A)).not.toBe('1\n2\n999\n');                       // and not clobbered
+    expect(await onDisk(A, path)).toBe('1\n2\n4\n5\n');              // A's edit preserved
+    expect(await onDisk(A, path)).not.toBe('1\n2\n999\n');           // and not clobbered
   });
 
   // A second, distinct data-loss path reported after the debounce fix landed:
@@ -110,45 +109,47 @@ describe('concurrent conflicting edits (reported data-loss bug)', () => {
   // to its un-acknowledged edit. Its later merge against the peer's concurrent
   // edit then used the wrong base and silently clobbered its own change.
   // Fix: exclude own ops from the remote projection (reconstructRemoteState) and
-  // never advance the ancestor on `send_remote` (updateAncestorHashes) — both
-  // mirrored by MemoryHost here (own-op exclusion is shared production code; the
-  // ancestor rule matches MemoryHost never advancing on send_remote).
+  // never advance the ancestor on `send_remote` for a non-first sync
+  // (nextAncestorHash) — both now exercised through the REAL stack: own-op
+  // exclusion is shared production code, and the ancestor rule is the real
+  // ancestor policy, not a fake's approximation.
   test('the device that syncs its edit first must not clobber its own change', async () => {
-    const api: ServerApi = new FakeSyncServer();
-    const client = (host: MemoryHost, deviceId: string) =>
-      new ServerSyncClient({ api, crypto: vc, host, hlc: new HybridLogicalClock(deviceId) });
+    const api = new FakeSyncServer();
+    const client = (d: TestDevice) =>
+      new ServerSyncClient({ api, crypto: vc, host: d.host, hlc: d.hlc });
 
-    const A = new MemoryHost('dev-a');
-    const B = new MemoryHost('dev-b');
+    const A = await TestDevice.create('dev-a');
+    const B = await TestDevice.create('dev-b');
+    const path = 'my-first';
 
     // ── A creates `my-first` = "1\n2\n3", syncs; B syncs and receives it. ────
-    const base = await seedFile(A, 'dev-a', 'f1', 'my-first', '1\n2\n3\n', 1000);
-    await client(A, 'dev-a').runSync();
-    A.fileEntries.get('f1')!.ancestorContentHash = base.hash; // first-sync base (mirrors applicator)
-    await client(B, 'dev-b').runSync();
+    const id = await A.seedFile(path, '1\n2\n3\n', 1000);
+    const baseHash = A.entry(id)!.contentHash;
+    await client(A).runSync();   // real applicator records A's first-sync ancestor
+    await client(B).runSync();
 
     // ── A edits → "1\n2\n4\n5" and syncs FIRST (a normal logged edit). ───────
-    await editFile(A, 'dev-a', 'f1', 'my-first', '1\n2\n4\n5\n', 2000);
-    await client(A, 'dev-a').runSync();
+    await A.editFile(path, '1\n2\n4\n5\n', 2000);
+    await client(A).runSync();
     // Syncing its own edit must not corrupt A's ancestor to that edit…
-    expect(A.fileEntries.get('f1')!.ancestorContentHash).toBe(base.hash);
+    expect(A.entry(id)!.ancestorContentHash).toBe(baseHash);
     expect(A.applied.some(a => a.type === 'write_local')).toBe(false);
 
     // ── B concurrently edits the same line → "1\n2\n999" and syncs. ──────────
-    await editFile(B, 'dev-b', 'f1', 'my-first', '1\n2\n999\n', 3000);
-    await client(B, 'dev-b').runSync();
+    await B.editFile(path, '1\n2\n999\n', 3000);
+    await client(B).runSync();
     expect(B.applied.some(a => a.type === 'conflict')).toBe(true); // B sees the conflict
 
     // ── A syncs again, pulling B's concurrent edit. ──────────────────────────
     const before = A.applied.length;
-    await client(A, 'dev-a').runSync();
+    await client(A).runSync();
     const aActions = A.applied.slice(before).map(a => a.type);
 
     // A must surface a conflict against the TRUE base "1\n2\n3" and keep its own
     // edit — never silently adopt B's "1\n2\n999".
     expect(aActions).toContain('conflict');
     expect(aActions).not.toContain('write_local');
-    expect(onDisk(A)).toBe('1\n2\n4\n5\n');
-    expect(onDisk(A)).not.toBe('1\n2\n999\n');
+    expect(await onDisk(A, path)).toBe('1\n2\n4\n5\n');
+    expect(await onDisk(A, path)).not.toBe('1\n2\n999\n');
   });
 });

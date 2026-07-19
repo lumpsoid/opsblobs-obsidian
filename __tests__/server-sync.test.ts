@@ -3,10 +3,9 @@
 //  Full pull→merge→push round against the in-memory fake; cursor advancement;
 //  blob dedup; idempotent append; remote-state reconstruction.
 //
-//  Migrated (Phase 4) from the hand-rolled MemoryHost to the REAL device stack:
-//  a `TestDevice` wires FileRegistry/ContentStore/OperationLogger/SyncApplicator/
-//  PluginVaultSyncHost over in-memory fakes, so the round drives the genuine
-//  client + host instead of a look-alike.
+//  Driven through the REAL device stack: a `TestDevice` wires FileRegistry/
+//  ContentStore/OperationLogger/SyncApplicator/PluginVaultSyncHost over in-memory
+//  fakes, so the round exercises the genuine client + host, not a look-alike.
 // ─────────────────────────────────────────────
 
 import { describe, test, expect, beforeAll } from 'vitest';
