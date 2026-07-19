@@ -90,15 +90,28 @@ export class ContentStore {
   }
 
   /**
-   * Garbage-collect hashes not in the keep set.
+   * Garbage-collect stored content. A hash is retained when it is either:
+   *   - still referenced (`keepHashes`) — always kept, regardless of age; or
+   *   - younger than the retention window (`now - mtime < retentionMs`).
+   * Everything else is deleted. `now` is injected (never `Date.now()` here) so
+   * the retention window is deterministic under test. If a blob's mtime can't be
+   * determined (stat null/throws) it is kept — we don't delete what we can't date.
    * Call after a successful sync when ancestor hashes are updated.
    */
-  async gc(keepHashes: Set<string>): Promise<void> {
+  async gc(keepHashes: Set<string>, retentionMs: number, now: number): Promise<void> {
     const all = await this.listHashes();
     for (const hash of all) {
-      if (!keepHashes.has(hash)) {
-        await this.delete(hash);
+      if (keepHashes.has(hash)) continue;
+      let mtime: number | null = null;
+      try {
+        const stat = await this.app.vault.adapter.stat(this.contentPath(hash));
+        mtime = stat?.mtime ?? null;
+      } catch {
+        mtime = null;
       }
+      // Conservative: keep anything we can't date, or that's within the window.
+      if (mtime === null || now - mtime < retentionMs) continue;
+      await this.delete(hash);
     }
   }
 

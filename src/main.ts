@@ -298,7 +298,8 @@ export default class VaultSyncPlugin extends Plugin {
   async clearContentCache(): Promise<number> {
     const keep = this.registry.referencedHashes();
     const before = (await this.contentStore.listHashes()).length;
-    await this.contentStore.gc(keep);
+    const retentionMs = this.settings.ancestorRetentionDays * 86_400_000;
+    await this.contentStore.gc(keep, retentionMs, Date.now());
     const after = (await this.contentStore.listHashes()).length;
     return before - after;
   }
