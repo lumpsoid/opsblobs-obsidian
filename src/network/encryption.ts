@@ -164,6 +164,13 @@ export class VaultCrypto {
   }
 }
 
+/** Deterministic 32-byte salt for a vault, derived from its (shared) vaultId so
+ *  every device produces the same PBKDF2 salt without transferring one. */
+export async function saltForVault(vaultId: string): Promise<Uint8Array> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`vault-sync:salt:${vaultId}`));
+  return new Uint8Array(digest);
+}
+
 export function bytesToBase64(bytes: Uint8Array): string {
   let binary = '';
   for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!);

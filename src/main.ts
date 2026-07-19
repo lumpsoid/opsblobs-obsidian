@@ -2,7 +2,7 @@
 //  Obsidian Vault Sync — Main Plugin Entry
 // ─────────────────────────────────────────────
 
-import { App, Plugin, Notice, Modal, addIcon } from 'obsidian';
+import { Plugin, Notice, addIcon } from 'obsidian';
 import { SyncSettings, DEFAULT_SETTINGS } from './types';
 import { HybridLogicalClock } from './core/hlc';
 import { FileRegistry } from './core/file-registry';
@@ -10,11 +10,12 @@ import { ContentStore } from './core/content-store';
 import { OperationLogger } from './core/operation-logger';
 import { resolveDeleteStrategy } from './core/conflict-policy';
 import { SyncApplicator } from './network/sync-applicator';
-import { VaultCrypto } from './network/encryption';
+import { VaultCrypto, saltForVault } from './network/encryption';
 import { ServerSyncClient } from './network/server-sync';
 import { HttpServerApi, CursorStore } from './network/server-http';
 import { PluginVaultSyncHost } from './network/vault-sync-host';
 import { ConflictResolutionModal } from './ui/conflict-modal';
+import { DeleteConflictModal } from './ui/delete-conflict-modal';
 import { SyncSettingTab } from './ui/settings-tab';
 
 // ─── Ribbon icon SVG ────────────────────────────────────────────────────────
@@ -373,67 +374,5 @@ export default class VaultSyncPlugin extends Plugin {
     if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
     if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
     return `${Math.floor(seconds / 86400)}d ago`;
-  }
-}
-
-/** Deterministic 32-byte salt for a vault, derived from its (shared) vaultId so
- *  every device produces the same PBKDF2 salt without transferring one. */
-async function saltForVault(vaultId: string): Promise<Uint8Array> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`vault-sync:salt:${vaultId}`));
-  return new Uint8Array(digest);
-}
-
-// ─── Delete-conflict modal ─────────────────────────────────────────────────────
-// Shown when a file was deleted on one device and modified on another, and the
-// deleteConflictStrategy is 'ask'. The user chooses which side to keep.
-
-class DeleteConflictModal extends Modal {
-  private decided = false;
-
-  constructor(
-    app: App,
-    private path: string,
-    private side: 'local_deleted' | 'remote_deleted',
-    private resolve: (decision: 'keep_deleted' | 'restore') => void,
-  ) {
-    super(app);
-  }
-
-  onOpen() {
-    const { contentEl } = this;
-    contentEl.createEl('h2', { text: '⚠️ Delete conflict' });
-
-    const deletedHere = this.side === 'local_deleted';
-    contentEl.createEl('p', {
-      text: `"${this.path}" was deleted on ${deletedHere ? 'this device' : 'another device'} ` +
-        `but modified on ${deletedHere ? 'another device' : 'this device'}. ` +
-        'Keep the deletion, or restore the modified version?',
-    });
-
-    const buttons = contentEl.createDiv({ cls: 'delete-conflict-buttons' });
-
-    const restoreBtn = buttons.createEl('button', {
-      text: 'Keep modified version',
-      cls: 'mod-cta',
-    });
-    restoreBtn.addEventListener('click', () => this.decide('restore'));
-
-    const deleteBtn = buttons.createEl('button', {
-      text: 'Keep deleted',
-      cls: 'mod-warning',
-    });
-    deleteBtn.addEventListener('click', () => this.decide('keep_deleted'));
-  }
-
-  private decide(decision: 'keep_deleted' | 'restore') {
-    this.decided = true;
-    this.resolve(decision);
-    this.close();
-  }
-
-  onClose() {
-    // Dismissed without choosing — default to restoring so no edit is lost.
-    if (!this.decided) this.resolve('restore');
-    this.contentEl.empty();
   }
 }
