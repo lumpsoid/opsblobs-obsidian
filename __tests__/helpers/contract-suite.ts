@@ -16,7 +16,7 @@ import { describe, test, expect, beforeAll } from 'vitest';
 import { ServerApi, ServerSyncClient } from '../../src/network/server-sync';
 import { VaultCrypto } from '../../src/network/encryption';
 import { HybridLogicalClock } from '../../src/core/hlc';
-import { MemoryHost, seedFile, editFile, sha256Hex } from './memory-host';
+import { MemoryHost, seedFile, editFile, deleteFile, renameFile, sha256Hex } from './memory-host';
 
 /**
  * Supplies ServerApi instances to the suite. `connect(vaultId)` returns a client
@@ -199,6 +199,109 @@ export function runContractSuite(label: string, newServer: () => ContractServer)
       const hostC = new MemoryHost('dev-c');
       await client(server.connect(vault), hostC, 'dev-c').runSync();
       expect(decode(hostC)).toBe(R);
+    });
+
+    test('two devices: a one-sided delete propagates and both converge to deleted', async () => {
+      const server = newServer();
+      const vault = server.freshVault();
+      const hostA = new MemoryHost('dev-a');
+      const hostB = new MemoryHost('dev-b');
+
+      // ── Shared base: A creates & pushes; B pulls it. Both hold the file. ──
+      const { hash } = await seedFile(hostA, 'dev-a', 'f1', 'note.md', 'body\n', 1000);
+      await client(server.connect(vault), hostA, 'dev-a').runSync();
+      // Mirror the applicator's send_remote ancestor update (MemoryHost doesn't):
+      // A's surviving side must match its ancestor for a clean incoming delete.
+      hostA.fileEntries.get('f1')!.ancestorContentHash = hash;
+      await client(server.connect(vault), hostB, 'dev-b').runSync();
+      expect(hostB.fileEntries.get('f1')!.contentHash).toBe(hash);
+
+      // ── B deletes the file and pushes the tombstone. ──
+      deleteFile(hostB, 'dev-b', 'f1', 'note.md', 2000);
+      await client(server.connect(vault), hostB, 'dev-b').runSync();
+      expect(hostB.pendingOps).toHaveLength(0);
+
+      // ── A pulls the delete; its unchanged copy is removed cleanly (delete_local,
+      //    not a delete_conflict — A never touched the file since the ancestor). ──
+      await client(server.connect(vault), hostA, 'dev-a').runSync();
+      expect(hostA.fileEntries.get('f1')!.deleted).toBe(true);
+      expect(hostB.fileEntries.get('f1')!.deleted).toBe(true);
+
+      // The tombstone is durable: a fresh device pulls create+delete and never
+      // materialises the file at all.
+      const hostC = new MemoryHost('dev-c');
+      await client(server.connect(vault), hostC, 'dev-c').runSync();
+      const cEntry = hostC.fileEntries.get('f1');
+      expect(cEntry === undefined || cEntry.deleted).toBe(true);
+    });
+
+    test('two devices: a rename propagates via move_local and both converge', async () => {
+      const server = newServer();
+      const vault = server.freshVault();
+      const hostA = new MemoryHost('dev-a');
+      const hostB = new MemoryHost('dev-b');
+
+      // ── Shared base: A creates "old.md" & pushes; B pulls it. ──
+      const { hash } = await seedFile(hostA, 'dev-a', 'f1', 'old.md', 'stable body\n', 1000);
+      await client(server.connect(vault), hostA, 'dev-a').runSync();
+      hostA.fileEntries.get('f1')!.ancestorContentHash = hash;
+      await client(server.connect(vault), hostB, 'dev-b').runSync();
+      expect(hostB.fileEntries.get('f1')!.path).toBe('old.md');
+
+      // ── A renames old.md → new.md (content unchanged) and pushes the move. ──
+      renameFile(hostA, 'dev-a', 'f1', 'old.md', 'new.md', 2000);
+      await client(server.connect(vault), hostA, 'dev-a').runSync();
+      expect(hostA.pendingOps).toHaveLength(0);
+      expect(hostA.fileEntries.get('f1')!.path).toBe('new.md');
+
+      // ── B pulls the move; same content + higher-HLC path ⇒ move_local, not a
+      //    rewrite. The file id is stable, only the path follows the winner. ──
+      await client(server.connect(vault), hostB, 'dev-b').runSync();
+      expect(hostB.fileEntries.get('f1')!.path).toBe('new.md');
+      expect(hostB.fileEntries.get('f1')!.contentHash).toBe(hash);
+      expect(hostB.fileEntries.get('f1')!.deleted).toBe(false);
+
+      // A fresh device sees the file only at its renamed path, with content intact.
+      const hostC = new MemoryHost('dev-c');
+      await client(server.connect(vault), hostC, 'dev-c').runSync();
+      expect(hostC.fileEntries.get('f1')!.path).toBe('new.md');
+      const body = hostC.content.get(hostC.fileEntries.get('f1')!.contentHash);
+      expect(body && new TextDecoder().decode(body)).toBe('stable body\n');
+    });
+
+    test('two devices: concurrent renames to different paths converge by HLC', async () => {
+      const server = newServer();
+      const vault = server.freshVault();
+      const hostA = new MemoryHost('dev-a');
+      const hostB = new MemoryHost('dev-b');
+
+      // ── Shared base: A creates "orig.md" & pushes; B pulls it. ──
+      const { hash } = await seedFile(hostA, 'dev-a', 'f1', 'orig.md', 'shared\n', 1000);
+      await client(server.connect(vault), hostA, 'dev-a').runSync();
+      hostA.fileEntries.get('f1')!.ancestorContentHash = hash;
+      await client(server.connect(vault), hostB, 'dev-b').runSync();
+
+      // ── Both rename to a different path at the *same* wall/counter, so the
+      //    winner is decided purely by the deviceId tie-break ('dev-b' > 'dev-a'). ──
+      renameFile(hostA, 'dev-a', 'f1', 'orig.md', 'a-name.md', 2000);
+      renameFile(hostB, 'dev-b', 'f1', 'orig.md', 'b-name.md', 2000);
+
+      // A pushes first; B pushes on top; both keep syncing until the log drains
+      // into agreement. dev-b's rename dominates the tie, so both land on b-name.
+      await client(server.connect(vault), hostA, 'dev-a').runSync(); // push a-name
+      await client(server.connect(vault), hostB, 'dev-b').runSync(); // push b-name, sees a-name (loses tie)
+      await client(server.connect(vault), hostA, 'dev-a').runSync(); // pull b-name → move_local
+      await client(server.connect(vault), hostB, 'dev-b').runSync(); // settle (no-op)
+
+      expect(hostA.fileEntries.get('f1')!.path).toBe('b-name.md');
+      expect(hostB.fileEntries.get('f1')!.path).toBe('b-name.md');
+      expect(hostA.fileEntries.get('f1')!.contentHash).toBe(hash);
+      expect(hostB.fileEntries.get('f1')!.contentHash).toBe(hash);
+
+      // A fresh device agrees on the winning path.
+      const hostC = new MemoryHost('dev-c');
+      await client(server.connect(vault), hostC, 'dev-c').runSync();
+      expect(hostC.fileEntries.get('f1')!.path).toBe('b-name.md');
     });
   });
 }

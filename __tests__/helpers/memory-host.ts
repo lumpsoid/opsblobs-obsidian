@@ -69,6 +69,11 @@ export class MemoryHost implements VaultSyncHost {
       } else if (a.type === 'delete_local') {
         const e = this.fileEntries.get(a.fileId);
         if (e) this.fileEntries.set(a.fileId, { ...e, deleted: true });
+      } else if (a.type === 'move_local') {
+        // Mirror SyncApplicator.moveLocalFile: the file id is unchanged, only its
+        // path moves to the winning side's path.
+        const e = this.fileEntries.get(a.fileId);
+        if (e) this.fileEntries.set(a.fileId, { ...e, path: a.toPath });
       } else if (a.type === 'conflict' && this.resolveConflict) {
         // Mirror SyncApplicator: resolve, advance to the resolved content, and
         // re-emit it as an op (clearPendingOps already ran this round, so this
@@ -122,4 +127,28 @@ export async function editFile(
   host.fileEntries.set(fileId, { ...entry, path, contentHash: hash, hlcTimestamp: hlc });
   host.pendingOps.push({ id: `${deviceId}-edit-${fileId}-${wall}`, deviceId, hlcTimestamp: hlc, fileId, type: 'update', path, contentHash: hash });
   return { hash };
+}
+
+/** Delete an already-tracked file: tombstone its entry and queue a pending
+ *  `delete` op (models a user deleting a file that is already in sync). Content
+ *  is left in the store; a delete op carries no blob. */
+export function deleteFile(
+  host: MemoryHost, deviceId: string, fileId: string, path: string, wall: number,
+): void {
+  const hlc: HLC = { wallTime: wall, counter: 0, deviceId };
+  const entry = host.fileEntries.get(fileId)!;
+  host.fileEntries.set(fileId, { ...entry, deleted: true, hlcTimestamp: hlc });
+  host.pendingOps.push({ id: `${deviceId}-del-${fileId}-${wall}`, deviceId, hlcTimestamp: hlc, fileId, type: 'delete', path, contentHash: entry.contentHash });
+}
+
+/** Rename an already-tracked file: move its path with the content unchanged and
+ *  queue a pending `move` op (models a user renaming a file that is in sync). The
+ *  content hash and ancestor are untouched — only the path changes. */
+export function renameFile(
+  host: MemoryHost, deviceId: string, fileId: string, fromPath: string, toPath: string, wall: number,
+): void {
+  const hlc: HLC = { wallTime: wall, counter: 0, deviceId };
+  const entry = host.fileEntries.get(fileId)!;
+  host.fileEntries.set(fileId, { ...entry, path: toPath, hlcTimestamp: hlc });
+  host.pendingOps.push({ id: `${deviceId}-mv-${fileId}-${wall}`, deviceId, hlcTimestamp: hlc, fileId, type: 'move', path: toPath, contentHash: entry.contentHash, previousPath: fromPath });
 }

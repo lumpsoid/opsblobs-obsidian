@@ -393,12 +393,16 @@ client↔server contract suite against the real Go server, green). What remains,
   (Client-side; server-independent — no wire/contract change, the op rides the existing `ciphertext`.)
 
 **Integration testing:**
-- **Two-client convergence — conflict case DONE (2026-07-19); deletes/renames still TODO.** The
-  shared contract suite (`__tests__/helpers/contract-suite.ts`) gained a two-device
-  concurrent-overlapping-edit → resolve → converge scenario, and it passes against **both** the
-  in-memory fake and the **real Go server** (`npm run test:integration`, 8/8). `MemoryHost` mirrors
-  the applicator's resolve-and-re-emit behaviour behind an injectable `resolveConflict`. Still to
-  add: concurrent **deletes** and **renames** convergence across two clients.
+- **Two-client convergence — conflict, delete & rename cases DONE (2026-07-19).** The
+  shared contract suite (`__tests__/helpers/contract-suite.ts`) covers two-device
+  concurrent-overlapping-edit → resolve → converge, plus three new scenarios: a one-sided **delete**
+  propagates (`delete_local`, not a false `delete_conflict`) and a fresh device sees the tombstone;
+  a one-sided **rename** propagates via `move_local` (stable file id, path follows the winner); and
+  **concurrent renames** to different paths converge by the HLC deviceId tie-break. All pass against
+  **both** the in-memory fake (`npm test`, 63/63) and the **real Go server**
+  (`npm run test:integration`, 11/11). `MemoryHost` mirrors the applicator's resolve-and-re-emit
+  behaviour (`resolveConflict`) and now its `move_local` path move; new `deleteFile` / `renameFile`
+  helpers queue the corresponding `delete` / `move` pending ops.
 - **Real-device pass** — desktop + iOS/Android; verify the `requestUrl` transport works on mobile
   (the biggest still-untested surface).
 
