@@ -59,9 +59,15 @@ export interface ConflictChunk {
   ancestor: string[];
   local: string[];
   remote: string[];
-  resolution?: 'local' | 'remote' | 'both' | 'custom';
-  customText?: string[];
 }
+
+// How a user resolved a single ConflictChunk. A discriminated union so an
+// invalid combination cannot be represented: 'custom' always carries its text.
+export type ConflictResolution =
+  | { kind: 'local' }
+  | { kind: 'remote' }
+  | { kind: 'both' }
+  | { kind: 'custom'; text: string[] };
 
 export interface ThreeWayMergeResult {
   merged: string[];

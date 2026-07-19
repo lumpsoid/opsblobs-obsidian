@@ -6,7 +6,7 @@
 //  Layer 1: Patience diff (LCS-based, anchors on unique lines — better for markdown)
 //  Layer 2: Three-way merge using two diffs against a common ancestor
 
-import { ConflictChunk, ThreeWayMergeResult } from '../types';
+import { ConflictChunk, ConflictResolution, ThreeWayMergeResult } from '../types';
 
 // ─── Layer 1: Patience Diff ──────────────────────────────────────────────────
 
@@ -389,16 +389,20 @@ function normalizeLines(text: string): string[] {
 // ─── Helpers exported for use in merge engine ─────────────────────────────────
 
 /**
- * Given a resolved `ConflictChunk`, produce the replacement lines its
- * `resolution` selects. The single home for this rule; the conflict modal
- * imports it to build the resolved file content.
+ * Given a raw `ConflictChunk` and the user's `resolution`, produce the
+ * replacement lines the resolution selects. The single home for this rule; the
+ * conflict modal imports it to build the resolved file content. Because
+ * `resolution` is a discriminated union, `'custom'` always carries its text —
+ * no fallback needed.
  */
-export function resolveConflictChunkLines(chunk: ConflictChunk): string[] {
-  switch (chunk.resolution) {
+export function resolveConflictChunkLines(
+  chunk: ConflictChunk,
+  resolution: ConflictResolution,
+): string[] {
+  switch (resolution.kind) {
     case 'local': return chunk.local;
     case 'remote': return chunk.remote;
     case 'both': return [...chunk.local, ...chunk.remote];
-    case 'custom': return chunk.customText ?? chunk.local;
-    default: return chunk.local;
+    case 'custom': return resolution.text;
   }
 }

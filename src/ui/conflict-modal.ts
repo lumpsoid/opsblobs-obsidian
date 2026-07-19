@@ -4,12 +4,12 @@
 // ─────────────────────────────────────────────
 
 import { App, Modal, ButtonComponent } from 'obsidian';
-import { ThreeWayMergeResult, ConflictChunk } from '../types';
+import { ThreeWayMergeResult, ConflictResolution } from '../types';
 import { resolveConflictChunkLines } from '../merge/diff3';
 
 export class ConflictResolutionModal extends Modal {
   private result: Uint8Array | null = null;
-  private resolvedChunks: Map<number, ConflictChunk> = new Map();
+  private resolutions: Map<number, ConflictResolution> = new Map();
   private mergedLines: string[];
 
   constructor(
@@ -23,8 +23,8 @@ export class ConflictResolutionModal extends Modal {
     super(app);
     this.mergedLines = [...mergeResult.merged];
     // Pre-populate resolutions with 'local' as default
-    mergeResult.conflicts.forEach((chunk, i) => {
-      this.resolvedChunks.set(i, { ...chunk, resolution: 'local' });
+    mergeResult.conflicts.forEach((_chunk, i) => {
+      this.resolutions.set(i, { kind: 'local' });
     });
   }
 
@@ -50,15 +50,15 @@ export class ConflictResolutionModal extends Modal {
     new ButtonComponent(globalBar)
       .setButtonText('Accept All Local')
       .setClass('mod-cta')
-      .onClick(() => { this.acceptAll('local'); this.renderConflicts(conflictsContainer); });
+      .onClick(() => { this.acceptAll({ kind: 'local' }); this.renderConflicts(conflictsContainer); });
 
     new ButtonComponent(globalBar)
       .setButtonText('Accept All Remote')
-      .onClick(() => { this.acceptAll('remote'); this.renderConflicts(conflictsContainer); });
+      .onClick(() => { this.acceptAll({ kind: 'remote' }); this.renderConflicts(conflictsContainer); });
 
     new ButtonComponent(globalBar)
       .setButtonText('Accept All Both')
-      .onClick(() => { this.acceptAll('both'); this.renderConflicts(conflictsContainer); });
+      .onClick(() => { this.acceptAll({ kind: 'both' }); this.renderConflicts(conflictsContainer); });
 
     // ── Conflicts list ────────────────────────────────────────────────────
     const conflictsContainer = contentEl.createDiv('conflict-list');
@@ -97,7 +97,7 @@ export class ConflictResolutionModal extends Modal {
     container.empty();
 
     this.mergeResult.conflicts.forEach((chunk, idx) => {
-      const current = this.resolvedChunks.get(idx) ?? chunk;
+      const current = this.resolutions.get(idx);
       const conflictEl = container.createDiv('conflict-chunk');
 
       const chunkHeader = conflictEl.createDiv('chunk-header');
@@ -106,7 +106,7 @@ export class ConflictResolutionModal extends Modal {
         cls: 'chunk-index',
       });
 
-      const resolved = current.resolution;
+      const resolved = current?.kind;
       chunkHeader.createEl('span', {
         text: this.resolutionLabel(resolved),
         cls: `resolution-badge resolution-${resolved ?? 'unset'}`,
@@ -128,25 +128,25 @@ export class ConflictResolutionModal extends Modal {
       // Action buttons
       const actions = conflictEl.createDiv('chunk-actions');
 
-      const makeBtn = (label: string, resolution: ConflictChunk['resolution'], cls = '') => {
+      const makeBtn = (label: string, resolution: ConflictResolution, cls = '') => {
         new ButtonComponent(actions)
           .setButtonText(label)
           .setClass(cls || 'mod-plain')
           .onClick(() => {
-            this.resolvedChunks.set(idx, { ...current, resolution });
+            this.resolutions.set(idx, resolution);
             this.renderConflicts(container);
           });
       };
 
-      makeBtn('Accept Local', 'local', resolved === 'local' ? 'mod-cta' : '');
-      makeBtn('Accept Remote', 'remote', resolved === 'remote' ? 'mod-cta' : '');
-      makeBtn('Accept Both', 'both', resolved === 'both' ? 'mod-cta' : '');
+      makeBtn('Accept Local', { kind: 'local' }, resolved === 'local' ? 'mod-cta' : '');
+      makeBtn('Accept Remote', { kind: 'remote' }, resolved === 'remote' ? 'mod-cta' : '');
+      makeBtn('Accept Both', { kind: 'both' }, resolved === 'both' ? 'mod-cta' : '');
     });
   }
 
-  private acceptAll(resolution: ConflictChunk['resolution']): void {
-    this.mergeResult.conflicts.forEach((chunk, idx) => {
-      this.resolvedChunks.set(idx, { ...chunk, resolution });
+  private acceptAll(resolution: ConflictResolution): void {
+    this.mergeResult.conflicts.forEach((_chunk, idx) => {
+      this.resolutions.set(idx, resolution);
     });
   }
 
@@ -157,15 +157,15 @@ export class ConflictResolutionModal extends Modal {
       .sort((a, b) => b.c.startLine - a.c.startLine);
 
     for (const { c, i } of sortedConflicts) {
-      const resolved = this.resolvedChunks.get(i);
-      const replacementLines = resolveConflictChunkLines(resolved ?? c);
+      const resolution = this.resolutions.get(i) ?? { kind: 'local' };
+      const replacementLines = resolveConflictChunkLines(c, resolution);
       lines.splice(c.startLine, c.local.length, ...replacementLines);
     }
     return lines.join('\n');
   }
 
-  private resolutionLabel(resolution?: ConflictChunk['resolution']): string {
-    switch (resolution) {
+  private resolutionLabel(kind?: ConflictResolution['kind']): string {
+    switch (kind) {
       case 'local': return '✓ Local';
       case 'remote': return '✓ Remote';
       case 'both': return '✓ Both';
