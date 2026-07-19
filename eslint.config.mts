@@ -13,7 +13,9 @@ export default tseslint.config(
 				projectService: {
 					allowDefaultProject: [
 						'eslint.config.js',
-						'manifest.json'
+						'manifest.json',
+						'vitest.config.ts',
+						'vitest.integration.config.ts'
 					]
 				},
 				tsconfigRootDir: import.meta.dirname,
@@ -22,6 +24,22 @@ export default tseslint.config(
 		},
 	},
 	...obsidianmd.configs.recommended,
+	{
+		// The client↔server integration harness runs in Node (vitest), not inside
+		// Obsidian, so it legitimately uses `fetch`, Node builtins, and Node globals.
+		// The Obsidian-plugin rules that forbid those do not apply to these files.
+		files: ["__tests__/integration/**/*.ts"],
+		languageOptions: {
+			globals: {
+				...globals.node,
+			},
+		},
+		rules: {
+			"no-restricted-globals": "off",
+			"import/no-nodejs-modules": "off",
+			"no-undef": "off",
+		},
+	},
 	globalIgnores([
 		"node_modules",
 		"dist",
