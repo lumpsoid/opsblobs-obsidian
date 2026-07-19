@@ -7,7 +7,7 @@
 //  Compares two VaultStates and returns a list of actions to apply.
 //  Commutative: merge(A, B) produces equivalent actions as merge(B, A).
 
-import { VaultState, FileEntry, MergeAction, StateMergeResult } from '../types';
+import { VaultState, FileEntry, MergeAction, StateMergeResult, ThreeWayMergeResult } from '../types';
 import { hlcCompare, hlcMax } from '../core/hlc';
 import { threeWayMerge } from './diff3';
 
@@ -198,13 +198,35 @@ function resolveContentConflict(
 
   // Attempt three-way merge using ancestor
   const ancestorHash = le.ancestorContentHash ?? re.ancestorContentHash;
-  const ancestorContent = ancestorHash
+  const ancestorContent = ancestorHash != null
     ? (local.contentStore.get(ancestorHash) ?? remote.contentStore.get(ancestorHash))
     : undefined;
 
+  // A *known-but-missing* ancestor (a real hash was recorded but its bytes are
+  // held by neither store — GC'd or never fetched to this device) is NOT a valid
+  // three-way base. Falling back to an empty ancestor makes diff3 treat both full
+  // versions as inserts at the same gap and silently *unions* them, duplicating
+  // the whole file. Distinguish that from "no ancestor recorded at all"
+  // (ancestorHash == null — genuinely no common base): only the latter may fall
+  // back to an empty ancestor. When the ancestor is known but unavailable, surface
+  // a conflict so the user resolves it and nothing is silently concatenated.
+  if (ancestorHash != null && ancestorContent === undefined) {
+    const mergeResult = wholeFileConflict(localText, remoteText);
+    return {
+      type: 'conflict',
+      fileId,
+      localPath: le.path,
+      remotePath: re.path,
+      mergeResult,
+      localContent: localText,
+      remoteContent: remoteText,
+      parentHashes: [le.contentHash, re.contentHash],
+    };
+  }
+
   const ancestorText = ancestorContent
     ? new TextDecoder().decode(ancestorContent)
-    : '';  // Fall back to empty ancestor if not available
+    : '';  // Fall back to empty ancestor only when no ancestor was ever recorded
 
   const mergeResult = threeWayMerge(ancestorText, localText, remoteText);
 
@@ -234,6 +256,35 @@ function resolveContentConflict(
     remoteContent: remoteText,
     parentHashes: [le.contentHash, re.contentHash],
   };
+}
+
+/**
+ * Synthesize a whole-file conflict result for the case where no usable ancestor
+ * exists (its bytes are unavailable), so the two versions cannot be reconciled
+ * automatically. Mirrors the shape `threeWayMerge` produces for a genuine
+ * conflict — `merged` carries the local lines as the placeholder and a single
+ * `ConflictChunk` spans that region with an empty ancestor — so the conflict
+ * modal/applicator consume it exactly like any other conflict.
+ */
+function wholeFileConflict(localText: string, remoteText: string): ThreeWayMergeResult {
+  const localLines = splitLines(localText);
+  const remoteLines = splitLines(remoteText);
+  return {
+    merged: localLines,
+    conflicts: [{
+      startLine: 0,
+      endLine: localLines.length - 1,
+      ancestor: [],
+      local: localLines,
+      remote: remoteLines,
+    }],
+    hasConflicts: true,
+  };
+}
+
+/** Split text into lines the same way diff3 normalizes (CRLF/CR → LF). */
+function splitLines(text: string): string[] {
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
 }
 
 function resolveRenameConflict(fileId: string, le: FileEntry, re: FileEntry): MergeAction {

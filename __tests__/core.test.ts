@@ -394,6 +394,42 @@ describe('mergeVaultStates', () => {
     );
   });
 
+  // ── F6: a known-but-missing ancestor must not union both full versions ──
+  test('both modified, ancestor recorded but its bytes missing → conflict (never union both versions)', () => {
+    // Both sides edited file1 and both current contents are present, but the
+    // recorded ancestor's bytes are held by neither store (GC'd / never fetched).
+    // An empty-string stand-in for a *known* ancestor makes diff3 treat both full
+    // versions as inserts at gap 0 and unions them — silently duplicating the
+    // whole file. That must surface as a conflict instead.
+    // A leading blank line (ubiquitous in markdown) survives as the empty
+    // ancestor's phantom line, so each side's real edit becomes a *pure insert*
+    // at the same gap — exactly the diff3 union trap for a known-but-missing base.
+    const localText = '\nAAA local only line 1\nAAA local only line 2';
+    const remoteText = '\nBBB remote only line 1\nBBB remote only line 2';
+    const local = makeState('A', [
+      { id: 'file1', contentHash: 'local-hash', ancestorContentHash: 'base', hlcTimestamp: { wallTime: 1000, counter: 0, deviceId: 'A' } },
+    ]);
+    const remote = makeState('B', [
+      { id: 'file1', contentHash: 'remote-hash', ancestorContentHash: 'base', hlcTimestamp: { wallTime: 2000, counter: 0, deviceId: 'B' } },
+    ]);
+    // Distinct, present current content on each side...
+    local.contentStore.set('local-hash', new TextEncoder().encode(localText));
+    remote.contentStore.set('remote-hash', new TextEncoder().encode(remoteText));
+    // ...but the recorded ancestor's bytes are unavailable in both stores.
+    expect(local.contentStore.has('base')).toBe(false);
+    expect(remote.contentStore.has('base')).toBe(false);
+
+    const { actions } = mergeVaultStates(local, remote);
+    const action = actions.find(a => a.fileId === 'file1')!;
+    expect(action.type).toBe('conflict');
+    // Must NOT emit a write_local whose merged content concatenates BOTH versions.
+    const writes = actions.filter(a => a.type === 'write_local' && a.fileId === 'file1');
+    for (const w of writes) {
+      const text = new TextDecoder().decode((w as { content: Uint8Array }).content);
+      expect(text.includes('AAA local only line 1') && text.includes('BBB remote only line 1')).toBe(false);
+    }
+  });
+
   test('commutativity: merge(A,B).type == merge(B,A).type', () => {
     const stateA = makeState('A', [{ id: 'f1' }, { id: 'f2' }]);
     const stateB = makeState('B', [{ id: 'f2', contentHash: 'different' }, { id: 'f3' }]);
