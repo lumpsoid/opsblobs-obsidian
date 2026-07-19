@@ -3,25 +3,31 @@
 //  Phase 1.4
 // ─────────────────────────────────────────────
 //
-//  Hooks into Obsidian vault events and records operations.
-//  Debounces rapid saves so only one operation is recorded per logical edit.
+//  Observes vault change events (via a VaultWatcher port) and records
+//  operations. Debounces rapid saves so only one operation is recorded per
+//  logical edit. Reads file bytes through a VaultFiles port and persists the
+//  oplog through a MetadataStore port — obsidian-free.
 
-import { App, TFile, normalizePath } from 'obsidian';
 import { HLC, Operation, SyncSettings } from '../types';
 import { HybridLogicalClock } from './hlc';
 import { FileRegistry } from './file-registry';
 import { ContentStore, hashContent } from './content-store';
 import { isExcluded } from './exclusion-policy';
+import { VaultFiles } from '../ports/vault-files';
+import { VaultWatcher } from '../ports/vault-watcher';
+import { MetadataStore } from '../ports/metadata-store';
 
+const OPLOG_DIR = '.vault-sync';
 const OPLOG_PATH = '.vault-sync/oplog.json';
 
 export class OperationLogger {
   private pendingOps: Operation[] = [];
   private debounceTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
-  private eventHandlers: Array<() => void> = [];
 
   constructor(
-    private app: App,
+    private files: VaultFiles,
+    private watcher: VaultWatcher,
+    private metadata: MetadataStore,
     private deviceId: string,
     private hlc: HybridLogicalClock,
     private registry: FileRegistry,
@@ -33,12 +39,8 @@ export class OperationLogger {
   // ─── Lifecycle ────────────────────────────────────────────────────────────
 
   async load(): Promise<void> {
-    try {
-      const raw = await this.app.vault.adapter.read(OPLOG_PATH);
-      this.pendingOps = JSON.parse(raw) as Operation[];
-    } catch {
-      this.pendingOps = [];
-    }
+    const raw = await this.metadata.read(OPLOG_PATH);
+    this.pendingOps = raw === null ? [] : (JSON.parse(raw) as Operation[]);
   }
 
   /**
@@ -59,13 +61,15 @@ export class OperationLogger {
     const onDisk = new Set<string>();
 
     // ── Live files: untracked → create, content drifted → update ─────────────
-    for (const file of this.app.vault.getFiles()) {
-      if (this.isExcluded(file.path)) continue;
-      onDisk.add(file.path);
+    for (const ref of this.files.list()) {
+      const path = ref.path;
+      if (this.isExcluded(path)) continue;
+      onDisk.add(path);
 
-      const content = await this.readFile(file);
+      const content = await this.files.read(path);
+      if (content === null) continue;
       const hash = await hashContent(content);
-      const entry = this.registry.getByPath(file.path);
+      const entry = this.registry.getByPath(path);
 
       if (entry && entry.contentHash === hash) continue; // already captured/synced
 
@@ -73,10 +77,10 @@ export class OperationLogger {
       const hlcTs = this.hlc.now();
 
       if (!entry) {
-        const id = await this.registry.registerFile(file, hlcTs, hash);
+        const id = await this.registry.registerFile({ path }, hlcTs, hash);
         this.pendingOps.push({
           id: this.opId(), deviceId: this.deviceId, hlcTimestamp: hlcTs,
-          fileId: id, type: 'create', path: file.path, contentHash: hash,
+          fileId: id, type: 'create', path, contentHash: hash,
         });
       } else {
         // A drifted hash means either a placeholder from an older op-less
@@ -84,10 +88,10 @@ export class OperationLogger {
         // the op carries the current content, so peers converge; `create` when
         // it was never really captured, `update` otherwise.
         const type = entry.contentHash === '' ? 'create' : 'update';
-        await this.registry.updateContentHash(file.path, hash, hlcTs);
+        await this.registry.updateContentHash(path, hash, hlcTs);
         this.pendingOps.push({
           id: this.opId(), deviceId: this.deviceId, hlcTimestamp: hlcTs,
-          fileId: entry.id, type, path: file.path, contentHash: hash,
+          fileId: entry.id, type, path, contentHash: hash,
         });
       }
       changed = true;
@@ -109,31 +113,16 @@ export class OperationLogger {
   }
 
   startListening(): void {
-    const onCreate = this.app.vault.on('create', file => {
-      if (file instanceof TFile) void this.handleCreate(file);
+    this.watcher.start({
+      onCreate: path => void this.handleCreate(path),
+      onModify: path => this.handleModify(path),
+      onDelete: path => void this.handleDelete(path),
+      onRename: (path, oldPath) => void this.handleRename(path, oldPath),
     });
-    const onModify = this.app.vault.on('modify', file => {
-      if (file instanceof TFile) void this.handleModify(file);
-    });
-    const onDelete = this.app.vault.on('delete', file => {
-      if (file instanceof TFile) void this.handleDelete(file);
-    });
-    const onRename = this.app.vault.on('rename', (file, oldPath) => {
-      if (file instanceof TFile) void this.handleRename(file, oldPath);
-    });
-
-    // Store removers so we can clean up on unload
-    this.eventHandlers.push(
-      () => this.app.vault.offref(onCreate),
-      () => this.app.vault.offref(onModify),
-      () => this.app.vault.offref(onDelete),
-      () => this.app.vault.offref(onRename),
-    );
   }
 
   stopListening(): void {
-    for (const remove of this.eventHandlers) remove();
-    this.eventHandlers = [];
+    this.watcher.stop();
     for (const timer of this.debounceTimers.values()) clearTimeout(timer);
     this.debounceTimers.clear();
   }
@@ -153,20 +142,20 @@ export class OperationLogger {
       const timer = this.debounceTimers.get(path);
       if (timer) clearTimeout(timer);
       this.debounceTimers.delete(path);
-      const file = this.app.vault.getAbstractFileByPath(path);
-      if (file instanceof TFile) await this.flushModify(file);
+      await this.flushModify(path);
     }
   }
 
   // ─── Event handlers ───────────────────────────────────────────────────────
 
-  private async handleCreate(file: TFile): Promise<void> {
-    if (this.isExcluded(file.path)) return;
+  private async handleCreate(path: string): Promise<void> {
+    if (this.isExcluded(path)) return;
     const hlcTs = this.hlc.now();
-    const content = await this.readFile(file);
+    const content = await this.files.read(path);
+    if (content === null) return;
     const hash = await hashContent(content);
 
-    const id = await this.registry.registerFile(file, hlcTs, hash);
+    const id = await this.registry.registerFile({ path }, hlcTs, hash);
     await this.contentStore.put(hash, content);
 
     await this.recordOp({
@@ -175,35 +164,36 @@ export class OperationLogger {
       hlcTimestamp: hlcTs,
       fileId: id,
       type: 'create',
-      path: file.path,
+      path,
       contentHash: hash,
     });
   }
 
-  private handleModify(file: TFile): void {
-    if (this.isExcluded(file.path)) return;
+  private handleModify(path: string): void {
+    if (this.isExcluded(path)) return;
 
     // Cancel existing debounce for this file
-    const existing = this.debounceTimers.get(file.path);
+    const existing = this.debounceTimers.get(path);
     if (existing) clearTimeout(existing);
 
     const timer = setTimeout(() => {
-      this.debounceTimers.delete(file.path);
-      this.flushModify(file).catch(console.error);
+      this.debounceTimers.delete(path);
+      this.flushModify(path).catch(console.error);
     }, this.debounceMs);
 
-    this.debounceTimers.set(file.path, timer);
+    this.debounceTimers.set(path, timer);
   }
 
-  private async flushModify(file: TFile): Promise<void> {
-    const entry = this.registry.getByPath(file.path);
+  private async flushModify(path: string): Promise<void> {
+    const entry = this.registry.getByPath(path);
     if (!entry) {
       // Untracked file got modified — treat as create
-      await this.handleCreate(file);
+      await this.handleCreate(path);
       return;
     }
 
-    const content = await this.readFile(file);
+    const content = await this.files.read(path);
+    if (content === null) return;
     const hash = await hashContent(content);
 
     // Skip if content hasn't actually changed
@@ -211,7 +201,7 @@ export class OperationLogger {
 
     const hlcTs = this.hlc.now();
     await this.contentStore.put(hash, content);
-    await this.registry.updateContentHash(file.path, hash, hlcTs);
+    await this.registry.updateContentHash(path, hash, hlcTs);
 
     await this.recordOp({
       id: this.opId(),
@@ -219,18 +209,18 @@ export class OperationLogger {
       hlcTimestamp: hlcTs,
       fileId: entry.id,
       type: 'update',
-      path: file.path,
+      path,
       contentHash: hash,
     });
   }
 
-  private async handleDelete(file: TFile): Promise<void> {
-    if (this.isExcluded(file.path)) return;
-    const entry = this.registry.getByPath(file.path);
+  private async handleDelete(path: string): Promise<void> {
+    if (this.isExcluded(path)) return;
+    const entry = this.registry.getByPath(path);
     if (!entry) return;
 
     const hlcTs = this.hlc.now();
-    await this.registry.markDeleted(file.path, hlcTs);
+    await this.registry.markDeleted(path, hlcTs);
 
     // If there's a pending create for this file, cancel them out
     this.pruneCreateDeletePair(entry.id);
@@ -241,22 +231,22 @@ export class OperationLogger {
       hlcTimestamp: hlcTs,
       fileId: entry.id,
       type: 'delete',
-      path: file.path,
+      path,
       contentHash: entry.contentHash,
     });
   }
 
-  private async handleRename(file: TFile, oldPath: string): Promise<void> {
-    if (this.isExcluded(file.path) && this.isExcluded(oldPath)) return;
+  private async handleRename(path: string, oldPath: string): Promise<void> {
+    if (this.isExcluded(path) && this.isExcluded(oldPath)) return;
     const entry = this.registry.getByPath(oldPath);
     if (!entry) {
       // Was excluded before rename, now included — treat as create
-      await this.handleCreate(file);
+      await this.handleCreate(path);
       return;
     }
 
     const hlcTs = this.hlc.now();
-    await this.registry.updatePath(oldPath, file.path, hlcTs);
+    await this.registry.updatePath(oldPath, path, hlcTs);
 
     await this.recordOp({
       id: this.opId(),
@@ -264,7 +254,7 @@ export class OperationLogger {
       hlcTimestamp: hlcTs,
       fileId: entry.id,
       type: 'move',
-      path: file.path,
+      path,
       previousPath: oldPath,
       contentHash: entry.contentHash,
     });
@@ -335,11 +325,10 @@ export class OperationLogger {
   }
 
   private async saveOpLog(): Promise<void> {
-    const dir = normalizePath('.vault-sync');
-    if (!(await this.app.vault.adapter.exists(dir))) {
-      await this.app.vault.adapter.mkdir(dir);
+    if (!(await this.metadata.exists(OPLOG_DIR))) {
+      await this.metadata.mkdir(OPLOG_DIR);
     }
-    await this.app.vault.adapter.write(OPLOG_PATH, JSON.stringify(this.pendingOps, null, 2));
+    await this.metadata.write(OPLOG_PATH, JSON.stringify(this.pendingOps, null, 2));
   }
 
   /**
@@ -357,11 +346,6 @@ export class OperationLogger {
   }
 
   // ─── Helpers ─────────────────────────────────────────────────────────────
-
-  private async readFile(file: TFile): Promise<Uint8Array> {
-    const arrayBuffer = await this.app.vault.readBinary(file);
-    return new Uint8Array(arrayBuffer);
-  }
 
   private isExcluded(path: string): boolean {
     return isExcluded(path, this.getSettings());

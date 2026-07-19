@@ -13,6 +13,7 @@ import { resolveDeleteStrategy } from './core/conflict-policy';
 import { SyncApplicator } from './network/sync-applicator';
 import { ObsidianVaultFiles } from './network/obsidian-vault-files';
 import { ObsidianMetadataStore } from './network/obsidian-metadata-store';
+import { ObsidianVaultWatcher } from './network/obsidian-vault-watcher';
 import { VaultCrypto, saltForVault } from './network/encryption';
 import { ServerSyncClient } from './network/server-sync';
 import { HttpServerApi } from './network/server-http';
@@ -57,8 +58,11 @@ export default class VaultSyncPlugin extends Plugin {
     const vaultFiles = new ObsidianVaultFiles(this.app);
     this.registry = new FileRegistry(metadata, vaultFiles, this.settings.deviceId, () => this.settings);
     this.contentStore = new ContentStore(metadata);
+    const watcher = new ObsidianVaultWatcher(this.app);
     this.opLogger = new OperationLogger(
-      this.app,
+      vaultFiles,
+      watcher,
+      metadata,
       this.settings.deviceId,
       this.hlc,
       this.registry,
