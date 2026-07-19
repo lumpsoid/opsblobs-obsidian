@@ -109,7 +109,14 @@ export class MemoryHost implements VaultSyncHost {
         // pending op belongs to the next round and replicates the resolution).
         const resolved = this.resolveConflict(a);
         const hash = await sha256Hex(resolved);
-        const hlc = dominatingHlc(local.hlc, remote.hlc, this.deviceId);
+        // The resolution must dominate BOTH conflicting sides — in production the
+        // monotonic clock guarantees `hlc.now()` exceeds the device's own prior
+        // edit (which `local.hlc` here, hardcoded {0,0}, doesn't reflect). Derive
+        // it from the two entries' timestamps so the resolution out-ranks them and
+        // wins the latest-by-HLC projection on peers.
+        const leTs = local.fileEntries.get(a.fileId)?.hlcTimestamp ?? local.hlc;
+        const reTs = remote.fileEntries.get(a.fileId)?.hlcTimestamp ?? remote.hlc;
+        const hlc = dominatingHlc(leTs, reTs, this.deviceId);
         this.content.set(hash, resolved);
         this.disk.set(a.fileId, resolved);
         this.fileEntries.set(a.fileId, {
@@ -120,6 +127,9 @@ export class MemoryHost implements VaultSyncHost {
           id: `${this.deviceId}-resolve-${a.fileId}-${hash.slice(0, 12)}`,
           deviceId: this.deviceId, hlcTimestamp: hlc, fileId: a.fileId,
           type: 'update', path: a.localPath, contentHash: hash,
+          // Mirror SyncApplicator: tag the resolution with the sides it settles
+          // so peers holding either adopt it instead of re-prompting.
+          supersedes: a.parentHashes,
         });
       }
     }

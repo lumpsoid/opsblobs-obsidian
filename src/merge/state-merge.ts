@@ -118,6 +118,28 @@ function resolveContentConflict(
   local: VaultState,
   remote: VaultState,
 ): MergeAction {
+  // ── Already-resolved conflict ────────────────────────────────────────────
+  // One side is a user-resolved conflict whose `supersedes` set names the exact
+  // content hashes the human chose between. If the *other* side still holds one
+  // of those superseded versions, the resolution already accounts for it —
+  // adopt it wholesale rather than re-running a three-way merge that would just
+  // re-surface the same conflict a peer already settled. Deterministic on both
+  // devices: only the resolution carries `supersedes`, so exactly one branch fires.
+  if (re.supersedes?.includes(le.contentHash)) {
+    const content = remote.contentStore.get(re.contentHash);
+    if (content) {
+      return { type: 'write_local', fileId, path: re.path, content, hlc: re.hlcTimestamp };
+    }
+  }
+  if (le.supersedes?.includes(re.contentHash)) {
+    // Our own content is the resolution and the remote holds a superseded side —
+    // keep ours and push it (send_remote), don't merge back toward the old version.
+    const content = local.contentStore.get(le.contentHash);
+    if (content) {
+      return { type: 'send_remote', fileId, path: le.path, content, hlc: le.hlcTimestamp };
+    }
+  }
+
   // Retrieve file content
   const localContent = local.contentStore.get(le.contentHash);
   const remoteContent = remote.contentStore.get(re.contentHash);
@@ -167,7 +189,9 @@ function resolveContentConflict(
     };
   }
 
-  // True conflict — needs user resolution
+  // True conflict — needs user resolution. Carry the two conflicting content
+  // hashes so the applicator can tag the resolution op with what it supersedes,
+  // letting peers that still hold either side adopt the resolution cleanly.
   return {
     type: 'conflict',
     fileId,
@@ -176,6 +200,7 @@ function resolveContentConflict(
     mergeResult,
     localContent: localText,
     remoteContent: remoteText,
+    parentHashes: [le.contentHash, re.contentHash],
   };
 }
 

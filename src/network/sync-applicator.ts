@@ -19,6 +19,7 @@ interface PendingResolution {
   path: string;
   contentHash: string;
   hlc: HLC;
+  supersedes: string[];
 }
 
 export class SyncApplicator {
@@ -70,7 +71,7 @@ export class SyncApplicator {
     // resolution to peers. The registry was already updated to the resolved
     // hash during apply, so the resumed modify listener suppresses the echo.
     for (const r of resolutions) {
-      await this.opLogger.recordResolvedUpdate(r.fileId, r.path, r.contentHash, r.hlc);
+      await this.opLogger.recordResolvedUpdate(r.fileId, r.path, r.contentHash, r.hlc, r.supersedes);
     }
   }
 
@@ -123,7 +124,9 @@ export class SyncApplicator {
         // resolution is the base future three-way merges align against.
         await this.registry.updateContentHash(action.localPath, hash, hlcTs);
         await this.registry.setAncestorHash(action.fileId, hash);
-        return { fileId: action.fileId, path: action.localPath, contentHash: hash, hlc: hlcTs };
+        // Tag the resolution with the two sides it settles so peers still
+        // holding either version adopt it instead of re-prompting.
+        return { fileId: action.fileId, path: action.localPath, contentHash: hash, hlc: hlcTs, supersedes: action.parentHashes };
       }
 
       case 'delete_conflict': {

@@ -291,7 +291,7 @@ export class OperationLogger {
    * caller supplies an HLC that dominates the remote content being superseded,
    * so the resolution wins last-writer-wins when peers pull it.
    */
-  async recordResolvedUpdate(fileId: string, path: string, contentHash: string, hlcTs: HLC): Promise<void> {
+  async recordResolvedUpdate(fileId: string, path: string, contentHash: string, hlcTs: HLC, supersedes: string[]): Promise<void> {
     await this.recordOp({
       id: this.opId(),
       deviceId: this.deviceId,
@@ -300,6 +300,9 @@ export class OperationLogger {
       type: 'update',
       path,
       contentHash,
+      // The conflicting sides this resolution settles — peers holding either
+      // adopt it instead of re-prompting (see FileEntry.supersedes).
+      supersedes,
     });
   }
 

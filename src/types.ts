@@ -15,6 +15,11 @@ export interface FileEntry {
   hlcTimestamp: HLC;                   // hybrid logical clock at last modification
   deleted: boolean;                    // tombstone flag
   ancestorContentHash: string | null;  // hash at last successful sync (for three-way merge)
+  // Content hashes this entry's content resolved/superseded. Set only on a
+  // user-resolved conflict: the two conflicting sides the human chose between.
+  // A peer that still holds one of these hashes adopts this content cleanly
+  // instead of re-prompting — the decision already weighed its version.
+  supersedes?: string[];
 }
 
 export type OperationType = 'create' | 'update' | 'delete' | 'move';
@@ -28,6 +33,11 @@ export interface Operation {
   path: string;            // file path at time of operation
   contentHash: string;     // hash of file content after operation
   previousPath?: string;   // for move/rename operations only
+  // Set only on a resolution op (a user-resolved conflict re-emitted by the
+  // applicator): the content hashes of the two conflicting sides this
+  // resolution supersedes. A peer still holding one of them adopts the
+  // resolution instead of re-conflicting. See FileEntry.supersedes.
+  supersedes?: string[];
 }
 
 export interface VaultState {
@@ -60,7 +70,7 @@ export type MergeAction =
   | { type: 'delete_local'; fileId: string; path: string }
   | { type: 'delete_remote'; fileId: string; path: string }
   | { type: 'move_local'; fileId: string; fromPath: string; toPath: string }
-  | { type: 'conflict'; fileId: string; localPath: string; remotePath: string; mergeResult: ThreeWayMergeResult; localContent: string; remoteContent: string }
+  | { type: 'conflict'; fileId: string; localPath: string; remotePath: string; mergeResult: ThreeWayMergeResult; localContent: string; remoteContent: string; parentHashes: string[] }
   | { type: 'delete_conflict'; fileId: string; path: string; side: 'local_deleted' | 'remote_deleted'; content: Uint8Array }
   | { type: 'no_op'; fileId: string };
 

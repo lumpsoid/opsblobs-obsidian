@@ -290,6 +290,9 @@ export function reconstructRemoteState(ops: Operation[], ownDeviceId?: string): 
       hlcTimestamp: op.hlcTimestamp,
       deleted: op.type === 'delete',
       ancestorContentHash: null,
+      // Carry a resolution op's superseded sides so a peer still holding one of
+      // them adopts the resolution rather than re-conflicting (state-merge).
+      supersedes: op.supersedes,
     });
   }
 
