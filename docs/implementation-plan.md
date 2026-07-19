@@ -341,36 +341,91 @@ Implement [`server-api-spec.md`](server-api-spec.md).
 
 **Exit:** a deployed server satisfies the v1 spec; the P3 client talks to it, not just the fake.
 
+**Status (2026-07-19): DONE — service built + integration-green; deployment is the one piece left.**
+- **Separate Go repo** — `../obsidian-sync-golang` (module `github.com/lumpsoid/obsidian-sync-server`).
+  Go 1.26, stdlib `net/http` (method+wildcard routing, no framework), **pure-Go SQLite**
+  (`modernc.org/sqlite`, no CGO → a single static binary) for the oplog / accounts / tokens /
+  blob-metadata, a filesystem blob store, and `x/crypto/bcrypt` for passwords.
+- **v1 endpoints implemented** to the spec §4–§5 wire contract (field-for-field against
+  `server-sync.ts`): `GET/POST /v1/vaults/{id}/ops`, `POST …/blobs:check`, `PUT/GET …/blobs/{hash}`,
+  plus `/healthz`. Append-only monotonic per-vault `seq`; idempotent append by `clientOpId`;
+  content-addressed, deduped blobs; `422` when an op references an un-uploaded blob.
+- **Open questions resolved (spec §9):**
+  - **§9.2 token/auth — account system.** A web UI (`/register`, `/login`, `/dashboard`) mints
+    Bearer tokens (only the SHA-256 is stored; plaintext shown once). A `vaultId` is claimed by the
+    first account that touches it; other accounts get `403`. An `/admin` panel lists all vaults,
+    gated by an out-of-band `promote` CLI (admin is never granted through the web).
+  - **§9.3 stale-writer — always accept.** `baseCursor` is advisory; append-only + client merge
+    makes it safe, so the server never `409`s.
+  - **§9.4 checkpoints — deferred to v2** (log-only; a fresh device replays the whole log).
+  - **§9.5 blob GC — retain-all in v1** (GC is checkpoint-driven; deleting a vault cascades its rows).
+  - **§9.6 limits — configurable via env** (max blob size, ops per `POST`, pull-limit cap). A
+    per-vault storage **quota** is not yet enforced (a deploy/ops knob — see P7).
+- **Architecture** — hexagonal: a `domain` layer of value objects + narrow ports, `usecase`
+  orchestration, and `store`/`web`/`httpapi` adapters assembled in `internal/app` (with a `seed`
+  subcommand for integration harnesses). `go build` / `vet` / `test` green (store contract tests,
+  web-UI flow, domain/usecase units).
+- **Integration — GREEN.** The plugin's client↔server contract suite (this repo, `7f65f0e`) drives
+  the *real* Go server through a full pull→merge→push round and passes.
+- **Not done (→ P7 / ops):** an actual **deployed** server (TLS reverse proxy, hosting, and backups
+  of the data dir — the encrypted blobs + DB are the only server-side copy). That "deployed" clause
+  of the Exit is the sole outstanding item.
+
 ---
 
 ## Phase 7 — Integration & release  🟡
 
-- **End-to-end test:** two clients + the real (or fake) server → concurrent edits, deletes, and
-  renames converge.
-- Real-device pass (desktop + iOS/Android) — verify the `requestUrl` path works on mobile.
-- Fill manifest `author`/`authorUrl`; version bump; community-plugin submission.
+**Status (2026-07-19): IN PROGRESS.** Single-client integration has landed (`7f65f0e` — the
+client↔server contract suite against the real Go server, green). What remains, grouped:
 
-**Exit:** shipped v1 with a passing integration test and a store submission.
+**Correctness — must-fix before shipping v1:**
+- **User-resolved conflicts don't replicate.** Known gap carried from P3: a hand-resolved text
+  conflict is a fresh decision the CRDT replay can't reproduce, yet it emits **no op** — so peer
+  devices never learn the resolution and can diverge. Make conflict resolution emit an op.
+  (Client-side; server-independent.)
+
+**Integration testing:**
+- **Two-client convergence** — extend the single-client suite to *two* clients + the server:
+  concurrent edits, deletes, and renames all converge. (The server repo's `seed` subcommand
+  scaffolds multi-actor setups.)
+- **Real-device pass** — desktop + iOS/Android; verify the `requestUrl` transport works on mobile
+  (the biggest still-untested surface).
+
+**Deploy — the outstanding half of P6's Exit:**
+- Stand up a **TLS-terminated** server (reverse proxy), set `SYNC_COOKIE_SECURE=true`, register the
+  account then flip `SYNC_ALLOW_REGISTRATION=false`, and `promote` the admin. Back up the data dir.
+- Harden if publicly reachable: CSRF tokens on the web forms (only `SameSite=Lax` today) and
+  login/token rate-limiting; decide a per-vault storage quota (§9.6 leftover).
+
+**Release:**
+- Fill manifest `author`/`authorUrl`; version bump; community-plugin submission.
+- Branch hygiene: fold `chore/p0-test-tooling` (now carrying P1–P6 + integration) into `master`.
+
+**Exit:** shipped v1 — conflict replication fixed, two-client + real-device convergence passing, a
+deployed TLS server, and a store submission.
 
 ---
 
 ## Decisions still needed (mapped to phases)
 
-| Open question (spec §9) | Blocks | Leaning |
+| Open question (spec §9) | Blocks | Resolution |
 |---|---|---|
 | ~~Hash blinding (HMAC vs raw SHA-256)~~ **DECIDED** | ~~P2~~ done | **HMAC-blinded** (shipped) |
-| Token / auth issuance | P6 (deploy) | — |
-| Stale-writer `409` policy | P6 | Always accept in v1 |
-| Checkpoints v1 vs v2 | P6/P7 | v2 |
-| Blob GC strategy | P6 | Checkpoint-driven |
-| Size / quota limits | P6 | — |
+| ~~Token / auth issuance~~ **DECIDED** | ~~P6~~ done | **Account system + dashboard-minted Bearer tokens** (shipped) |
+| ~~Stale-writer `409` policy~~ **DECIDED** | ~~P6~~ done | **Always accept** in v1 (shipped) |
+| ~~Checkpoints v1 vs v2~~ **DECIDED** | ~~P6~~ done | **v2** — v1 is log-only (shipped) |
+| ~~Blob GC strategy~~ **DECIDED** | ~~P6~~ done | **Retain-all** in v1; checkpoint-driven later |
+| Size / quota limits | P7 (deploy) | Per-request limits configurable; **per-vault quota TBD at deploy** |
 
-Hash blinding (the only client-gating question) is **resolved** (HMAC-blinded, P2); the rest gate
-the server/deploy and can be settled during P6, so client work P3–P5 is unblocked.
+Every spec-§9 question is now **resolved** except a per-vault storage **quota** — a deploy/ops knob
+rather than a protocol decision, to be set when the server is stood up (P7).
 
 ---
 
 ## Suggested sequencing
+
+**Now (2026-07-19): P0–P6 are DONE.** Only **P7** remains — fix conflict replication, prove
+two-client + real-device convergence, deploy the TLS server, and submit. Original order below.
 
 1. **P0** (foundations) — do immediately; unblocks confident change.
 2. **P1** and **P2** in parallel (independent client work).
