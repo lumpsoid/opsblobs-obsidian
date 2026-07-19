@@ -76,7 +76,7 @@ export type MergeAction =
   | { type: 'delete_remote'; fileId: string; path: string }
   | { type: 'move_local'; fileId: string; fromPath: string; toPath: string }
   | { type: 'conflict'; fileId: string; localPath: string; remotePath: string; mergeResult: ThreeWayMergeResult; localContent: string; remoteContent: string; parentHashes: string[] }
-  | { type: 'delete_conflict'; fileId: string; path: string; side: 'local_deleted' | 'remote_deleted'; content: Uint8Array }
+  | { type: 'delete_conflict'; fileId: string; path: string; side: 'local_deleted' | 'remote_deleted'; content: Uint8Array; parentHashes: string[] }
   | { type: 'no_op'; fileId: string };
 
 export interface StateMergeResult {

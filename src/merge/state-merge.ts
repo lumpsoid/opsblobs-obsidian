@@ -91,19 +91,33 @@ function classifyAndResolve(
   // so the deletion propagates without asking. If the surviving side changed
   // the file, it's a genuine delete/modify conflict.
   if (le.deleted && !re.deleted) {
+    // Remote holds a present file. If it is a *restore* resolution whose
+    // `supersedes` names our deleted side, a peer already settled this
+    // delete/modify conflict in favour of keeping the file — adopt it instead of
+    // re-prompting (mirrors the content-conflict shortcut in resolveContentConflict).
+    if (re.supersedes?.includes(le.contentHash)) {
+      const content = remote.contentStore.get(re.contentHash) ?? local.contentStore.get(re.contentHash);
+      if (content) return { type: 'write_local', fileId, path: re.path, content, hlc: re.hlcTimestamp };
+    }
     if (isUnchangedSinceAncestor(re)) {
       return { type: 'delete_remote', fileId, path: re.path };
     }
     const content = remote.contentStore.get(re.contentHash) ?? new Uint8Array();
-    return { type: 'delete_conflict', fileId, path: re.path, side: 'local_deleted', content };
+    return { type: 'delete_conflict', fileId, path: re.path, side: 'local_deleted', content, parentHashes: [le.contentHash, re.contentHash] };
   }
 
   if (!le.deleted && re.deleted) {
+    // Remote is a delete. If it is a *keep_deleted* resolution whose `supersedes`
+    // names our present content, a peer already settled this conflict in favour
+    // of the deletion — accept it cleanly instead of re-prompting.
+    if (re.supersedes?.includes(le.contentHash)) {
+      return { type: 'delete_local', fileId, path: le.path };
+    }
     if (isUnchangedSinceAncestor(le)) {
       return { type: 'delete_local', fileId, path: le.path };
     }
     const content = local.contentStore.get(le.contentHash) ?? new Uint8Array();
-    return { type: 'delete_conflict', fileId, path: le.path, side: 'remote_deleted', content };
+    return { type: 'delete_conflict', fileId, path: le.path, side: 'remote_deleted', content, parentHashes: [le.contentHash, re.contentHash] };
   }
 
   // ── Both modified (different content, neither deleted) ───────────────────
@@ -126,7 +140,10 @@ function resolveContentConflict(
   // re-surface the same conflict a peer already settled. Deterministic on both
   // devices: only the resolution carries `supersedes`, so exactly one branch fires.
   if (re.supersedes?.includes(le.contentHash)) {
-    const content = remote.contentStore.get(re.contentHash);
+    // Content is hash-addressed: prefer the remote store, but fall back to the
+    // local one — an unchanged-content resolution (e.g. a rename) is skipped by
+    // fetchRemoteBlobs precisely because we already hold those bytes.
+    const content = remote.contentStore.get(re.contentHash) ?? local.contentStore.get(re.contentHash);
     if (content) {
       return { type: 'write_local', fileId, path: re.path, content, hlc: re.hlcTimestamp };
     }

@@ -107,24 +107,36 @@ export class MemoryHost implements VaultSyncHost {
         if (e) this.fileEntries.set(a.fileId, { ...e, deleted: true });
         this.disk.delete(a.fileId);
       } else if (a.type === 'delete_conflict') {
-        // Mirror SyncApplicator: ask the resolver (default keep_deleted). On
-        // 'restore' the file survives at a.path with a.content; the id is
-        // preserved. Not re-emitted as an op — same as production today.
+        // Mirror SyncApplicator: ask the resolver (default keep_deleted), then
+        // re-emit the decision as an op tagged with the sides it settles so peers
+        // holding either adopt it instead of re-prompting. The HLC dominates both
+        // sides (production's monotonic clock guarantees this; derive it here).
         const decision = this.resolveDeleteConflict ? this.resolveDeleteConflict(a) : 'keep_deleted';
+        const hash = await sha256Hex(a.content);
+        const leTs = local.fileEntries.get(a.fileId)?.hlcTimestamp ?? local.hlc;
+        const reTs = remote.fileEntries.get(a.fileId)?.hlcTimestamp ?? remote.hlc;
+        const hlc = dominatingHlc(leTs, reTs, this.deviceId);
         const e = this.fileEntries.get(a.fileId);
         if (decision === 'restore') {
-          const hash = await sha256Hex(a.content);
           this.content.set(hash, a.content);
           this.disk.set(a.fileId, a.content);
           this.fileEntries.set(a.fileId, {
-            id: a.fileId, path: a.path, contentHash: hash,
-            hlcTimestamp: e?.hlcTimestamp ?? { wallTime: 0, counter: 0, deviceId: this.deviceId },
-            deleted: false, ancestorContentHash: e?.ancestorContentHash ?? null,
-            ancestorPath: e?.ancestorPath ?? null,
+            id: a.fileId, path: a.path, contentHash: hash, hlcTimestamp: hlc,
+            deleted: false, ancestorContentHash: hash, ancestorPath: a.path,
+          });
+          this.pendingOps.push({
+            id: `${this.deviceId}-restore-${a.fileId}-${hash.slice(0, 12)}`,
+            deviceId: this.deviceId, hlcTimestamp: hlc, fileId: a.fileId,
+            type: 'update', path: a.path, contentHash: hash, supersedes: a.parentHashes,
           });
         } else {
-          if (e) this.fileEntries.set(a.fileId, { ...e, deleted: true });
+          if (e) this.fileEntries.set(a.fileId, { ...e, deleted: true, hlcTimestamp: hlc });
           this.disk.delete(a.fileId);
+          this.pendingOps.push({
+            id: `${this.deviceId}-keepdel-${a.fileId}-${hash.slice(0, 12)}`,
+            deviceId: this.deviceId, hlcTimestamp: hlc, fileId: a.fileId,
+            type: 'delete', path: a.path, contentHash: hash, supersedes: a.parentHashes,
+          });
         }
       } else if (a.type === 'move_local') {
         // Mirror SyncApplicator.moveLocalFile: the file id is unchanged, only its

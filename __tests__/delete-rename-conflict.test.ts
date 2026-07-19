@@ -72,29 +72,58 @@ describe('concurrent delete vs rename', () => {
     // the file is only removed because the user/strategy said so, not silently.
   });
 
-  test('keep the renamed file: both devices converge to `my-1`', async () => {
+  test('restore replicates: B keeps my-1, A adopts it WITHOUT re-prompting', async () => {
     const { A, B, client } = await setup();
-    // Same strategy on both devices (realistic: one user, one setting).
-    A.resolveDeleteConflict = () => 'restore';
+    // Only B (the device that surfaces the conflict) resolves. A has no resolver
+    // — it must adopt B's decision, not raise its own prompt.
     B.resolveDeleteConflict = () => 'restore';
 
-    await client(B, 'dev-b').runSync();   // B keeps my-1
-    await client(A, 'dev-a').runSync();   // A pulls B's rename, restores my-1
+    await client(B, 'dev-b').runSync();   // B hits the conflict, keeps my-1
+    expect(B.applied.some(a => a.type === 'delete_conflict')).toBe(true);
+    await client(B, 'dev-b').runSync();   // pushes the restore resolution op
 
-    expect(isDeleted(B)).toBe(false);
+    const before = A.applied.length;
+    await client(A, 'dev-a').runSync();   // A pulls B's rename + resolution
+    const aNew = A.applied.slice(before).map(a => a.type);
+
+    expect(aNew).not.toContain('delete_conflict'); // ← A is NOT re-prompted
+    expect(aNew).toContain('write_local');         // A adopts the restored file
     expect(isDeleted(A)).toBe(false);
-    expect(pathOf(B)).toBe('my-1');
+    expect(isDeleted(B)).toBe(false);
     expect(pathOf(A)).toBe('my-1');
+    expect(pathOf(B)).toBe('my-1');
   });
 
-  test('accept the deletion: both devices converge to removed', async () => {
-    const { A, B, client } = await setup();
-    A.resolveDeleteConflict = () => 'keep_deleted';
-    B.resolveDeleteConflict = () => 'keep_deleted';
+  test('keep_deleted replicates: resolver accepts deletion, peer adopts WITHOUT re-prompting', async () => {
+    // Rename-first ordering so the *deleter* (A) surfaces the conflict and the
+    // *survivor* (B) later adopts the keep-deleted decision via `supersedes`.
+    const api: ServerApi = new FakeSyncServer();
+    const client = (h: MemoryHost, d: string) =>
+      new ServerSyncClient({ api, crypto: vc, host: h, hlc: new HybridLogicalClock(d) });
+    const A = new MemoryHost('dev-a');
+    const B = new MemoryHost('dev-b');
+    A.resolveDeleteConflict = () => 'keep_deleted';   // only A resolves
 
-    await client(B, 'dev-b').runSync();
+    const { hash } = await seedFile(A, 'dev-a', 'f1', 'my', 'content\n', 1000);
     await client(A, 'dev-a').runSync();
+    A.fileEntries.get('f1')!.ancestorContentHash = hash;
+    A.fileEntries.get('f1')!.ancestorPath = 'my';
+    await client(B, 'dev-b').runSync();
 
+    renameFile(B, 'dev-b', 'f1', 'my', 'my-1', 2000);
+    await client(B, 'dev-b').runSync();               // B pushes its rename (no conflict yet)
+
+    deleteFile(A, 'dev-a', 'f1', 'my', 2500);
+    await client(A, 'dev-a').runSync();               // A pulls the rename → conflict → keep_deleted
+    expect(A.applied.some(a => a.type === 'delete_conflict')).toBe(true);
+    await client(A, 'dev-a').runSync();               // A pushes the keep-deleted resolution
+
+    const before = B.applied.length;
+    await client(B, 'dev-b').runSync();               // B (survivor) pulls A's resolution
+    const bNew = B.applied.slice(before).map(a => a.type);
+
+    expect(bNew).not.toContain('delete_conflict');   // ← B is NOT re-prompted
+    expect(bNew).toContain('delete_local');          // B accepts the deletion
     expect(isDeleted(B)).toBe(true);
     expect(isDeleted(A)).toBe(true);
   });

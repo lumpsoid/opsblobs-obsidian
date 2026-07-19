@@ -13,8 +13,13 @@ import { HybridLogicalClock } from '../core/hlc';
 export type ConflictHandler = (action: Extract<MergeAction, { type: 'conflict' }>) => Promise<Uint8Array | null>;
 export type DeleteConflictHandler = (action: Extract<MergeAction, { type: 'delete_conflict' }>) => Promise<'keep_deleted' | 'restore'>;
 
-/** A user-resolved conflict that must be re-emitted as an op so it replicates. */
+/** A user-resolved conflict that must be re-emitted as an op so it replicates.
+ *  `kind` is the op it becomes: an `update` (content conflict, or a delete
+ *  conflict resolved by restoring the file) or a `delete` (delete conflict
+ *  resolved by accepting the deletion). `supersedes` names the sides it settles
+ *  so peers holding either adopt the decision instead of re-prompting. */
 interface PendingResolution {
+  kind: 'update' | 'delete';
   fileId: string;
   path: string;
   contentHash: string;
@@ -71,7 +76,11 @@ export class SyncApplicator {
     // resolution to peers. The registry was already updated to the resolved
     // hash during apply, so the resumed modify listener suppresses the echo.
     for (const r of resolutions) {
-      await this.opLogger.recordResolvedUpdate(r.fileId, r.path, r.contentHash, r.hlc, r.supersedes);
+      if (r.kind === 'delete') {
+        await this.opLogger.recordResolvedDelete(r.fileId, r.path, r.contentHash, r.hlc, r.supersedes);
+      } else {
+        await this.opLogger.recordResolvedUpdate(r.fileId, r.path, r.contentHash, r.hlc, r.supersedes);
+      }
     }
   }
 
@@ -126,17 +135,30 @@ export class SyncApplicator {
         await this.registry.setAncestorHash(action.fileId, hash);
         // Tag the resolution with the two sides it settles so peers still
         // holding either version adopt it instead of re-prompting.
-        return { fileId: action.fileId, path: action.localPath, contentHash: hash, hlc: hlcTs, supersedes: action.parentHashes };
+        return { kind: 'update', fileId: action.fileId, path: action.localPath, contentHash: hash, hlc: hlcTs, supersedes: action.parentHashes };
       }
 
       case 'delete_conflict': {
         const decision = await this.onDeleteConflict(action);
+        // Timestamp the decision *now* so it dominates the delete/edit it
+        // supersedes (runSync already advanced the clock past the merged HLC),
+        // and tag it with both sides so a peer still holding either adopts the
+        // decision instead of independently re-prompting.
+        const hlcTs = this.hlc.now();
+        const hash = await hashContent(action.content);
         if (decision === 'restore') {
+          // Keep the file. Re-assert its presence (undeleting our own copy if we
+          // were the deleting side) and make the restored content the new ancestor.
           await this.writeLocalFile(action.path, action.content);
-          await this.contentStore.put(await hashContent(action.content), action.content);
+          await this.contentStore.put(hash, action.content);
+          await this.registry.adoptRemote(action.fileId, action.path, hash, hlcTs);
+          return { kind: 'update', fileId: action.fileId, path: action.path, contentHash: hash, hlc: hlcTs, supersedes: action.parentHashes };
         }
-        // 'keep_deleted' — do nothing
-        return null;
+        // 'keep_deleted' — accept the deletion: remove our copy (if present) and
+        // tombstone, then replicate the delete so the modified side converges.
+        await this.deleteLocalFile(action.path);
+        await this.registry.markDeleted(action.path, hlcTs);
+        return { kind: 'delete', fileId: action.fileId, path: action.path, contentHash: hash, hlc: hlcTs, supersedes: action.parentHashes };
       }
 
       case 'send_remote':

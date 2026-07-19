@@ -306,6 +306,27 @@ export class OperationLogger {
     });
   }
 
+  /**
+   * Record a `delete` op for a delete/modify conflict the user resolved by
+   * *accepting the deletion*. Like {@link recordResolvedUpdate}, this is produced
+   * while listeners are paused and after the pending log is cleared, so it must
+   * be re-emitted explicitly. `supersedes` names the two conflicting sides so a
+   * peer still holding the modified version adopts the deletion instead of
+   * re-prompting. `contentHash` is the superseded (now-deleted) content.
+   */
+  async recordResolvedDelete(fileId: string, path: string, contentHash: string, hlcTs: HLC, supersedes: string[]): Promise<void> {
+    await this.recordOp({
+      id: this.opId(),
+      deviceId: this.deviceId,
+      hlcTimestamp: hlcTs,
+      fileId,
+      type: 'delete',
+      path,
+      contentHash,
+      supersedes,
+    });
+  }
+
   private async recordOp(op: Operation): Promise<void> {
     this.pendingOps.push(op);
     await this.saveOpLog();
