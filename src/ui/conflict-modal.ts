@@ -5,6 +5,7 @@
 
 import { App, Modal, ButtonComponent } from 'obsidian';
 import { ThreeWayMergeResult, ConflictChunk } from '../types';
+import { resolveConflictChunkLines } from '../merge/diff3';
 
 export class ConflictResolutionModal extends Modal {
   private result: Uint8Array | null = null;
@@ -157,20 +158,10 @@ export class ConflictResolutionModal extends Modal {
 
     for (const { c, i } of sortedConflicts) {
       const resolved = this.resolvedChunks.get(i);
-      const replacementLines = this.getResolutionLines(resolved ?? c);
+      const replacementLines = resolveConflictChunkLines(resolved ?? c);
       lines.splice(c.startLine, c.local.length, ...replacementLines);
     }
     return lines.join('\n');
-  }
-
-  private getResolutionLines(chunk: ConflictChunk): string[] {
-    switch (chunk.resolution) {
-      case 'local': return chunk.local;
-      case 'remote': return chunk.remote;
-      case 'both': return [...chunk.local, ...chunk.remote];
-      case 'custom': return chunk.customText ?? chunk.local;
-      default: return chunk.local;
-    }
   }
 
   private resolutionLabel(resolution?: ConflictChunk['resolution']): string {

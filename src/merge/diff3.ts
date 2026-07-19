@@ -388,21 +388,12 @@ function normalizeLines(text: string): string[] {
 
 // ─── Helpers exported for use in merge engine ─────────────────────────────────
 
-export function applyConflictResolutions(
-  mergeResult: ThreeWayMergeResult,
-  resolutions: Map<number, ConflictChunk>,
-): string {
-  const lines = [...mergeResult.merged];
-  // Apply resolutions in reverse order to preserve line indices
-  const sorted = Array.from(resolutions.entries()).sort((a, b) => b[0] - a[0]);
-  for (const [, chunk] of sorted) {
-    const resolved = getResolutionLines(chunk);
-    lines.splice(chunk.startLine, chunk.local.length, ...resolved);
-  }
-  return lines.join('\n');
-}
-
-function getResolutionLines(chunk: ConflictChunk): string[] {
+/**
+ * Given a resolved `ConflictChunk`, produce the replacement lines its
+ * `resolution` selects. The single home for this rule; the conflict modal
+ * imports it to build the resolved file content.
+ */
+export function resolveConflictChunkLines(chunk: ConflictChunk): string[] {
   switch (chunk.resolution) {
     case 'local': return chunk.local;
     case 'remote': return chunk.remote;
