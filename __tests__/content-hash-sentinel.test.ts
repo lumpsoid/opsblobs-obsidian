@@ -47,4 +47,21 @@ describe("contentHash '' sentinel never escapes into an op (audit G)", () => {
     expect(op).toBeDefined();
     expect(op!.contentHash).not.toBe('');
   });
+
+  // A *genuinely empty* file is NOT the sentinel: it has a real content address
+  // (SHA-256 of zero bytes), so the '' guards never misfire on it — it is
+  // captured and synced as ordinary content.
+  test('an empty file gets the real zero-byte SHA-256, not the "" sentinel', async () => {
+    const EMPTY_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+    const d = await TestDevice.create('dev-a');
+
+    const id = await d.seedFile('empty.md', '', 1000);
+
+    expect(d.entry(id)!.contentHash).toBe(EMPTY_SHA256);              // real hash, not ''
+    const op = d.pendingOps.find(o => o.path === 'empty.md');
+    expect(op).toBeDefined();
+    expect(op!.type).toBe('create');                                 // captured as normal content…
+    expect(op!.contentHash).toBe(EMPTY_SHA256);                      // …carrying the real hash
+    expect(d.pendingOps.some(o => o.contentHash === '')).toBe(false); // never the sentinel
+  });
 });
