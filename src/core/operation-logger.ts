@@ -111,6 +111,10 @@ export class OperationLogger {
       if (this.isExcluded(entry.path) || onDisk.has(entry.path)) continue;
       const hlcTs = this.hlc.now();
       await this.registry.markDeleted(entry.path, hlcTs);
+      // A never-captured placeholder ('' hash) was never synced to any peer, so
+      // its deletion is a local-only tombstone — emitting a delete op would leak
+      // the '' sentinel and reference content no peer holds (audit G).
+      if (entry.contentHash === '') continue;
       this.pendingOps.push(Ops.delete(entry.id, entry.path, entry.contentHash, hlcTs));
       changed = true;
     }
@@ -230,6 +234,10 @@ export class OperationLogger {
     const hlcTs = this.hlc.now();
     await this.registry.markDeleted(path, hlcTs);
 
+    // A never-captured placeholder ('' hash) was never synced — its delete is a
+    // local-only tombstone; emitting an op would leak the '' sentinel (audit G).
+    if (entry.contentHash === '') return;
+
     // If there's a pending create for this file, cancel them out
     this.pruneCreateDeletePair(entry.id);
 
@@ -247,6 +255,14 @@ export class OperationLogger {
 
     const hlcTs = this.hlc.now();
     await this.registry.updatePath(oldPath, path, hlcTs);
+
+    // A never-captured placeholder ('' hash) has no synced content, so a move op
+    // would carry the '' sentinel and propagate a phantom. Capture the file's
+    // real content at its new path instead (emits a proper content op) (audit G).
+    if (entry.contentHash === '') {
+      await this.flushModify(path);
+      return;
+    }
 
     await this.recordOp(Ops.move(entry.id, path, entry.contentHash, hlcTs));
   }
