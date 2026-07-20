@@ -1,7 +1,7 @@
 # Operation Format Audit — Findings & Hardening Backlog
 
-Status: **findings A–E remediated** (2026-07-20; see per-finding markers and
-§Suggested sequencing). F–H remain open (F/G actionable; H deferred to v2). Performed 2026-07-20 against `HEAD` of
+Status: **findings A–E, G remediated** (2026-07-20; see per-finding markers and
+§Suggested sequencing). F remains open (a decision); H is deferred to v2. Performed 2026-07-20 against `HEAD` of
 `master` (after the F1–F7 data-safety remediation landed). Scope: the
 **`Operation` interface /
 op format** — the core wire+at-rest data structure that represents every sync
@@ -171,7 +171,7 @@ integrity). Right now it's an unstated gap.
 
 ---
 
-### G — `contentHash` overloads the empty string as a sentinel `[Low]`
+### G — `contentHash` overloads the empty string as a sentinel `[Low]` · ✅ DONE (bc17a87)
 
 **Location:** `operation-logger.ts:102` (`entry.contentHash === '' ? 'create'`),
 `operation-logger.ts:119` (delete copies `entry.contentHash`).
@@ -226,8 +226,10 @@ The four format-level fixes that harden the interface before it locks in are
 5. ✅ **E** — concurrent binary edits surface a `binary_conflict` (modal, filename
    presentation) instead of silent LWW; one-sided edits still adopt cleanly (`2ed7a9d`).
 
+6. ✅ **G** — the `''` contentHash sentinel can no longer escape into a delete/move
+   op (never-synced placeholder → local-only tombstone / real-content capture) (`bc17a87`).
+
 Remaining, as separate passes:
 
-6. **F** — decide + document log-completeness stance (spec).
-7. **G** — remove the `''` sentinel from the op path.
+7. **F** — decide + document log-completeness stance (spec).
 8. **H** — deferred to v2 checkpoints.
