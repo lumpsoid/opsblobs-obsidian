@@ -8,8 +8,9 @@
 //  logical edit. Reads file bytes through a VaultFiles port and persists the
 //  oplog through a MetadataStore port — obsidian-free.
 
-import { HLC, Operation, OP_FORMAT_VERSION, SyncSettings } from '../types';
-import { HybridLogicalClock, hlcToString } from './hlc';
+import { HLC, Operation, SyncSettings } from '../types';
+import { HybridLogicalClock } from './hlc';
+import { Ops } from './operations';
 import { FileRegistry } from './file-registry';
 import { ContentStore, hashContent } from './content-store';
 import { isExcluded } from './exclusion-policy';
@@ -89,19 +90,18 @@ export class OperationLogger {
 
       if (!entry) {
         const id = await this.registry.registerFile({ path }, hlcTs, hash);
-        this.pendingOps.push(this.buildOp({
-          hlcTimestamp: hlcTs, fileId: id, type: 'create', path, contentHash: hash,
-        }));
+        this.pendingOps.push(Ops.create(id, path, hash, hlcTs));
       } else {
         // A drifted hash means either a placeholder from an older op-less
         // reconcile ('') or an edit made while the plugin was off. Either way
         // the op carries the current content, so peers converge; `create` when
         // it was never really captured, `update` otherwise.
-        const type = entry.contentHash === '' ? 'create' : 'update';
         await this.registry.updateContentHash(path, hash, hlcTs);
-        this.pendingOps.push(this.buildOp({
-          hlcTimestamp: hlcTs, fileId: entry.id, type, path, contentHash: hash,
-        }));
+        this.pendingOps.push(
+          entry.contentHash === ''
+            ? Ops.create(entry.id, path, hash, hlcTs)
+            : Ops.update(entry.id, path, hash, hlcTs),
+        );
       }
       changed = true;
     }
@@ -111,9 +111,7 @@ export class OperationLogger {
       if (this.isExcluded(entry.path) || onDisk.has(entry.path)) continue;
       const hlcTs = this.hlc.now();
       await this.registry.markDeleted(entry.path, hlcTs);
-      this.pendingOps.push(this.buildOp({
-        hlcTimestamp: hlcTs, fileId: entry.id, type: 'delete', path: entry.path, contentHash: entry.contentHash,
-      }));
+      this.pendingOps.push(Ops.delete(entry.id, entry.path, entry.contentHash, hlcTs));
       changed = true;
     }
 
@@ -184,13 +182,7 @@ export class OperationLogger {
     const id = await this.registry.registerFile({ path }, hlcTs, hash);
     await this.contentStore.put(hash, content);
 
-    await this.recordOp(this.buildOp({
-      hlcTimestamp: hlcTs,
-      fileId: id,
-      type: 'create',
-      path,
-      contentHash: hash,
-    }));
+    await this.recordOp(Ops.create(id, path, hash, hlcTs));
   }
 
   private handleModify(path: string): void {
@@ -227,13 +219,7 @@ export class OperationLogger {
     await this.contentStore.put(hash, content);
     await this.registry.updateContentHash(path, hash, hlcTs);
 
-    await this.recordOp(this.buildOp({
-      hlcTimestamp: hlcTs,
-      fileId: entry.id,
-      type: 'update',
-      path,
-      contentHash: hash,
-    }));
+    await this.recordOp(Ops.update(entry.id, path, hash, hlcTs));
   }
 
   private async handleDelete(path: string): Promise<void> {
@@ -247,13 +233,7 @@ export class OperationLogger {
     // If there's a pending create for this file, cancel them out
     this.pruneCreateDeletePair(entry.id);
 
-    await this.recordOp(this.buildOp({
-      hlcTimestamp: hlcTs,
-      fileId: entry.id,
-      type: 'delete',
-      path,
-      contentHash: entry.contentHash,
-    }));
+    await this.recordOp(Ops.delete(entry.id, path, entry.contentHash, hlcTs));
   }
 
   private async handleRename(path: string, oldPath: string): Promise<void> {
@@ -268,13 +248,7 @@ export class OperationLogger {
     const hlcTs = this.hlc.now();
     await this.registry.updatePath(oldPath, path, hlcTs);
 
-    await this.recordOp(this.buildOp({
-      hlcTimestamp: hlcTs,
-      fileId: entry.id,
-      type: 'move',
-      path,
-      contentHash: entry.contentHash,
-    }));
+    await this.recordOp(Ops.move(entry.id, path, entry.contentHash, hlcTs));
   }
 
   // ─── Op management ────────────────────────────────────────────────────────
@@ -301,16 +275,7 @@ export class OperationLogger {
    * so the resolution wins last-writer-wins when peers pull it.
    */
   async recordResolvedUpdate(fileId: string, path: string, contentHash: string, hlcTs: HLC, supersedes: string[]): Promise<void> {
-    await this.recordOp(this.buildOp({
-      hlcTimestamp: hlcTs,
-      fileId,
-      type: 'update',
-      path,
-      contentHash,
-      // The conflicting sides this resolution settles — peers holding either
-      // adopt it instead of re-prompting (see FileEntry.supersedes).
-      supersedes,
-    }));
+    await this.recordOp(Ops.resolveUpdate(fileId, path, contentHash, hlcTs, supersedes));
   }
 
   /**
@@ -322,14 +287,7 @@ export class OperationLogger {
    * re-prompting. `contentHash` is the superseded (now-deleted) content.
    */
   async recordResolvedDelete(fileId: string, path: string, contentHash: string, hlcTs: HLC, supersedes: string[]): Promise<void> {
-    await this.recordOp(this.buildOp({
-      hlcTimestamp: hlcTs,
-      fileId,
-      type: 'delete',
-      path,
-      contentHash,
-      supersedes,
-    }));
+    await this.recordOp(Ops.resolveDelete(fileId, path, contentHash, hlcTs, supersedes));
   }
 
   private async recordOp(op: Operation): Promise<void> {
@@ -363,20 +321,6 @@ export class OperationLogger {
   }
 
   // ─── Helpers ─────────────────────────────────────────────────────────────
-
-  /**
-   * Construct an Operation, stamping the fields every op shares — the format
-   * version, a unique id, and the authoring device — in one place so an
-   * individual call site can neither forget them nor let them drift. Per-op
-   * fields are supplied by the caller.
-   */
-  private buildOp(fields: Omit<Operation, 'v' | 'id'>): Operation {
-    // The HLC is already unique per op per device — its counter increments on
-    // every now() — and totally ordered, so it is a collision-free, deterministic
-    // op id. Deriving the id from it avoids a second uniqueness mechanism
-    // (Date.now()+Math.random()) whose collision-freedom was only probabilistic.
-    return { v: OP_FORMAT_VERSION, id: hlcToString(fields.hlcTimestamp), ...fields };
-  }
 
   private isExcluded(path: string): boolean {
     return isExcluded(path, this.getSettings());
