@@ -9,7 +9,7 @@
 //  oplog through a MetadataStore port — obsidian-free.
 
 import { HLC, Operation, OP_FORMAT_VERSION, SyncSettings } from '../types';
-import { HybridLogicalClock } from './hlc';
+import { HybridLogicalClock, hlcToString } from './hlc';
 import { FileRegistry } from './file-registry';
 import { ContentStore, hashContent } from './content-store';
 import { isExcluded } from './exclusion-policy';
@@ -34,7 +34,6 @@ export class OperationLogger {
     private files: VaultFiles,
     private watcher: VaultWatcher,
     private metadata: MetadataStore,
-    private deviceId: string,
     private hlc: HybridLogicalClock,
     private registry: FileRegistry,
     private contentStore: ContentStore,
@@ -373,14 +372,14 @@ export class OperationLogger {
    * fields are supplied by the caller.
    */
   private buildOp(fields: Omit<Operation, 'v' | 'id'>): Operation {
-    return { v: OP_FORMAT_VERSION, id: this.opId(), ...fields };
+    // The HLC is already unique per op per device — its counter increments on
+    // every now() — and totally ordered, so it is a collision-free, deterministic
+    // op id. Deriving the id from it avoids a second uniqueness mechanism
+    // (Date.now()+Math.random()) whose collision-freedom was only probabilistic.
+    return { v: OP_FORMAT_VERSION, id: hlcToString(fields.hlcTimestamp), ...fields };
   }
 
   private isExcluded(path: string): boolean {
     return isExcluded(path, this.getSettings());
-  }
-
-  private opId(): string {
-    return `${this.deviceId}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   }
 }

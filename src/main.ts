@@ -74,7 +74,6 @@ export default class VaultSyncPlugin extends Plugin {
       vaultFiles,
       watcher,
       metadata,
-      this.settings.deviceId,
       this.hlc,
       this.registry,
       this.contentStore,

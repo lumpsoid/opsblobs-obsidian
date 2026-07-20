@@ -77,7 +77,6 @@ export class TestDevice {
       this.files,
       this.watcher,
       this.metadata,
-      deviceId,
       this.hlc,
       this.registry,
       this.contentStore,
