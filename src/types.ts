@@ -37,8 +37,7 @@ export const OP_FORMAT_VERSION = 1;
 export interface Operation {
   v: number;               // op-format version (OP_FORMAT_VERSION); absent on legacy ops ⇒ 1
   id: string;              // unique operation ID
-  deviceId: string;        // which device generated this
-  hlcTimestamp: HLC;       // when it happened (HLC)
+  hlcTimestamp: HLC;       // when it happened (HLC); its deviceId is the authoring device
   fileId: string;          // UUID of the file
   type: OperationType;
   path: string;            // file path at time of operation

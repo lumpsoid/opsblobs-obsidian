@@ -372,8 +372,8 @@ export class OperationLogger {
    * individual call site can neither forget them nor let them drift. Per-op
    * fields are supplied by the caller.
    */
-  private buildOp(fields: Omit<Operation, 'v' | 'id' | 'deviceId'>): Operation {
-    return { v: OP_FORMAT_VERSION, id: this.opId(), deviceId: this.deviceId, ...fields };
+  private buildOp(fields: Omit<Operation, 'v' | 'id'>): Operation {
+    return { v: OP_FORMAT_VERSION, id: this.opId(), ...fields };
   }
 
   private isExcluded(path: string): boolean {

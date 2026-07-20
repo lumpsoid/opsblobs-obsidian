@@ -383,7 +383,8 @@ export function reconstructRemoteState(ops: Operation[], ownDeviceId?: string): 
   let maxHlc: HLC | null = null;
 
   for (const op of ops) {
-    if (ownDeviceId !== undefined && op.deviceId === ownDeviceId) continue;
+    // Authorship lives in the HLC; the op no longer duplicates it top-level.
+    if (ownDeviceId !== undefined && op.hlcTimestamp.deviceId === ownDeviceId) continue;
 
     if (!maxHlc || hlcCompare(op.hlcTimestamp, maxHlc) > 0) maxHlc = op.hlcTimestamp;
 
