@@ -273,7 +273,6 @@ export class OperationLogger {
       fileId: entry.id,
       type: 'move',
       path,
-      previousPath: oldPath,
       contentHash: entry.contentHash,
     }));
   }

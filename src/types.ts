@@ -42,7 +42,6 @@ export interface Operation {
   type: OperationType;
   path: string;            // file path at time of operation
   contentHash: string;     // hash of file content after operation
-  previousPath?: string;   // for move/rename operations only
   // Set only on a resolution op (a user-resolved conflict re-emitted by the
   // applicator): the content hashes of the two conflicting sides this
   // resolution supersedes. A peer still holding one of them adopts the
