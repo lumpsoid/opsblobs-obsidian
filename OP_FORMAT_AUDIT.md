@@ -1,7 +1,7 @@
 # Operation Format Audit — Findings & Hardening Backlog
 
-Status: **findings A–D remediated** (2026-07-20; see per-finding markers and
-§Suggested sequencing). E–H remain open. Performed 2026-07-20 against `HEAD` of
+Status: **findings A–E remediated** (2026-07-20; see per-finding markers and
+§Suggested sequencing). F–H remain open (F/G actionable; H deferred to v2). Performed 2026-07-20 against `HEAD` of
 `master` (after the F1–F7 data-safety remediation landed). Scope: the
 **`Operation` interface /
 op format** — the core wire+at-rest data structure that represents every sync
@@ -135,7 +135,7 @@ dead weight.
 
 ---
 
-### E — Concurrent **binary** edits silently drop a side `[Medium, data-safety]`
+### E — Concurrent **binary** edits silently drop a side `[Medium, data-safety]` · ✅ DONE (2ed7a9d)
 
 **Location:** `src/merge/state-merge.ts:230-237` (binary sniff → LWW).
 
@@ -223,9 +223,11 @@ The four format-level fixes that harden the interface before it locks in are
 3. ✅ **C** — derive `id` from the HLC; removed `opId()` and the dead `deviceId` ctor param (`454af00`).
 4. ✅ **D** — delete the write-only `previousPath` (`ea17cc6`).
 
+5. ✅ **E** — concurrent binary edits surface a `binary_conflict` (modal, filename
+   presentation) instead of silent LWW; one-sided edits still adopt cleanly (`2ed7a9d`).
+
 Remaining, as separate passes:
 
-5. **E** — binary-divergence conflict (merge-layer, data-safety).
 6. **F** — decide + document log-completeness stance (spec).
 7. **G** — remove the `''` sentinel from the op path.
 8. **H** — deferred to v2 checkpoints.
