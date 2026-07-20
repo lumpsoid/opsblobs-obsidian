@@ -72,7 +72,7 @@ async function device(deviceId: string): Promise<TestDevice> {
 
 describe('reconstructRemoteState', () => {
   const base = (fileId: string, type: Operation['type'], hash: string, wall: number, counter = 0): Operation => ({
-    id: `op-${wall}-${counter}`, deviceId: 'dev-x', hlcTimestamp: { wallTime: wall, counter, deviceId: 'dev-x' },
+    v: 1, id: `op-${wall}-${counter}`, deviceId: 'dev-x', hlcTimestamp: { wallTime: wall, counter, deviceId: 'dev-x' },
     fileId, type, path: `${fileId}.md`, contentHash: hash,
   });
 

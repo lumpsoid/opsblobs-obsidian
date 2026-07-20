@@ -29,7 +29,13 @@ export interface FileEntry {
 
 export type OperationType = 'create' | 'update' | 'delete' | 'move';
 
+/** Current op-format version. Bump when the at-rest / on-wire shape of an
+ *  {@link Operation} changes in a non-additive way, so a reader can dispatch on
+ *  `op.v`. Ops written before versioning existed carry no `v` and are format 1. */
+export const OP_FORMAT_VERSION = 1;
+
 export interface Operation {
+  v: number;               // op-format version (OP_FORMAT_VERSION); absent on legacy ops ⇒ 1
   id: string;              // unique operation ID
   deviceId: string;        // which device generated this
   hlcTimestamp: HLC;       // when it happened (HLC)

@@ -8,7 +8,7 @@
 //  logical edit. Reads file bytes through a VaultFiles port and persists the
 //  oplog through a MetadataStore port — obsidian-free.
 
-import { HLC, Operation, SyncSettings } from '../types';
+import { HLC, Operation, OP_FORMAT_VERSION, SyncSettings } from '../types';
 import { HybridLogicalClock } from './hlc';
 import { FileRegistry } from './file-registry';
 import { ContentStore, hashContent } from './content-store';
@@ -90,10 +90,9 @@ export class OperationLogger {
 
       if (!entry) {
         const id = await this.registry.registerFile({ path }, hlcTs, hash);
-        this.pendingOps.push({
-          id: this.opId(), deviceId: this.deviceId, hlcTimestamp: hlcTs,
-          fileId: id, type: 'create', path, contentHash: hash,
-        });
+        this.pendingOps.push(this.buildOp({
+          hlcTimestamp: hlcTs, fileId: id, type: 'create', path, contentHash: hash,
+        }));
       } else {
         // A drifted hash means either a placeholder from an older op-less
         // reconcile ('') or an edit made while the plugin was off. Either way
@@ -101,10 +100,9 @@ export class OperationLogger {
         // it was never really captured, `update` otherwise.
         const type = entry.contentHash === '' ? 'create' : 'update';
         await this.registry.updateContentHash(path, hash, hlcTs);
-        this.pendingOps.push({
-          id: this.opId(), deviceId: this.deviceId, hlcTimestamp: hlcTs,
-          fileId: entry.id, type, path, contentHash: hash,
-        });
+        this.pendingOps.push(this.buildOp({
+          hlcTimestamp: hlcTs, fileId: entry.id, type, path, contentHash: hash,
+        }));
       }
       changed = true;
     }
@@ -114,10 +112,9 @@ export class OperationLogger {
       if (this.isExcluded(entry.path) || onDisk.has(entry.path)) continue;
       const hlcTs = this.hlc.now();
       await this.registry.markDeleted(entry.path, hlcTs);
-      this.pendingOps.push({
-        id: this.opId(), deviceId: this.deviceId, hlcTimestamp: hlcTs,
-        fileId: entry.id, type: 'delete', path: entry.path, contentHash: entry.contentHash,
-      });
+      this.pendingOps.push(this.buildOp({
+        hlcTimestamp: hlcTs, fileId: entry.id, type: 'delete', path: entry.path, contentHash: entry.contentHash,
+      }));
       changed = true;
     }
 
@@ -188,15 +185,13 @@ export class OperationLogger {
     const id = await this.registry.registerFile({ path }, hlcTs, hash);
     await this.contentStore.put(hash, content);
 
-    await this.recordOp({
-      id: this.opId(),
-      deviceId: this.deviceId,
+    await this.recordOp(this.buildOp({
       hlcTimestamp: hlcTs,
       fileId: id,
       type: 'create',
       path,
       contentHash: hash,
-    });
+    }));
   }
 
   private handleModify(path: string): void {
@@ -233,15 +228,13 @@ export class OperationLogger {
     await this.contentStore.put(hash, content);
     await this.registry.updateContentHash(path, hash, hlcTs);
 
-    await this.recordOp({
-      id: this.opId(),
-      deviceId: this.deviceId,
+    await this.recordOp(this.buildOp({
       hlcTimestamp: hlcTs,
       fileId: entry.id,
       type: 'update',
       path,
       contentHash: hash,
-    });
+    }));
   }
 
   private async handleDelete(path: string): Promise<void> {
@@ -255,15 +248,13 @@ export class OperationLogger {
     // If there's a pending create for this file, cancel them out
     this.pruneCreateDeletePair(entry.id);
 
-    await this.recordOp({
-      id: this.opId(),
-      deviceId: this.deviceId,
+    await this.recordOp(this.buildOp({
       hlcTimestamp: hlcTs,
       fileId: entry.id,
       type: 'delete',
       path,
       contentHash: entry.contentHash,
-    });
+    }));
   }
 
   private async handleRename(path: string, oldPath: string): Promise<void> {
@@ -278,16 +269,14 @@ export class OperationLogger {
     const hlcTs = this.hlc.now();
     await this.registry.updatePath(oldPath, path, hlcTs);
 
-    await this.recordOp({
-      id: this.opId(),
-      deviceId: this.deviceId,
+    await this.recordOp(this.buildOp({
       hlcTimestamp: hlcTs,
       fileId: entry.id,
       type: 'move',
       path,
       previousPath: oldPath,
       contentHash: entry.contentHash,
-    });
+    }));
   }
 
   // ─── Op management ────────────────────────────────────────────────────────
@@ -314,9 +303,7 @@ export class OperationLogger {
    * so the resolution wins last-writer-wins when peers pull it.
    */
   async recordResolvedUpdate(fileId: string, path: string, contentHash: string, hlcTs: HLC, supersedes: string[]): Promise<void> {
-    await this.recordOp({
-      id: this.opId(),
-      deviceId: this.deviceId,
+    await this.recordOp(this.buildOp({
       hlcTimestamp: hlcTs,
       fileId,
       type: 'update',
@@ -325,7 +312,7 @@ export class OperationLogger {
       // The conflicting sides this resolution settles — peers holding either
       // adopt it instead of re-prompting (see FileEntry.supersedes).
       supersedes,
-    });
+    }));
   }
 
   /**
@@ -337,16 +324,14 @@ export class OperationLogger {
    * re-prompting. `contentHash` is the superseded (now-deleted) content.
    */
   async recordResolvedDelete(fileId: string, path: string, contentHash: string, hlcTs: HLC, supersedes: string[]): Promise<void> {
-    await this.recordOp({
-      id: this.opId(),
-      deviceId: this.deviceId,
+    await this.recordOp(this.buildOp({
       hlcTimestamp: hlcTs,
       fileId,
       type: 'delete',
       path,
       contentHash,
       supersedes,
-    });
+    }));
   }
 
   private async recordOp(op: Operation): Promise<void> {
@@ -380,6 +365,16 @@ export class OperationLogger {
   }
 
   // ─── Helpers ─────────────────────────────────────────────────────────────
+
+  /**
+   * Construct an Operation, stamping the fields every op shares — the format
+   * version, a unique id, and the authoring device — in one place so an
+   * individual call site can neither forget them nor let them drift. Per-op
+   * fields are supplied by the caller.
+   */
+  private buildOp(fields: Omit<Operation, 'v' | 'id' | 'deviceId'>): Operation {
+    return { v: OP_FORMAT_VERSION, id: this.opId(), deviceId: this.deviceId, ...fields };
+  }
 
   private isExcluded(path: string): boolean {
     return isExcluded(path, this.getSettings());
