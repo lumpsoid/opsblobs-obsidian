@@ -33,6 +33,10 @@ export type ConflictResolver =
 export type DeleteConflictResolver =
   (action: Extract<MergeAction, { type: 'delete_conflict' }>) => 'keep_deleted' | 'restore';
 
+/** How a device resolves a concurrent binary-file conflict (whole-version pick). */
+export type BinaryConflictResolver =
+  (action: Extract<MergeAction, { type: 'binary_conflict' }>) => 'keep_local' | 'keep_remote';
+
 export class TestDevice {
   readonly files = new FakeVaultFiles();
   readonly metadata = new FakeMetadataStore();
@@ -60,6 +64,10 @@ export class TestDevice {
   /** When set, `delete_conflict` actions use this decision (default:
    *  'keep_deleted') — a device's stand-in for the delete-conflict modal. */
   resolveDeleteConflict?: DeleteConflictResolver;
+
+  /** When set, `binary_conflict` actions use this decision (default:
+   *  'keep_local') — a device's stand-in for the binary-conflict modal. */
+  resolveBinaryConflict?: BinaryConflictResolver;
 
   /** Every merge action applied across all rounds, in order — the real merge's
    *  decisions (conflict / write_local / delete_local / …), captured so a test
@@ -91,6 +99,7 @@ export class TestDevice {
       this.hlc,
       async a => this.resolveConflict?.(a) ?? null,
       async a => this.resolveDeleteConflict?.(a) ?? 'keep_deleted',
+      async a => this.resolveBinaryConflict?.(a) ?? 'keep_local',
     );
     this.cursorStore = new CursorStore(this.metadata);
     this.host = new PluginVaultSyncHost(
@@ -182,6 +191,23 @@ export class TestDevice {
     this.setWall(wall);
     await this.files.trash(path);
     await this.watcher.emitDelete(path);
+  }
+
+  /** Create a new binary file (raw bytes — include a null byte to trip the
+   *  merge's binary sniff) and let the real create-handler assign its id + op. */
+  async seedBinary(path: string, bytes: Uint8Array, wall: number): Promise<string> {
+    this.setWall(wall);
+    await this.files.write(path, bytes);
+    await this.watcher.emitCreate(path);
+    return this.registry.getByPath(path)!.id;
+  }
+
+  /** Edit an already-tracked binary file; flush so its update op exists now. */
+  async editBinary(path: string, bytes: Uint8Array, wall: number): Promise<void> {
+    this.setWall(wall);
+    await this.files.write(path, bytes);
+    this.watcher.emitModify(path);
+    await this.opLogger.flush();
   }
 
   /** Rename an already-tracked file (real rename-handler moves + ops it). */

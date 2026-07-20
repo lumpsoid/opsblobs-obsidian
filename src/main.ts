@@ -22,6 +22,7 @@ import { HlcStore } from './network/hlc-store';
 import { PluginVaultSyncHost } from './network/vault-sync-host';
 import { ConflictResolutionModal } from './ui/conflict-modal';
 import { DeleteConflictModal } from './ui/delete-conflict-modal';
+import { BinaryConflictModal } from './ui/binary-conflict-modal';
 import { SyncSettingTab } from './ui/settings-tab';
 
 // ─── Ribbon icon SVG ────────────────────────────────────────────────────────
@@ -108,6 +109,13 @@ export default class VaultSyncPlugin extends Plugin {
         // 'ask' — let the user decide per file.
         return new Promise(resolve => {
           new DeleteConflictModal(this.app, action.path, action.side, resolve).open();
+        });
+      },
+      // Binary conflict handler — binary files can't be three-way merged, so the
+      // user picks which whole version to keep (presented by filename + metadata).
+      async (action) => {
+        return new Promise(resolve => {
+          new BinaryConflictModal(this.app, action, resolve).open();
         });
       },
     );

@@ -226,14 +226,39 @@ function resolveContentConflict(
   const localText = new TextDecoder().decode(localContent);
   const remoteText = new TextDecoder().decode(remoteContent);
 
-  // If it's a binary file, skip text merge
+  // Binary files can't be three-way merged. Deciding by "higher HLC wins" would
+  // silently drop the losing side (data loss). Instead, take the sole edit when
+  // only ONE side changed since the common ancestor — no conflict, no prompt —
+  // and otherwise surface a `binary_conflict` for the user to resolve. Changed-
+  // since-ancestor is a cheap *hash* comparison, so (unlike the text path) it
+  // needs no ancestor bytes.
   if (isBinary(localContent) || isBinary(remoteContent)) {
-    // For binary files: higher HLC wins deterministically
-    if (hlcCompare(le.hlcTimestamp, re.hlcTimestamp) >= 0) {
-      return { type: 'no_op', fileId }; // local wins, nothing to do
-    } else {
-      return { type: 'write_local', fileId, path: re.path, content: remoteContent, hlc: re.hlcTimestamp };
+    const ancestorHash = le.ancestorContentHash ?? re.ancestorContentHash;
+    if (ancestorHash != null) {
+      const localChanged = le.contentHash !== ancestorHash;
+      const remoteChanged = re.contentHash !== ancestorHash;
+      // Only the remote side changed → adopt it cleanly.
+      if (remoteChanged && !localChanged) {
+        return { type: 'write_local', fileId, path: re.path, content: remoteContent, hlc: re.hlcTimestamp };
+      }
+      // Only the local side changed → keep ours; the local file already holds it.
+      if (localChanged && !remoteChanged) {
+        return { type: 'no_op', fileId };
+      }
     }
+    // Both sides diverged (or there is no common ancestor): a genuine conflict the
+    // user must resolve. Never silently overwrite.
+    return {
+      type: 'binary_conflict',
+      fileId,
+      localPath: le.path,
+      remotePath: re.path,
+      localContent,
+      remoteContent,
+      localHlc: le.hlcTimestamp,
+      remoteHlc: re.hlcTimestamp,
+      parentHashes: [le.contentHash, re.contentHash],
+    };
   }
 
   // Attempt three-way merge using ancestor

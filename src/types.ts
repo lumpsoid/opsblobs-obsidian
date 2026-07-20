@@ -87,6 +87,13 @@ export type MergeAction =
   | { type: 'move_local'; fileId: string; fromPath: string; toPath: string }
   | { type: 'conflict'; fileId: string; localPath: string; remotePath: string; mergeResult: ThreeWayMergeResult; localContent: string; remoteContent: string; parentHashes: string[] }
   | { type: 'delete_conflict'; fileId: string; path: string; side: 'local_deleted' | 'remote_deleted'; content: Uint8Array; parentHashes: string[] }
+  // Two devices edited the same *binary* file concurrently. Binary content can't
+  // be three-way merged, so rather than silently dropping one side by
+  // last-writer-wins the user chooses which whole version to keep (presented by
+  // filename + metadata — there is no meaningful content diff to show). Both
+  // versions are carried so the applicator can write the chosen one; parentHashes
+  // are the two sides the resolution supersedes (like `conflict`).
+  | { type: 'binary_conflict'; fileId: string; localPath: string; remotePath: string; localContent: Uint8Array; remoteContent: Uint8Array; localHlc: HLC; remoteHlc: HLC; parentHashes: string[] }
   | { type: 'no_op'; fileId: string };
 
 export interface StateMergeResult {

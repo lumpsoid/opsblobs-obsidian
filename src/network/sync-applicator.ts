@@ -13,6 +13,7 @@ import { nextAncestorHash } from '../merge/ancestor-policy';
 
 export type ConflictHandler = (action: Extract<MergeAction, { type: 'conflict' }>) => Promise<Uint8Array | null>;
 export type DeleteConflictHandler = (action: Extract<MergeAction, { type: 'delete_conflict' }>) => Promise<'keep_deleted' | 'restore'>;
+export type BinaryConflictHandler = (action: Extract<MergeAction, { type: 'binary_conflict' }>) => Promise<'keep_local' | 'keep_remote'>;
 
 /** A user-resolved conflict that must be re-emitted as an op so it replicates.
  *  `kind` is the op it becomes: an `update` (content conflict, or a delete
@@ -37,6 +38,7 @@ export class SyncApplicator {
     private hlc: HybridLogicalClock,
     public onConflict: ConflictHandler,
     public onDeleteConflict: DeleteConflictHandler,
+    public onBinaryConflict: BinaryConflictHandler,
   ) {}
 
   /**
@@ -218,6 +220,29 @@ export class SyncApplicator {
         await this.files.trash(action.path);
         await this.registry.markDeleted(action.path, hlcTs);
         return { kind: 'delete', fileId: action.fileId, path: action.path, contentHash: hash, hlc: hlcTs, supersedes: action.parentHashes };
+      }
+
+      case 'binary_conflict': {
+        // Binary files can't be merged; the user picked which whole version to
+        // keep. Write it, converge identity, and re-emit it as a resolution op —
+        // exactly like `delete_conflict`, so a peer still holding either side
+        // adopts the decision via `supersedes` instead of re-prompting.
+        const decision = await this.onBinaryConflict(action);
+        const keepLocal = decision === 'keep_local';
+        const content = keepLocal ? action.localContent : action.remoteContent;
+        const path = keepLocal ? action.localPath : action.remotePath;
+        // Timestamp *now* so the decision dominates the version it supersedes
+        // (runSync already advanced the clock past the merged HLC).
+        const hlcTs = this.hlc.now();
+        const hash = await hashContent(content);
+        if (await this.wouldTruncateNonEmpty(path, content)) {
+          console.warn(`Vault Sync: skipping binary_conflict resolution for ${path} — refusing to overwrite a non-empty file with empty content`);
+          return null;
+        }
+        await this.files.write(path, content);
+        await this.contentStore.put(hash, content);
+        await this.registry.adoptRemote(action.fileId, path, hash, hlcTs);
+        return { kind: 'update', fileId: action.fileId, path, contentHash: hash, hlc: hlcTs, supersedes: action.parentHashes };
       }
 
       case 'send_remote':
