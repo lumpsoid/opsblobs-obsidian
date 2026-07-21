@@ -51,6 +51,7 @@ export default class VaultSyncPlugin extends Plugin {
 
   private ribbonIcon: HTMLElement | null = null;
   private statusBarItem: HTMLElement | null = null;
+  private statusBarText = '';
   private syncInProgress = false;
   private autoSyncHandle: number | null = null;
 
@@ -177,6 +178,13 @@ export default class VaultSyncPlugin extends Plugin {
 
     this.statusBarItem = this.addStatusBarItem();
     this.updateStatusBar();
+    // Flip the badge to "changes to sync" the moment a (debounced) edit is
+    // recorded, without polling. During a round the progress handler owns the
+    // badge and the round's own `clearOps` fires this too, so defer to the
+    // post-round `updateStatusBar` and skip while a sync is in progress.
+    this.opLogger.onChange(() => {
+      if (!this.syncInProgress) this.updateStatusBar();
+    });
 
     // ── Commands ───────────────────────────────────────────────────────────
     this.addCommand({
@@ -288,7 +296,7 @@ export default class VaultSyncPlugin extends Plugin {
       crypto: this.crypto,
       host,
       hlc: this.hlc,
-      onProgress: (label) => this.statusBarItem?.setText(`⟳ ${label}`),
+      onProgress: (label) => this.setStatusBarText(`⟳ ${label}`),
     });
     return client.runSync();
   }
@@ -457,23 +465,38 @@ export default class VaultSyncPlugin extends Plugin {
     this.ribbonIcon.setAttribute('aria-label', titles[state] ?? 'Vault Sync');
   }
 
+  /**
+   * A deliberately *coarse* badge: which of three states the vault is in, not
+   * how many changes or how long ago. Precision (counts, "2m ago") belongs in
+   * the sync-status modal, not a glanceable indicator — and dropping it means
+   * the badge has nothing time-dependent to refresh, so it only ever needs to
+   * re-render when the state actually changes (an op recorded/cleared, or a
+   * conflict raised/resolved). Those are the events wired to call this; there
+   * is no polling.
+   */
   private updateStatusBar() {
     if (!this.statusBarItem) return;
-    const pending = this.opLogger.getPendingOps().length;
-    const conflicts = this.outstandingConflictCount();
-    const lastSynced = this.settings.lastSyncTime;
-    const lastSyncedStr = lastSynced ? this.relativeTime(lastSynced) : 'Never synced';
 
-    // Outstanding conflicts take priority — they need the user, not just time.
-    if (conflicts > 0) {
-      this.statusBarItem.setText(`⚠️ ${conflicts} conflict${conflicts !== 1 ? 's' : ''} to resolve`);
-    } else {
-      this.statusBarItem.setText(
-        pending > 0
-          ? `⟳ ${pending} pending change${pending !== 1 ? 's' : ''}`
-          : `✓ ${lastSyncedStr}`,
-      );
-    }
+    // Outstanding conflicts take priority — they need the user, not just a sync.
+    const text =
+      this.outstandingConflictCount() > 0
+        ? '⚠ Conflict to resolve'
+        : this.opLogger.getPendingOps().length > 0
+          ? '⟳ Changes to sync'
+          : '✓ Synced';
+
+    this.setStatusBarText(text);
+  }
+
+  /** Single writer for the status bar. Called by every state-change event and
+   *  by the sync progress handler, so it only touches the DOM when the text
+   *  changed — and it keeps {@link statusBarText} in lockstep with the DOM so a
+   *  transient progress label ("⟳ Pulling…") is always overwritten by the next
+   *  render, even when the pre- and post-sync states happen to be identical. */
+  private setStatusBarText(text: string): void {
+    if (!this.statusBarItem || text === this.statusBarText) return;
+    this.statusBarText = text;
+    this.statusBarItem.setText(text);
   }
 
   /** Open the inspectable sync-status surface (S2) — replaces the old transient
@@ -487,13 +510,5 @@ export default class VaultSyncPlugin extends Plugin {
       state: this.syncState.get(),
       onResolveConflicts: () => { void this.recheckConflicts(); },
     }).open();
-  }
-
-  private relativeTime(ts: number): string {
-    const seconds = Math.floor((Date.now() - ts) / 1000);
-    if (seconds < 60) return 'just now';
-    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
-    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
-    return `${Math.floor(seconds / 86400)}d ago`;
   }
 }

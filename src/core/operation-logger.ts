@@ -30,6 +30,10 @@ const OPLOG_PATH = '.vault-sync/oplog.json';
 export class OperationLogger {
   private pendingOps: Operation[] = [];
   private debounceTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+  /** Notified whenever the pending oplog is persisted — i.e. an op was
+   *  recorded, cleared, or cancelled. Lets the UI reflect "changes to sync"
+   *  the instant a (debounced) edit lands, without polling. */
+  private changeListener: (() => void) | null = null;
 
   constructor(
     private files: VaultFiles,
@@ -47,6 +51,14 @@ export class OperationLogger {
     // callers that don't need persistence omit it.
     private hlcStore?: HlcPersister,
   ) {}
+
+  /** Subscribe to pending-oplog changes. At most one listener; the latest wins.
+   *  Fires *after* the log is persisted, so `getPendingOps()` is already current
+   *  when the callback runs. `load()` sets the log without notifying (there is
+   *  no observer yet at load time). */
+  onChange(listener: () => void): void {
+    this.changeListener = listener;
+  }
 
   // ─── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -383,6 +395,9 @@ export class OperationLogger {
     // per-op cadence; `main.ts` additionally persists after each sync round and
     // on unload, so time issued outside op-recording (merge/setCurrent) is durable.
     await this.hlcStore?.save(this.hlc.getCurrent());
+    // Notify observers that the pending set may have changed (UI status). Kept
+    // last so the persisted state is durable before anyone reacts to it.
+    this.changeListener?.();
   }
 
   /**
