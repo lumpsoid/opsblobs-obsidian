@@ -242,11 +242,38 @@ this.registerDomEvent(window, "resize", () => { /* ... */ });
 this.registerInterval(window.setInterval(() => { /* ... */ }, 1000));
 ```
 
+### The vault index is NOT populated during `onload` — wait for `onLayoutReady`
+
+`app.vault.getFiles()` / `getMarkdownFiles()` return an **empty or partial** list
+while the plugin's `onload()` runs; the vault file index fills in as the workspace
+becomes ready. Any startup logic that enumerates the vault — reconciling against
+persisted state, building an initial index, especially anything that could **delete
+or overwrite** based on "this file isn't here anymore" — must run inside
+`this.app.workspace.onLayoutReady(cb)` (which fires immediately if the layout is
+already up), never directly in `onload`.
+
+```ts
+async onload() {
+  // ...load persisted state, wire components...
+  this.app.workspace.onLayoutReady(() => {
+    void this.reconcileVaultAgainstState(); // getFiles() is reliable here
+  });
+}
+```
+
+This bit us for real: a cold-start reconcile that diffed the vault against saved
+state ran in `onload`, saw an empty `getFiles()`, concluded every tracked file was
+deleted, and propagated a vault-wide phantom delete. Treat an empty enumeration at
+startup as "index not ready," not as "the vault is empty" — and never derive a
+destructive action from a single lazily-populated host API. See
+`docs/sync-engineering-guide.md` §6 (cold-start phantom delete) for the full case.
+
 ## Troubleshooting
 
 - Plugin doesn't load after build: ensure `main.js` and `manifest.json` are at the top level of the plugin folder under `<Vault>/.obsidian/plugins/<plugin-id>/`. 
 - Build issues: if `main.js` is missing, run `npm run build` or `npm run dev` to compile your TypeScript source code.
 - Commands not appearing: verify `addCommand` runs after `onload` and IDs are unique.
+- Files "missing" / spurious deletes at startup: `app.vault.getFiles()` isn't populated during `onload` — enumerate the vault inside `workspace.onLayoutReady` (see "The vault index is NOT populated during `onload`").
 - Settings not persisting: ensure `loadData`/`saveData` are awaited and you re-render the UI after changes.
 - Mobile-only issues: confirm you're not using desktop-only APIs; check `isDesktopOnly` and adjust.
 

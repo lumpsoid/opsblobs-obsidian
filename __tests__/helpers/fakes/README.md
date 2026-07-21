@@ -17,6 +17,14 @@ one side should be mirrored here:
 - **`rename` fires with `(newPath, oldPath)`** — the registry follows the file id
   from the old path to the new one. `emitRename(to, from)`.
 - **`delete` fires for a tracked file** and tombstones it in the registry.
+- **`list()` can under-report during a cold start.** `ObsidianVaultFiles.list()`
+  wraps `app.vault.getFiles()`, which is **empty/partial until the workspace layout
+  is ready** — it is not reliable inside `onload`. So a caller must never treat "not
+  in `list()`" as "deleted" without confirming the index is ready (`main.ts` defers
+  the first `captureOfflineChanges` to `onLayoutReady`, and the scan itself skips its
+  delete pass when the listing is empty while active entries remain). Reproduce the
+  race with `FakeVaultFiles.setListingReady(false)` — `list()` reports empty while
+  `read`/`exists` still work.
 - **Persistence survives a restart.** `FakeVaultFiles` (vault bytes) and
   `FakeMetadataStore` (`.vault-sync/*` JSON: registry, oplog, cursor, HLC,
   sync-state) hold the durable state; in-memory device state does not.
