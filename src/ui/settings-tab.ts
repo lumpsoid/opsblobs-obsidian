@@ -21,6 +21,7 @@ export interface SettingsHost extends Plugin {
   resetSyncState(): Promise<void>;
   recheckConflicts(): Promise<void>;
   syncNow(): Promise<void>;
+  openSyncStatus(): void;
 }
 
 export class SyncSettingTab extends PluginSettingTab {
@@ -141,6 +142,13 @@ export class SyncSettingTab extends PluginSettingTab {
 
     // ── Sync behavior ─────────────────────────────────────────────────────
     new Setting(containerEl).setName('Sync behavior').setHeading();
+
+    new Setting(containerEl)
+      .setName('View sync status')
+      .setDesc('See the last sync, pending changes, and any skipped conflicts or files needing attention.')
+      .addButton(btn => {
+        btn.setButtonText('View status').onClick(() => this.host.openSyncStatus());
+      });
 
     new Setting(containerEl)
       .setName('Sync now')

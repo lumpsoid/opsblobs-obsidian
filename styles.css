@@ -37,3 +37,7 @@ textarea.vault-sync-exclusions {
 .conflict-code code { white-space: inherit; overflow-wrap: anywhere; word-break: break-word; }
 .chunk-actions { display: flex; gap: 0.5rem; padding: 0.5rem 0.75rem; background: var(--background-secondary); border-top: 1px solid var(--background-modifier-border); flex-wrap: wrap; }
 .conflict-footer { display: flex; gap: 0.75rem; margin-top: 1.25rem; justify-content: flex-end; flex-wrap: wrap; }
+
+/* Sync status modal (S2) */
+.vault-sync-status-list { margin: 0.25rem 0 0.5rem 1rem; padding: 0; font-size: 0.85rem; color: var(--text-muted); max-height: 160px; overflow-y: auto; }
+.vault-sync-status-list li { overflow-wrap: anywhere; word-break: break-word; }

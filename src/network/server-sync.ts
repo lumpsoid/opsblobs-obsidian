@@ -114,6 +114,20 @@ export interface ServerSyncOptions {
 
 const DEFAULT_OPS_LIMIT = 500;
 
+/** What a sync round did, surfaced to the plugin so the observable sync-state
+ *  (S2) can record it. `deferred`/`stranded` are the fileless raw sets the round
+ *  already computes for its cursor logic — the plugin resolves them to paths. */
+export interface SyncRoundSummary {
+  /** Count of locally-authored pending ops pushed this round. */
+  pushed: number;
+  /** Count of remote ops pulled this round. */
+  pulled: number;
+  /** fileIds whose destructive action was deferred for on-disk drift (F5). */
+  deferred: string[];
+  /** content hashes whose blob couldn't be fetched this round (F3). */
+  stranded: string[];
+}
+
 export class ServerSyncClient {
   private readonly api: ServerApi;
   private readonly crypto: VaultCrypto;
@@ -146,11 +160,12 @@ export class ServerSyncClient {
    * decision replay can't reproduce; the applicator re-emits it as an op (see
    * SyncApplicator's `conflict` case) so it replicates like any other edit.
    */
-  async runSync(): Promise<void> {
+  async runSync(): Promise<SyncRoundSummary> {
     if (!this.crypto.isReady()) throw new Error('Vault key not derived');
 
     const local = await this.host.buildLocalState();
     const startCursor = await this.host.loadCursor();
+    const pushed = local.pendingOps.length;
 
     // ── 1. Pull remote ops since our cursor ──────────────────────────────────
     this.onProgress?.('Pulling changes…');
@@ -199,6 +214,13 @@ export class ServerSyncClient {
     // re-merges against the edit we just re-captured. Its content WAS available
     // (not F3's case), so cap the cursor at this round's start.
     await this.host.saveCursor(safeCursor(pulled, pulledCursor, missingContent, startCursor, drifted.size > 0));
+
+    return {
+      pushed,
+      pulled: pulled.length,
+      deferred: [...drifted],
+      stranded: [...missingContent],
+    };
   }
 
   /**

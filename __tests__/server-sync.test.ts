@@ -246,7 +246,7 @@ describe('ServerSyncClient — full round against the fake', () => {
     const idB = await deviceB.seedFile('b.md', bodyB, 2000);
     const clientB = new ServerSyncClient({ api: staleOnce, crypto: vc, host: deviceB.host, hlc: deviceB.hlc });
 
-    await expect(clientB.runSync()).resolves.toBeUndefined(); // completes, no throw escapes
+    await expect(clientB.runSync()).resolves.toBeDefined(); // completes, no throw escapes
 
     // The append was retried after refreshing the cursor: two calls, one 409'd.
     expect(staleOnce.appendCalls).toBe(2);
@@ -275,5 +275,45 @@ describe('ServerSyncClient — full round against the fake', () => {
 
     expect(server.opCount).toBe(2);   // two ops
     expect(server.blobCount).toBe(1); // but one shared blob (dedup held)
+  });
+
+  test('runSync returns a summary of what the round did (S2)', async () => {
+    const server = new FakeSyncServer();
+    const deviceA = await device('dev-a');
+    const deviceB = await device('dev-b');
+    await deviceA.seedFile('one.md', 'first\n', 1000);
+    await deviceA.seedFile('two.md', 'second\n', 1000);
+
+    // A's round pushes its 2 ops and pulls nothing new.
+    const aSummary = await client(server, vc, deviceA).runSync();
+    expect(aSummary.pushed).toBe(2);
+    expect(aSummary.pulled).toBe(0);
+    expect(aSummary.deferred).toEqual([]);
+    expect(aSummary.stranded).toEqual([]);
+
+    // B's round pushes nothing and pulls A's 2 ops.
+    const bSummary = await client(server, vc, deviceB).runSync();
+    expect(bSummary.pushed).toBe(0);
+    expect(bSummary.pulled).toBe(2);
+  });
+
+  test('runSync reports stranded content when a blob is unavailable (F3 → S2)', async () => {
+    const inner = new FakeSyncServer();
+    const gated = new BlobGatedServer(inner);
+    const deviceA = await device('dev-a');
+    const deviceB = await device('dev-b');
+    const id = await deviceA.seedFile('later.md', 'appears\n', 1000);
+    const hash = deviceA.entry(id)!.contentHash;
+
+    const clientFor = (d: TestDevice) =>
+      new ServerSyncClient({ api: gated, crypto: vc, host: d.host, hlc: d.hlc });
+
+    await clientFor(deviceA).runSync();
+
+    gated.blobAvailable = false;
+    const summary = await clientFor(deviceB).runSync();
+    // The op was pulled but its content couldn't be fetched — reported as stranded.
+    expect(summary.pulled).toBe(1);
+    expect(summary.stranded).toContain(hash);
   });
 });

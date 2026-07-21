@@ -15,14 +15,16 @@ import { ObsidianVaultFiles } from './network/obsidian-vault-files';
 import { ObsidianMetadataStore } from './network/obsidian-metadata-store';
 import { ObsidianVaultWatcher } from './network/obsidian-vault-watcher';
 import { VaultCrypto, saltForVault } from './network/encryption';
-import { ServerSyncClient } from './network/server-sync';
+import { ServerSyncClient, SyncRoundSummary } from './network/server-sync';
 import { HttpServerApi } from './network/server-http';
 import { CursorStore } from './network/cursor-store';
 import { HlcStore } from './network/hlc-store';
+import { SyncStateStore } from './network/sync-state-store';
 import { PluginVaultSyncHost } from './network/vault-sync-host';
 import { ConflictResolutionModal } from './ui/conflict-modal';
 import { DeleteConflictModal } from './ui/delete-conflict-modal';
 import { BinaryConflictModal } from './ui/binary-conflict-modal';
+import { SyncStatusModal } from './ui/sync-status-modal';
 import { SyncSettingTab } from './ui/settings-tab';
 
 // ─── Ribbon icon SVG ────────────────────────────────────────────────────────
@@ -39,13 +41,20 @@ export default class VaultSyncPlugin extends Plugin {
   private vaultFiles!: ObsidianVaultFiles;
   private opLogger!: OperationLogger;
   private applicator!: SyncApplicator;
+  private syncState!: SyncStateStore;
   private crypto = new VaultCrypto();
 
   private ribbonIcon: HTMLElement | null = null;
   private statusBarItem: HTMLElement | null = null;
   private syncInProgress = false;
-  private pendingConflicts = 0;
   private autoSyncHandle: number | null = null;
+
+  /** Conflicts the user has skipped/dismissed and not yet resolved — drives the
+   *  ribbon's "needs attention" state and the status modal. Read from the
+   *  persisted sync-state so it survives restarts. */
+  private outstandingConflictCount(): number {
+    return this.syncState.get().outstandingConflicts.length;
+  }
 
   // ─── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -91,7 +100,7 @@ export default class VaultSyncPlugin extends Plugin {
       this.hlc,
       // Conflict handler
       async (action) => {
-        return new Promise(resolve => {
+        const resolved = await new Promise<Uint8Array | null>(resolve => {
           new ConflictResolutionModal(
             this.app,
             action.localPath,
@@ -101,26 +110,44 @@ export default class VaultSyncPlugin extends Plugin {
             resolve,
           ).open();
         });
+        // A skip (null) leaves the two devices divergent — record it as
+        // outstanding so it's visible and re-openable instead of vanishing. A real
+        // resolution clears any prior outstanding entry for this file.
+        if (resolved === null) {
+          await this.syncState.recordConflict({ fileId: action.fileId, path: action.localPath, kind: 'content', firstSeen: Date.now() });
+        } else {
+          await this.syncState.clearConflict(action.fileId);
+        }
+        return resolved;
       },
       // Delete conflict handler
       async (action) => {
-        const resolved = resolveDeleteStrategy(this.settings.deleteConflictStrategy);
-        if (resolved !== 'ask') return resolved;
-        // 'ask' — let the user decide per file.
-        return new Promise(resolve => {
-          new DeleteConflictModal(this.app, action.path, action.side, resolve).open();
-        });
+        const strategy = resolveDeleteStrategy(this.settings.deleteConflictStrategy);
+        const decision = strategy !== 'ask'
+          ? strategy
+          // 'ask' — let the user decide per file.
+          : await new Promise<'keep_deleted' | 'restore'>(resolve => {
+              new DeleteConflictModal(this.app, action.path, action.side, resolve).open();
+            });
+        // Delete conflicts always resolve (the modal defaults to 'restore' on
+        // dismiss), so clear any outstanding entry rather than recording a skip.
+        await this.syncState.clearConflict(action.fileId);
+        return decision;
       },
       // Binary conflict handler — binary files can't be three-way merged, so the
       // user picks which whole version to keep (presented by filename + metadata).
       async (action) => {
-        return new Promise(resolve => {
+        const decision = await new Promise<'keep_local' | 'keep_remote'>(resolve => {
           new BinaryConflictModal(this.app, action, resolve).open();
         });
+        await this.syncState.clearConflict(action.fileId);
+        return decision;
       },
     );
 
     // Load persisted state
+    this.syncState = new SyncStateStore(metadata);
+    await this.syncState.load();
     await this.contentStore.init();
     await this.registry.load();
     await this.opLogger.load();
@@ -141,7 +168,8 @@ export default class VaultSyncPlugin extends Plugin {
     this.ribbonIcon = this.addRibbonIcon(SYNC_ICON_ID, 'Vault Sync', () => {
       void this.triggerSync('manual');
     });
-    this.updateRibbonState('idle');
+    // Reflect any conflicts left outstanding from a previous session immediately.
+    this.updateRibbonState(this.outstandingConflictCount() > 0 ? 'conflict' : 'idle');
 
     this.statusBarItem = this.addStatusBarItem();
     this.updateStatusBar();
@@ -156,7 +184,7 @@ export default class VaultSyncPlugin extends Plugin {
     this.addCommand({
       id: 'view-sync-status',
       name: 'View sync status',
-      callback: () => this.showSyncStatus(),
+      callback: () => this.openSyncStatus(),
     });
 
     // ── Settings ───────────────────────────────────────────────────────────
@@ -314,26 +342,51 @@ export default class VaultSyncPlugin extends Plugin {
         onProgress: (label) => this.statusBarItem?.setText(`⟳ ${label}`),
       });
 
-      await client.runSync();
+      const summary = await client.runSync();
 
       // Persist logical time after the round (F7): the merge/apply path advances
       // the clock via merge()/setCurrent() outside op-recording, so capture it
       // here in addition to the per-op cadence in OperationLogger.
       await this.hlcStore.save(this.hlc.getCurrent());
 
+      await this.recordRoundOutcome(summary);
+      await this.syncState.clearError();
+
       this.settings.lastSyncTime = Date.now();
       await this.saveSettings();
 
       if (source === 'manual') new Notice('✅ Vault sync complete');
-      this.updateRibbonState('idle');
+      // Land on the conflict state (not idle) if the round left conflicts the user
+      // still needs to resolve, so the indicator doesn't silently go green.
+      this.updateRibbonState(this.outstandingConflictCount() > 0 ? 'conflict' : 'idle');
     } catch (err) {
       console.error('Vault Sync error:', err);
       new Notice(`❌ Sync failed: ${(err as Error).message}`);
+      await this.syncState.setError((err as Error).message, Date.now());
       this.updateRibbonState('error');
     } finally {
       this.syncInProgress = false;
       this.updateStatusBar();
     }
+  }
+
+  /** Fold a completed round's summary into the persisted sync-state (S2): the
+   *  one-line last-sync record plus the deferred/stranded lists, resolving the
+   *  round's raw fileIds/hashes to vault paths for display. */
+  private async recordRoundOutcome(summary: SyncRoundSummary): Promise<void> {
+    const now = Date.now();
+    const deferred = summary.deferred.map(fileId => ({
+      fileId,
+      path: this.registry.getById(fileId)?.path ?? fileId,
+      reason: 'drift' as const,
+      at: now,
+    }));
+    const stranded = summary.stranded.map(contentHash => ({ contentHash, at: now }));
+    await this.syncState.setRound(
+      { at: now, pushed: summary.pushed, pulled: summary.pulled, conflicts: this.outstandingConflictCount() },
+      deferred,
+      stranded,
+    );
   }
 
   /** Public entry point for the settings "Sync now" button. */
@@ -412,27 +465,33 @@ export default class VaultSyncPlugin extends Plugin {
   private updateStatusBar() {
     if (!this.statusBarItem) return;
     const pending = this.opLogger.getPendingOps().length;
+    const conflicts = this.outstandingConflictCount();
     const lastSynced = this.settings.lastSyncTime;
     const lastSyncedStr = lastSynced ? this.relativeTime(lastSynced) : 'Never synced';
 
-    this.statusBarItem.setText(
-      pending > 0
-        ? `⟳ ${pending} pending change${pending !== 1 ? 's' : ''}`
-        : `✓ ${lastSyncedStr}`,
-    );
+    // Outstanding conflicts take priority — they need the user, not just time.
+    if (conflicts > 0) {
+      this.statusBarItem.setText(`⚠️ ${conflicts} conflict${conflicts !== 1 ? 's' : ''} to resolve`);
+    } else {
+      this.statusBarItem.setText(
+        pending > 0
+          ? `⟳ ${pending} pending change${pending !== 1 ? 's' : ''}`
+          : `✓ ${lastSyncedStr}`,
+      );
+    }
   }
 
-  private showSyncStatus() {
-    const pending = this.opLogger.getPendingOps().length;
-    const fingerprint = this.vaultKeyFingerprint();
-    new Notice(
-      `Vault Sync Status\n` +
-      `• Server: ${this.settings.serverUrl || '(not configured)'}\n` +
-      `• Vault key: ${fingerprint ? `ready (${fingerprint})` : 'not derived'}\n` +
-      `• Pending operations: ${pending}\n` +
-      `• Device ID: ${this.settings.deviceId.slice(0, 8)}…`,
-      8000,
-    );
+  /** Open the inspectable sync-status surface (S2) — replaces the old transient
+   *  Notice. Public so the settings tab can open it too. */
+  openSyncStatus(): void {
+    new SyncStatusModal(this.app, {
+      serverUrl: this.settings.serverUrl,
+      fingerprint: this.vaultKeyFingerprint(),
+      deviceId: this.settings.deviceId,
+      pendingPaths: this.opLogger.getPendingOps().map(op => op.path),
+      state: this.syncState.get(),
+      onResolveConflicts: () => { void this.recheckConflicts(); },
+    }).open();
   }
 
   private relativeTime(ts: number): string {
