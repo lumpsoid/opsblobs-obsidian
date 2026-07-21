@@ -42,16 +42,14 @@ export interface Operation {
   type: OperationType;
   path: string;            // file path at time of operation
   contentHash: string;     // hash of file content after operation
-  // The content this edit was derived from — the file's contentHash immediately
-  // BEFORE this op (null/absent for a `create`, which has no prior version). It
-  // is the op's causal base, carried on the wire so a peer can reconstruct the
-  // true common ancestor for a three-way merge. This is what lets the merge
-  // FAST-FORWARD a sequential edit instead of spuriously conflicting/unioning:
-  // the author's own `ancestorContentHash` never advances when it pushes its
-  // edit (pushing isn't a peer acknowledgement — see ancestor-policy), so only
-  // the op itself can testify to what it was based on. Absent on legacy ops ⇒
-  // the merge falls back to the local ancestor (its prior behaviour).
-  baseContentHash?: string;
+  // The content hash(es) this version was derived from — the op's causal parents
+  // in the per-file content DAG (sync v2). A `create` is a root (`[]`); an
+  // ordinary edit or delete has the single prior content hash (`[prevHash]`); a
+  // merge node has both reconciled heads (`[headA, headB]`). Carried on the wire
+  // so a peer can reconstruct the DAG and compute the true three-way base (LCA)
+  // rather than relying on a locally-tracked scalar ancestor, which cannot
+  // testify to what a peer's edit was based on. See docs/sync-v2-decisions.md.
+  parents: string[];
   // Set only on a resolution op (a user-resolved conflict re-emitted by the
   // applicator): the content hashes of the two conflicting sides this
   // resolution supersedes. A peer still holding one of them adopts the

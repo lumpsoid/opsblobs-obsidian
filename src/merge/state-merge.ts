@@ -216,8 +216,8 @@ function resolveContentConflict(
   // (pushing isn't a peer acknowledgement — see ancestor-policy), so it can be a
   // stale pre-edit baseline. Merging against that stale base is what made a
   // sequential empty↔content edit either union/duplicate the file (empty-ancestor
-  // diff3) or silently keep the older side. The op's `baseContentHash` (surfaced
-  // as `re.ancestorContentHash`) is the true common point.
+  // diff3) or silently keep the older side. The op's causal parent (surfaced as
+  // `re.ancestorContentHash`) is the true common point.
   //
   // Safe under genuine concurrency: if the two really diverged, the remote's base
   // is some older shared version, NOT our current content, so this never fires

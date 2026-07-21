@@ -94,7 +94,7 @@ describe('empty files, truncation guard, and exclusions', () => {
   //  kept the stale text / duplicated the file. Root cause: the editing device's
   //  own `ancestorContentHash` never advances when it pushes its edit (pushing
   //  isn't a peer acknowledgement — ancestor-policy), so a later pull three-way-
-  //  merged against a STALE empty ancestor. Fix: ops carry `baseContentHash` (the
+  //  merged against a STALE empty ancestor. Fix: ops carry their causal parent (the
   //  content the edit derived from); the merge fast-forwards when the peer's base
   //  equals our current content, adopting the descendant cleanly. These are
   //  SEQUENTIAL edits (each device sees the other's before editing) — there is no
