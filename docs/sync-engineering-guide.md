@@ -213,6 +213,25 @@ test; the *classes* are what to watch for.
   **Lesson:** transient files must leave no trace on the wire.
 - **Orphaned status (badge-clear).** See §5.4. **Lesson:** convergence, not handler
   invocation, is the signal.
+- **Sequential edit conflicts/unions on a stale pusher ancestor.** A device's
+  `ancestorContentHash` deliberately does NOT advance when it pushes its own edit
+  (pushing isn't a peer acknowledgement — that advance was a prior data-loss bug, see
+  `ancestor-policy.ts`). So the *pusher's* ancestor can lag its own content. When the
+  peer then edits sequentially (having seen the pushed content) and the pusher pulls,
+  a three-way merge against that stale ancestor either **unions/duplicates** the file
+  (empty-ancestor diff3 concatenates both sides — the classic `"3\n4\n"` from `"3"`+`"4"`)
+  or **silently keeps the older side** (no conflict, pure divergence). Empty↔content
+  edits are the loudest trigger. Fix: ops carry **`baseContentHash`** (the content the
+  edit derived from); `reconstructRemoteState` surfaces it as the remote entry's
+  ancestor, and `state-merge` **fast-forwards** — if the remote's base equals our
+  current content, the peer is a strict descendant, so adopt it cleanly instead of
+  three-way-merging. Genuine concurrency is untouched (the bases won't match, so the
+  three-way conflict still fires — `concurrent-conflict-dataloss` stays green). **Lesson:**
+  the only witness to an edit's causal base is the op itself; a device can't infer it
+  from local state, because its own ancestor is intentionally stale. Carry the base on
+  the wire. The FF must fall back to the *local* content store (fetchRemoteBlobs skips
+  bytes you already hold, e.g. the empty blob), or a fast-forward to already-held content
+  wrongly defers.
 - **Cold-start phantom delete (listing race).** `captureOfflineChanges` diffs the
   registry against `files.list()` (`app.vault.getFiles()`) and emits a `delete` for any
   tracked file not in the listing. Obsidian does **not** populate `getFiles()` during

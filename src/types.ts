@@ -42,6 +42,16 @@ export interface Operation {
   type: OperationType;
   path: string;            // file path at time of operation
   contentHash: string;     // hash of file content after operation
+  // The content this edit was derived from — the file's contentHash immediately
+  // BEFORE this op (null/absent for a `create`, which has no prior version). It
+  // is the op's causal base, carried on the wire so a peer can reconstruct the
+  // true common ancestor for a three-way merge. This is what lets the merge
+  // FAST-FORWARD a sequential edit instead of spuriously conflicting/unioning:
+  // the author's own `ancestorContentHash` never advances when it pushes its
+  // edit (pushing isn't a peer acknowledgement — see ancestor-policy), so only
+  // the op itself can testify to what it was based on. Absent on legacy ops ⇒
+  // the merge falls back to the local ancestor (its prior behaviour).
+  baseContentHash?: string;
   // Set only on a resolution op (a user-resolved conflict re-emitted by the
   // applicator): the content hashes of the two conflicting sides this
   // resolution supersedes. A peer still holding one of them adopts the

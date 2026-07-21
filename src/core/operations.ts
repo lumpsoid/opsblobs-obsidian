@@ -36,16 +36,20 @@ export const Ops = {
     return stamp({ hlcTimestamp: hlc, fileId, type: 'create', path, contentHash });
   },
 
-  /** An edit to a tracked file. `contentHash` is the post-edit content. */
-  update(fileId: string, path: string, contentHash: string, hlc: HLC): Operation {
-    return stamp({ hlcTimestamp: hlc, fileId, type: 'update', path, contentHash });
+  /** An edit to a tracked file. `contentHash` is the post-edit content;
+   *  `baseContentHash` is the content it was derived from (the pre-edit hash), so
+   *  a peer can reconstruct the true three-way base and fast-forward a sequential
+   *  edit instead of spuriously conflicting. Omit only when the base is unknown. */
+  update(fileId: string, path: string, contentHash: string, hlc: HLC, baseContentHash?: string): Operation {
+    return stamp({ hlcTimestamp: hlc, fileId, type: 'update', path, contentHash, baseContentHash });
   },
 
   /** A tracked file removed. `contentHash` is the now-deleted content — no blob
    *  is uploaded for a delete; the hash only lets a peer match the tombstone to
-   *  bytes it may still hold. */
-  delete(fileId: string, path: string, contentHash: string, hlc: HLC): Operation {
-    return stamp({ hlcTimestamp: hlc, fileId, type: 'delete', path, contentHash });
+   *  bytes it may still hold. `baseContentHash` (the content the deletion was made
+   *  against) is carried for the same causal-base reason as {@link update}. */
+  delete(fileId: string, path: string, contentHash: string, hlc: HLC, baseContentHash?: string): Operation {
+    return stamp({ hlcTimestamp: hlc, fileId, type: 'delete', path, contentHash, baseContentHash });
   },
 
   /** A rename. Content is unchanged, so `contentHash` is the same as before; the

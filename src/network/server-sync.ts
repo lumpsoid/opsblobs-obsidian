@@ -425,7 +425,12 @@ export function reconstructRemoteState(ops: Operation[], ownDeviceId?: string): 
       contentHash: op.contentHash,
       hlcTimestamp: op.hlcTimestamp,
       deleted: op.type === 'delete',
-      ancestorContentHash: null,
+      // The op carries the content it was edited from (its causal base); surface
+      // it as the remote entry's ancestor so the merge can reconstruct the true
+      // common base and fast-forward a sequential edit (state-merge) instead of
+      // three-way-merging against the local device's stale ancestor. Legacy ops
+      // without a base leave this null — the merge falls back to prior behaviour.
+      ancestorContentHash: op.baseContentHash ?? null,
       ancestorPath: null,
       // Carry a resolution op's superseded sides so a peer still holding one of
       // them adopts the resolution rather than re-conflicting (state-merge).

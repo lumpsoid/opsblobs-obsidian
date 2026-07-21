@@ -107,12 +107,15 @@ export class OperationLogger {
         // A drifted hash means either a placeholder from an older op-less
         // reconcile ('') or an edit made while the plugin was off. Either way
         // the op carries the current content, so peers converge; `create` when
-        // it was never really captured, `update` otherwise.
+        // it was never really captured, `update` otherwise. Capture the prior
+        // hash BEFORE updateContentHash (which mutates the entry in place) — it is
+        // both the placeholder sentinel and the update's causal base.
+        const base = entry.contentHash;
         await this.registry.updateContentHash(path, hash, hlcTs);
         this.pendingOps.push(
-          entry.contentHash === ''
+          base === ''
             ? Ops.create(entry.id, path, hash, hlcTs)
-            : Ops.update(entry.id, path, hash, hlcTs),
+            : Ops.update(entry.id, path, hash, hlcTs, base),
         );
       }
       changed = true;
@@ -150,7 +153,7 @@ export class OperationLogger {
         // its deletion is a local-only tombstone — emitting a delete op would leak
         // the '' sentinel and reference content no peer holds (audit G).
         if (entry.contentHash === '') continue;
-        this.pendingOps.push(Ops.delete(entry.id, entry.path, entry.contentHash, hlcTs));
+        this.pendingOps.push(Ops.delete(entry.id, entry.path, entry.contentHash, hlcTs, entry.contentHash));
         changed = true;
       }
     }
@@ -199,13 +202,14 @@ export class OperationLogger {
         // we still emit a `create` — not an `update` referencing content no peer
         // holds — for a file that was only ever a reconcile placeholder (audit G).
         const wasPlaceholder = entry.contentHash === '';
+        const base = entry.contentHash; // pre-correction hash = the update's causal base
         if (entry.contentHash !== hash) {
           await this.registry.updateContentHash(path, hash, hlcTs);
         }
         this.pendingOps.push(
           wasPlaceholder
             ? Ops.create(entry.id, path, hash, hlcTs)
-            : Ops.update(entry.id, path, hash, hlcTs),
+            : Ops.update(entry.id, path, hash, hlcTs, base),
         );
       }
       changed = true;
@@ -311,11 +315,15 @@ export class OperationLogger {
     // Skip if content hasn't actually changed
     if (hash === entry.contentHash) return;
 
+    // The pre-edit hash is this update's causal base — captured before
+    // updateContentHash mutates the entry — so a peer can fast-forward a
+    // sequential edit rather than three-way-merge against a stale ancestor.
+    const base = entry.contentHash;
     const hlcTs = this.hlc.now();
     await this.contentStore.put(hash, content);
     await this.registry.updateContentHash(path, hash, hlcTs);
 
-    await this.recordOp(Ops.update(entry.id, path, hash, hlcTs));
+    await this.recordOp(Ops.update(entry.id, path, hash, hlcTs, base));
   }
 
   private async handleDelete(path: string): Promise<void> {
@@ -340,7 +348,7 @@ export class OperationLogger {
       return;
     }
 
-    await this.recordOp(Ops.delete(entry.id, path, entry.contentHash, hlcTs));
+    await this.recordOp(Ops.delete(entry.id, path, entry.contentHash, hlcTs, entry.contentHash));
   }
 
   private async handleRename(path: string, oldPath: string): Promise<void> {

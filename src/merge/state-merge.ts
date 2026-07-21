@@ -208,6 +208,36 @@ function resolveContentConflict(
   const localContent = local.contentStore.get(le.contentHash);
   const remoteContent = remote.contentStore.get(re.contentHash);
 
+  // ── Fast-forward (linear history, not a divergence) ────────────────────────
+  // If the remote's causal base is EXACTLY our current content, the peer edited
+  // directly from what we hold — its version is a strict descendant, not a
+  // concurrent branch. Adopt it cleanly instead of three-way-merging against our
+  // OWN `ancestorContentHash`, which does not advance when we push our edit
+  // (pushing isn't a peer acknowledgement — see ancestor-policy), so it can be a
+  // stale pre-edit baseline. Merging against that stale base is what made a
+  // sequential empty↔content edit either union/duplicate the file (empty-ancestor
+  // diff3) or silently keep the older side. The op's `baseContentHash` (surfaced
+  // as `re.ancestorContentHash`) is the true common point.
+  //
+  // Safe under genuine concurrency: if the two really diverged, the remote's base
+  // is some older shared version, NOT our current content, so this never fires
+  // and the three-way conflict below still surfaces (concurrent-conflict-dataloss
+  // stays green). Content is hash-addressed, so identical hashes ⇒ identical
+  // bytes ⇒ adopting is exactly what a three-way against that base would yield.
+  if (re.ancestorContentHash != null && re.ancestorContentHash === le.contentHash) {
+    // Hash-addressed: prefer the remote store but fall back to the local one —
+    // fetchRemoteBlobs skips bytes this device already holds (e.g. the empty blob
+    // an emptied file resolves to), so they are absent from the *remote* store yet
+    // present locally. Without this fallback a fast-forward to already-held content
+    // would wrongly defer and the file would never converge.
+    const content = remoteContent ?? local.contentStore.get(re.contentHash);
+    if (content) {
+      return { type: 'write_local', fileId, path: re.path, content, hlc: re.hlcTimestamp };
+    }
+    // Descendant bytes unavailable anywhere — defer rather than fabricate/clobber (F1).
+    return { type: 'no_op', fileId };
+  }
+
   if (!localContent || !remoteContent) {
     // Can't merge without content — defer to higher HLC.
     const winner = hlcCompare(le.hlcTimestamp, re.hlcTimestamp) >= 0 ? le : re;

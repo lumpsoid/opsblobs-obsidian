@@ -88,6 +88,69 @@ describe('empty files, truncation guard, and exclusions', () => {
     expect(await text(B, 'n.md')).toBe('');
   });
 
+  // ── Sequential edit fast-forward: empty ↔ content across two devices. ───────
+  //  Reported: A creates an empty file, both sync; A adds text, both sync; then a
+  //  device empties it, both sync — and the other device spuriously conflicted /
+  //  kept the stale text / duplicated the file. Root cause: the editing device's
+  //  own `ancestorContentHash` never advances when it pushes its edit (pushing
+  //  isn't a peer acknowledgement — ancestor-policy), so a later pull three-way-
+  //  merged against a STALE empty ancestor. Fix: ops carry `baseContentHash` (the
+  //  content the edit derived from); the merge fast-forwards when the peer's base
+  //  equals our current content, adopting the descendant cleanly. These are
+  //  SEQUENTIAL edits (each device sees the other's before editing) — there is no
+  //  real divergence, so no conflict may ever surface.
+  test('empty → content → empty converges with NO conflict (sequential, FF)', async () => {
+    const api = new FakeSyncServer();
+    const [A, B] = await pair(api);
+
+    await A.seedFile('123.md', '', 1000);          // 1. A: empty
+    await client(api, A).runSync();
+    await client(api, B).runSync();                // 2. B: empty
+    expect(await len(B, '123.md')).toBe(0);
+
+    await A.editFile('123.md', '3\n', 2000);       // 3. A: add text
+    await client(api, A).runSync();
+    await client(api, B).runSync();                // 4. B: gets text
+    expect(await text(B, '123.md')).toBe('3\n');
+
+    await B.editFile('123.md', '', 3000);          // 5. B: empty it again
+    await client(api, B).runSync();
+
+    A.applied.length = 0;
+    await client(api, A).runSync();                // 6. A: pulls the empty
+
+    // A must fast-forward to the empty (B derived it straight from A's "3\n"), not
+    // three-way-merge against A's stale empty ancestor and keep "3\n".
+    expect(A.applied.some(a => a.type === 'conflict' || a.type === 'delete_conflict')).toBe(false);
+    expect(await text(A, '123.md')).toBe('');
+    expect(await text(B, '123.md')).toBe('');
+  });
+
+  test('sequential content edits never union/duplicate (FF, the 3→4 lineage)', async () => {
+    const api = new FakeSyncServer();
+    const [A, B] = await pair(api);
+
+    await A.seedFile('123.md', '', 1000);
+    await client(api, A).runSync();
+    await client(api, B).runSync();
+
+    await A.editFile('123.md', '3\n', 2000);
+    await client(api, A).runSync();
+    await client(api, B).runSync();
+    expect(await text(B, '123.md')).toBe('3\n');
+
+    await B.editFile('123.md', '4\n', 3000);       // B edits 3 → 4 (having seen "3")
+    await client(api, B).runSync();
+
+    A.applied.length = 0;
+    await client(api, A).runSync();                // A (holding "3") pulls "4"
+
+    // The bug produced "3\n4\n" (empty-ancestor diff3 union). With the FF, A adopts
+    // "4" cleanly — B's edit descends directly from A's current content.
+    expect(await text(A, '123.md')).toBe('4\n');
+    expect(A.applied.some(a => a.type === 'conflict')).toBe(false);
+  });
+
   // ── G12: the REAL truncation protection lives in state-merge, not a blanket
   //    applicator refusal. When the HLC-winning side's bytes are genuinely missing,
   //    the merge returns no_op — it NEVER emits a truncating empty write_local — so
