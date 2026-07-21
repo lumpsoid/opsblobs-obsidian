@@ -299,10 +299,17 @@ function resolveContentConflict(
     // Clean merge — write result locally and send to remote
     const merged = mergeResult.merged.join('\n');
     const content = new TextEncoder().encode(merged);
+    // Follow the rename: when the two sides disagree on the path — one side renamed
+    // the file in the same round it edited it — the write must land at the winning
+    // side's path, not blindly the local one. Using `le.path` wrote the new content
+    // at the OLD path and silently dropped the rename (H5). Higher HLC wins,
+    // consistent with the `hlcMax` stamped below and with `resolveRenameConflict`.
+    // For the common no-rename case both paths are equal, so this is a no-op.
+    const pathWinner = hlcCompare(le.hlcTimestamp, re.hlcTimestamp) >= 0 ? le : re;
     return {
       type: 'write_local',
       fileId,
-      path: le.path,
+      path: pathWinner.path,
       content,
       hlc: hlcMax(le.hlcTimestamp, re.hlcTimestamp),
     };

@@ -71,17 +71,12 @@ describe('two-device happy paths', () => {
 
   // ── H5 ─────────────────────────────────────────────────────────────────────
   //
-  //  BUG (found by this test — currently skipped): a rename combined with a content
-  //  edit before syncing does NOT propagate the rename to the peer. A emits a `move`
-  //  op then an `update` op for the same file; `reconstructRemoteState` keeps only
-  //  ONE op per file (the highest-HLC one = the update, whose path is new.md but
-  //  whose merge action is a content `write_local`), and `mergeVaultStates` applies
-  //  that write at B's LOCAL path (old.md), dropping the move. Observed: B ends up
-  //  with the NEW content at the OLD path (old.md), no entry at new.md — and on the
-  //  next round B even `send_remote`s the stale path back, so the divergence can
-  //  propagate. Un-skip once the projection/merge carries a same-round move+update
-  //  as both a path change and a content change. See docs/sync-test-coverage-spec.md H5.
-  test.skip('H5 (BUG): a rename that also changes content propagates — new path, new bytes, id stable, old path gone', async () => {
+  //  A rename combined with a content edit in the same round propagates as BOTH a
+  //  path change and a content change. Previously the clean-merge `write_local`
+  //  targeted the local (old) path, so the peer got the new content at the old path
+  //  and the rename was silently dropped. Fixed by targeting the rename-winning
+  //  path in state-merge and trashing the stale old path in the applicator.
+  test('H5: a rename that also changes content propagates — new path, new bytes, id stable, old path gone', async () => {
     const server = new FakeSyncServer();
     const A = await TestDevice.create('dev-a');
     const B = await TestDevice.create('dev-b');
@@ -107,6 +102,11 @@ describe('two-device happy paths', () => {
     expect(await onDisk(B, 'new.md')).toBe('body v2\n');
     expect(await onDisk(B, 'old.md')).toBeNull();
     expect(B.entry(id)!.contentHash).toBe(A.entry(id)!.contentHash);
+    // The registry must not leave the old path indexed (a stale path→id mapping
+    // would let a later reconcile tombstone the moved file or block a new file at
+    // old.md). The moved id is the ONLY entry, now at new.md.
+    expect(B.entryByPath('old.md')).toBeUndefined();
+    expect(B.entry(id)!.path).toBe('new.md');
   });
 
   // The working variant of the same intent: when the rename and the edit are synced

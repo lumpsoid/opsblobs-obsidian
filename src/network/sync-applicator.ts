@@ -129,14 +129,22 @@ export class SyncApplicator {
   ): Promise<PendingResolution | null> {
     switch (action.type) {
       case 'write_local': {
-        if (await this.driftedSinceSnapshot(action.fileId, action.path, local)) {
+        // Where this file currently lives on THIS device. It differs from
+        // `action.path` only when the winning side renamed the file in the same
+        // round it edited it (H5): the write lands at the new path and the stale
+        // copy at `currentPath` is trashed below. Drift/truncation are judged at
+        // `currentPath` (where our bytes actually are), not the incoming new path.
+        const localEntry = local.fileEntries.get(action.fileId);
+        const currentPath = localEntry && !localEntry.deleted ? localEntry.path : action.path;
+
+        if (await this.driftedSinceSnapshot(action.fileId, currentPath, local)) {
           deferred.add(action.fileId);
-          console.warn(`Vault Sync: deferring write_local for ${action.path} — on-disk content changed during the sync window (F5)`);
+          console.warn(`Vault Sync: deferring write_local for ${currentPath} — on-disk content changed during the sync window (F5)`);
           return null;
         }
         const hash = await hashContent(action.content);
-        if (await this.wouldTruncateNonEmpty(action.path, action.content)) {
-          console.warn(`Vault Sync: skipping write_local for ${action.path} — refusing to truncate a non-empty file with empty content`);
+        if (await this.wouldTruncateNonEmpty(currentPath, action.content)) {
+          console.warn(`Vault Sync: skipping write_local for ${currentPath} — refusing to truncate a non-empty file with empty content`);
           return null;
         }
         await this.files.write(action.path, action.content);
@@ -150,6 +158,13 @@ export class SyncApplicator {
         // the id before the create event fires) stops that event from minting a
         // fresh duplicate id for the same path.
         await this.registry.adoptRemote(action.fileId, action.path, hash, action.hlc);
+        // The file was renamed as part of this merge (H5): remove the now-stale
+        // copy at its previous path so the rename isn't left as a duplicate. Guarded
+        // on inequality (the common no-rename write never trashes) and tolerant of
+        // an already-absent old file.
+        if (currentPath !== action.path) {
+          await this.files.trash(currentPath);
+        }
         return null;
       }
 

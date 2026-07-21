@@ -149,6 +149,14 @@ export class FileRegistry {
     if (existingId && existingId !== id) {
       this.entries.delete(existingId);
     }
+    // If this id currently lives at a DIFFERENT path, drop that stale path→id
+    // mapping — otherwise a rename adopted alongside a content merge (H5) leaves
+    // the old path indexed, so a later reconcile could tombstone the moved file or
+    // refuse to track a new file created at the old path.
+    const prev = this.entries.get(id);
+    if (prev && prev.path !== path) {
+      this.pathIndex.delete(prev.path);
+    }
     this.entries.set(id, {
       id,
       path,
