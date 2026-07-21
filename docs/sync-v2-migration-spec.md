@@ -59,25 +59,55 @@ orchestrator:
 
 ## Step 2 — Content DAG + LCA merge base
 
-**Goal:** compute the three-way base from the DAG, not the scalar ancestor.
+**Design note (why a persisted store).** An LCA walk needs the parent links of
+*past* versions, but pending ops are cleared after push and pulls are incremental,
+so no in-flight op list holds the full history. The DAG must therefore be
+**persisted and accumulated** — every op ever authored or pulled contributes its
+`(contentHash → parents, fileId)` edge. Parent links are just hashes (tiny), so the
+DAG is retained even after content GC drops the bytes (enabling "we know the base
+but not its bytes → degrade to conflict"). Split into a safe mechanical half (2a)
+and the behavior change (2b).
+
+### Step 2a — Persisted version-DAG store (behavior-preserving)
 
 **Changes**
-- New pure module `merge/content-dag.ts`: build `Map<fileId, DAG>` from an ordered
-  op list; `mergeBase(dag, a, b)` returns the LCA content hash (or a marker for
-  "multiple/again none"). Ancestor-reachability helper for fast-forward.
-- Thread the op history into the merge: `buildLocalState` / the round provide the
-  parent map (local pending ops + pulled ops) so `mergeVaultStates` can call
-  `mergeBase`. `VaultState` gains the DAG (or a parent lookup) instead of relying on
-  per-entry `ancestorContentHash`.
-- `merge/state-merge.ts`: in `resolveContentConflict`, use `mergeBase(localHead,
-  remoteHead)` for the three-way base and reachability for fast-forward. Keep the
-  existing conflict/clean outcomes.
+- New pure module `core/version-dag.ts`: an in-memory DAG of `contentHash →
+  { parents: string[]; fileId: string }` with `addVersion(hash, parents, fileId)`
+  (idempotent, union of parents), `isAncestor(maybeAncestor, descendant)`
+  (reachability via parent walk, cycle-safe), and `mergeBase(a, b)` returning the
+  lowest common ancestor hash, `null` if none, or a sentinel for "multiple bases"
+  (ambiguous criss-cross). Pure; no I/O.
+- New `network/version-dag-store.ts` (modeled on `cursor-store.ts`): load/save the
+  DAG to `.vault-sync/version-dag.json` with a defensive `load()`.
+- Populate it at every point an op is minted or pulled:
+  - `core/operation-logger.ts` — after emitting each op, record its edge.
+  - `network/server-sync.ts` — after decrypting each pulled op, record its edge.
+  (Prefer a single choke point if one exists; otherwise both.)
+- Wire construction in `main.ts` and `TestDevice`; load in the init sequence.
 
-**Done when** all merge tests pass using the DAG-computed base; the FF and
-concurrent-conflict cases are driven by reachability/LCA. `ancestorContentHash`
-still exists but is no longer *read* by the merge.
+**Done when** the DAG is persisted and accumulates edges across a round and a
+reload, and the full suite is still green. Nothing reads the DAG for merge yet.
 
-**Commit:** `feat(merge): derive three-way base from a content DAG (LCA), not the scalar ancestor`
+**Commit:** `feat(sync): persist a content version-DAG (parent links) for LCA`
+
+### Step 2b — Merge computes the base from the DAG
+
+**Changes**
+- `merge/state-merge.ts`: `mergeVaultStates(local, remote, dag?)` — new optional
+  `dag` param (a `VersionDag`). In `resolveContentConflict`, when the DAG is present
+  use `dag.mergeBase(le.contentHash, re.contentHash)` for the three-way base and
+  `dag.isAncestor` for fast-forward (both directions). Fall back to the current
+  `ancestorContentHash`/single-parent behavior when the DAG is absent or lacks a
+  path (keeps old tests green until Step 3). A "multiple bases" sentinel → surface a
+  conflict (never guess).
+- Thread the DAG through the round: `server-sync.runSync` builds the union DAG (the
+  persisted store is already the union) and passes it to `mergeVaultStates`.
+
+**Done when** FF and concurrent-conflict cases are driven by DAG
+reachability/LCA; `core.test.ts` and `concurrent-conflict-dataloss` pass via the
+DAG path. `ancestorContentHash` still exists but the merge no longer needs it.
+
+**Commit:** `feat(merge): derive three-way base from the content DAG (LCA), not the scalar ancestor`
 
 ## Step 3 — Retire `ancestor-policy` and `ancestorContentHash`
 
