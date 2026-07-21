@@ -157,14 +157,25 @@ export default class VaultSyncPlugin extends Plugin {
       },
     });
 
-    // Reconcile registry with current vault AND emit ops for anything that
-    // changed while we weren't listening — crucially, the files already present
-    // on a first enable (no create event ever fires for them). Without this the
-    // existing vault would never be pushed; only post-enable edits would sync.
-    await this.opLogger.captureOfflineChanges();
-
-    // Start listening for vault changes
-    this.opLogger.startListening();
+    // Defer the first reconciliation until the workspace layout is ready:
+    // `app.vault.getFiles()` is NOT reliably populated during `onload`, and
+    // diffing the registry against an empty/partial listing would mark every
+    // tracked file "vanished while offline" and emit a phantom delete for the
+    // whole vault — which then propagates to every peer (silent data loss).
+    // `onLayoutReady` runs the callback immediately if the layout is already up.
+    this.app.workspace.onLayoutReady(() => {
+      void (async () => {
+        // Reconcile registry with current vault AND emit ops for anything that
+        // changed while we weren't listening — crucially, the files already
+        // present on a first enable (no create event ever fires for them).
+        // Without this the existing vault would never be pushed; only post-enable
+        // edits would sync. (The engine also guards an empty listing as a
+        // belt-and-suspenders phantom-delete backstop.)
+        await this.opLogger.captureOfflineChanges();
+        // Start listening for vault changes.
+        this.opLogger.startListening();
+      })();
+    });
 
     // Derive the vault key up front so auto-sync can run unattended.
     await this.tryDeriveVaultKey();

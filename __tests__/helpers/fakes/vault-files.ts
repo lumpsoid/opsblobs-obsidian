@@ -10,8 +10,18 @@ import { VaultFiles, VaultFileRef } from '../../../src/ports/vault-files';
 
 export class FakeVaultFiles implements VaultFiles {
   private files = new Map<string, Uint8Array>();
+  private listingReady = true;
+
+  /** Test hook: reproduce Obsidian's cold-start window where `getFiles()` is not
+   *  yet populated even though the files are on disk (readable). While `false`,
+   *  `list()` reports empty but `read`/`exists` still work — the exact shape of
+   *  the startup race that produced phantom deletes. */
+  setListingReady(ready: boolean): void {
+    this.listingReady = ready;
+  }
 
   list(): VaultFileRef[] {
+    if (!this.listingReady) return [];
     return Array.from(this.files.keys()).map(path => ({ path }));
   }
 

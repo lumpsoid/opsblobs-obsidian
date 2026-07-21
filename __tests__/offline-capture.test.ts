@@ -91,6 +91,82 @@ describe('first-enable on a pre-existing vault (H10)', () => {
   });
 });
 
+describe('cold-start listing race — phantom-delete guard', () => {
+  // Obsidian's `app.vault.getFiles()` is not reliably populated during `onload`;
+  // on an unlucky cold start it returns empty even though the files are on disk.
+  // If `captureOfflineChanges` trusted that empty listing it would mark EVERY
+  // tracked file "vanished while offline" and emit a delete op for the whole
+  // vault — which then propagates to peers as data loss / delete conflicts. The
+  // guard: an empty listing while the registry still holds active entries is
+  // treated as not-yet-ready, and the delete pass is skipped. (Found in the wild:
+  // a two-vault test showed one device's registry tombstoning a present file and
+  // the peer surfacing a bogus "file is deleted" conflict.)
+
+  test('an empty vault listing (index not ready) never tombstones tracked files', async () => {
+    const server = new FakeSyncServer();
+    const A = await TestDevice.create('dev-a');
+    const id = await A.seedFile('my.md', '1\n2\n3\n', 1000);
+    await client(server, A).runSync();            // durably synced + tracked
+    expect(A.pendingOps).toHaveLength(0);
+    expect(A.entryByPath('my.md')!.deleted).toBe(false);
+
+    // Cold start: the file is still on disk (readable) but `getFiles()` has not
+    // been populated, so the listing comes back empty — the exact race.
+    A.files.setListingReady(false);
+    await A.opLogger.captureOfflineChanges();
+
+    // The guard must refuse: no delete op, entry stays live, no phantom to push.
+    expect(A.pendingOps.filter(op => op.type === 'delete')).toEqual([]);
+    expect(A.pendingOps).toHaveLength(0);
+    expect(A.entry(id)!.deleted).toBe(false);
+
+    // Once the listing is ready again, a no-change capture stays clean.
+    A.files.setListingReady(true);
+    await A.opLogger.captureOfflineChanges();
+    expect(A.pendingOps).toHaveLength(0);
+    expect(A.entry(id)!.deleted).toBe(false);
+  });
+
+  test('the phantom delete never reaches a peer (no delete/modify conflict on the other device)', async () => {
+    const server = new FakeSyncServer();
+    const A = await TestDevice.create('dev-a');
+    await A.seedFile('my.md', 'hello\n', 1000);
+    await client(server, A).runSync();
+
+    const B = await TestDevice.create('dev-b');
+    await client(server, B).runSync();
+    expect(await read(B, 'my.md')).toBe('hello\n');
+
+    // A restarts into the cold-start race, captures, then the listing recovers and
+    // A syncs. No tombstone must have been queued while the listing was empty.
+    A.files.setListingReady(false);
+    await A.opLogger.captureOfflineChanges();
+    A.files.setListingReady(true);
+    await client(server, A).runSync();
+
+    // B syncs again: it must NOT see a delete for my.md (nothing was pushed).
+    await client(server, B).runSync();
+    expect(await read(B, 'my.md')).toBe('hello\n');
+    expect(B.entryByPath('my.md')!.deleted).toBe(false);
+    expect(B.applied.some(a => a.type === 'delete_local' || a.type === 'delete_conflict')).toBe(false);
+  });
+
+  test('a genuine offline delete is still detected once the listing is ready', async () => {
+    const A = await TestDevice.create('dev-a');
+    const keepId = await A.seedFile('keep.md', 'a\n', 1000);
+    const goneId = await A.seedFile('gone.md', 'b\n', 1100);
+
+    // A real offline removal: the file is gone from disk AND the listing reflects
+    // it (non-empty — keep.md is still there), so the guard does NOT trip.
+    await A.files.trash('gone.md');
+    await A.opLogger.captureOfflineChanges();
+
+    expect(A.pendingOps.some(op => op.type === 'delete' && op.fileId === goneId)).toBe(true);
+    expect(A.entry(goneId)!.deleted).toBe(true);
+    expect(A.entry(keepId)!.deleted).toBe(false);
+  });
+});
+
 describe('create-then-delete before any sync (G11)', () => {
   test('a peer never materialises a file that was created and deleted before its first sync', async () => {
     const server = new FakeSyncServer();

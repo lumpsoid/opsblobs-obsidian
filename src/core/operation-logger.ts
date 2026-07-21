@@ -119,16 +119,40 @@ export class OperationLogger {
     }
 
     // ── Registry entries whose file vanished while offline → delete ──────────
-    for (const entry of this.registry.getActiveEntries()) {
-      if (this.isExcluded(entry.path) || onDisk.has(entry.path)) continue;
-      const hlcTs = this.hlc.now();
-      await this.registry.markDeleted(entry.path, hlcTs);
-      // A never-captured placeholder ('' hash) was never synced to any peer, so
-      // its deletion is a local-only tombstone — emitting a delete op would leak
-      // the '' sentinel and reference content no peer holds (audit G).
-      if (entry.contentHash === '') continue;
-      this.pendingOps.push(Ops.delete(entry.id, entry.path, entry.contentHash, hlcTs));
-      changed = true;
+    // Guard against a phantom mass-delete. `files.list()` can come back empty
+    // (Obsidian's `getFiles()` is not reliably populated during the cold-start
+    // window, before the vault index fills in). If we trusted that empty listing,
+    // EVERY tracked file would look "vanished while offline" and we'd emit a
+    // delete op for the whole vault and push it to every peer — a catastrophic
+    // silent divergence (a peer then trashes real data, or it resurfaces as a
+    // delete/modify conflict). An empty listing while the registry still holds
+    // active, non-excluded entries means the listing is untrustworthy, not the
+    // vault genuinely emptied: skip the deletion pass entirely. A real offline
+    // delete re-propagates on a later capture once the listing is reliable —
+    // deferring a delete is always safe, emitting a phantom one is not (G13: for
+    // a data-safety tool, bias against the destructive false positive). main.ts
+    // also defers this call to `onLayoutReady` to keep the listing populated.
+    const activeEntries = this.registry
+      .getActiveEntries()
+      .filter(entry => !this.isExcluded(entry.path));
+    if (onDisk.size === 0 && activeEntries.length > 0) {
+      console.warn(
+        `[vault-sync] captureOfflineChanges: vault listing came back empty while ` +
+          `${activeEntries.length} file(s) are still tracked — treating the listing ` +
+          `as not-yet-ready and skipping delete detection this pass (phantom-delete guard).`,
+      );
+    } else {
+      for (const entry of activeEntries) {
+        if (onDisk.has(entry.path)) continue;
+        const hlcTs = this.hlc.now();
+        await this.registry.markDeleted(entry.path, hlcTs);
+        // A never-captured placeholder ('' hash) was never synced to any peer, so
+        // its deletion is a local-only tombstone — emitting a delete op would leak
+        // the '' sentinel and reference content no peer holds (audit G).
+        if (entry.contentHash === '') continue;
+        this.pendingOps.push(Ops.delete(entry.id, entry.path, entry.contentHash, hlcTs));
+        changed = true;
+      }
     }
 
     if (changed) await this.saveOpLog();

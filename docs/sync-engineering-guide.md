@@ -213,6 +213,17 @@ test; the *classes* are what to watch for.
   **Lesson:** transient files must leave no trace on the wire.
 - **Orphaned status (badge-clear).** See §5.4. **Lesson:** convergence, not handler
   invocation, is the signal.
+- **Cold-start phantom delete (listing race).** `captureOfflineChanges` diffs the
+  registry against `files.list()` (`app.vault.getFiles()`) and emits a `delete` for any
+  tracked file not in the listing. Obsidian does **not** populate `getFiles()` during
+  `onload`, so on an unlucky cold start the listing was empty, *every* tracked file looked
+  "vanished," and the whole vault was tombstoned + pushed to peers (which then surfaced a
+  bogus "file is deleted" conflict). Two-layer fix: `main.ts` defers the first capture to
+  `workspace.onLayoutReady`, and `captureOfflineChanges` **skips the delete pass when the
+  listing is empty while active entries remain** (an empty listing is far likelier to mean
+  "index not ready" than "user deleted the whole vault"; deferring a delete is safe,
+  emitting a phantom one is not — same G13 bias). **Lesson:** never derive a *destructive*
+  op from a single enumeration that a host populates lazily; confirm the source is ready.
 
 Meta-lesson across all of them: **the dangerous failures are silent** — an edit that
 doesn't propagate, content at the wrong path, a file that won't empty, a badge that never
