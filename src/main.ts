@@ -25,6 +25,7 @@ import { ConflictResolutionModal } from './ui/conflict-modal';
 import { DeleteConflictModal } from './ui/delete-conflict-modal';
 import { BinaryConflictModal } from './ui/binary-conflict-modal';
 import { SyncStatusModal } from './ui/sync-status-modal';
+import { ConfirmModal } from './ui/confirm-modal';
 import { SyncSettingTab } from './ui/settings-tab';
 
 // ─── Ribbon icon SVG ────────────────────────────────────────────────────────
@@ -425,11 +426,33 @@ export default class VaultSyncPlugin extends Plugin {
     return before - after;
   }
 
-  /** Rebuild sync metadata: re-scan the vault into the registry and drop the
-   *  pending oplog. Vault content is never touched. */
+  /**
+   * Rebuild sync metadata non-destructively: re-scan the vault into the registry,
+   * then re-capture every on-disk file as ops via `captureOfflineChanges` — never
+   * dropping the pending oplog. The old path cleared pending ops outright, silently
+   * discarding un-synced local changes (S3); this instead re-derives ops from the
+   * true disk state, so nothing the user hasn't synced is lost. Vault content is
+   * never touched.
+   *
+   * If there are un-synced pending ops, confirm first — the user should understand
+   * those changes will be re-captured (and pushed next sync), not discarded.
+   */
   async resetSyncState(): Promise<void> {
+    const pending = this.opLogger.getPendingOps().length;
+    if (pending > 0) {
+      const confirmed = await new Promise<boolean>(resolve => {
+        new ConfirmModal(this.app, {
+          title: 'Rebuild sync metadata?',
+          message:
+            `${pending} unsynced change${pending !== 1 ? 's' : ''} will be re-captured from disk ` +
+            'and pushed on the next sync — nothing is discarded. Vault content is never touched.',
+          confirmText: 'Rebuild',
+        }, resolve).open();
+      });
+      if (!confirmed) return;
+    }
     await this.registry.reconcileWithVault(this.hlc.now());
-    await this.opLogger.clearOps();
+    await this.opLogger.captureOfflineChanges();
     this.updateStatusBar();
   }
 

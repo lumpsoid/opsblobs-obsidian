@@ -1,5 +1,6 @@
-/* Delete-conflict modal (main.ts) */
-.delete-conflict-buttons {
+/* Delete-conflict modal (main.ts) + generic confirm modal */
+.delete-conflict-buttons,
+.confirm-modal-buttons {
   display: flex;
   gap: 0.75rem;
   margin-top: 1.25rem;

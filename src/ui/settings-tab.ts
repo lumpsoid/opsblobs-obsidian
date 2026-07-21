@@ -280,8 +280,9 @@ export class SyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Reset sync state')
-      .setDesc('Rebuild the file registry from the vault and clear pending operations. ' +
-        'Use if sync metadata is corrupted. Vault content is never touched.')
+      .setDesc('Rebuild the file registry from the vault and re-capture every file as ' +
+        'pending operations. Use if sync metadata is corrupted. Un-synced changes are ' +
+        're-captured and pushed on the next sync — never discarded. Vault content is never touched.')
       .addButton(btn => {
         btn.setButtonText('Reset').setWarning().onClick(async () => {
           btn.setDisabled(true);
