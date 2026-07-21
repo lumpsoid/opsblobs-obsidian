@@ -2,7 +2,7 @@
 //  Obsidian Vault Sync — Main Plugin Entry
 // ─────────────────────────────────────────────
 
-import { Plugin, Notice, addIcon } from 'obsidian';
+import { Plugin, Notice, addIcon, MarkdownView } from 'obsidian';
 import { SyncSettings, DEFAULT_SETTINGS } from './types';
 import { HybridLogicalClock } from './core/hlc';
 import { FileRegistry } from './core/file-registry';
@@ -232,6 +232,28 @@ export default class VaultSyncPlugin extends Plugin {
 
   // ─── Sync ─────────────────────────────────────────────────────────────────
 
+  /**
+   * Best-effort flush of unsaved editor buffers to disk before a sync, so the
+   * drift capture in `triggerSync` sees the latest bytes rather than a stale disk
+   * copy. Obsidian persists the editor on its own idle debounce anyway, so this
+   * only narrows the window — and it must never throw (fully guarded): the on-disk
+   * `captureOfflineChanges` pass is the actual safety net. `save` is accessed
+   * defensively because its presence in the public typings varies across Obsidian
+   * versions.
+   */
+  private async forceSaveOpenEditors(): Promise<void> {
+    try {
+      for (const leaf of this.app.workspace.getLeavesOfType('markdown')) {
+        const view = leaf.view;
+        if (!(view instanceof MarkdownView)) continue;
+        const save = (view as unknown as { save?: () => Promise<void> }).save;
+        if (typeof save === 'function') await save.call(view);
+      }
+    } catch (err) {
+      console.warn('Vault Sync: force-save of open editors failed (non-fatal):', err);
+    }
+  }
+
   private async triggerSync(source: 'manual' | 'auto'): Promise<void> {
     if (this.syncInProgress) {
       if (source === 'manual') new Notice('Sync already in progress.');
@@ -255,10 +277,19 @@ export default class VaultSyncPlugin extends Plugin {
     this.updateRibbonState('syncing');
 
     try {
-      // Capture any edit still waiting in the debounce window as an op *before*
-      // building local state, so an edit-then-immediately-sync isn't raced and
-      // silently dropped by the merge.
+      // Get every just-made edit onto disk and into an op *before* building local
+      // state — otherwise an edit made moments before pressing sync is pushed only
+      // on a LATER round (the reported "sync doesn't take my change" bug). Three
+      // stages, cheapest first:
+      //   1. force-save unsaved editor buffers so their bytes reach disk;
+      //   2. flush() drains already-armed debounce timers (the fast path);
+      //   3. captureOfflineChanges() re-hashes every live file against the registry
+      //      and emits an op for any drift — the real safety net, since it captures
+      //      an edit even when its `modify` event hasn't fired yet. Idempotent, so
+      //      running it every sync never duplicates ops.
+      await this.forceSaveOpenEditors();
       await this.opLogger.flush();
+      await this.opLogger.captureOfflineChanges();
 
       const api = new HttpServerApi({
         baseUrl: this.settings.serverUrl,
