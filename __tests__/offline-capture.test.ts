@@ -119,19 +119,12 @@ describe('create-then-delete before any sync (G11)', () => {
     expect(B.activeEntries().map(e => e.path)).toEqual(['keep.md']);
   });
 
-  // KNOWN BUG (skipped, not forced green) — see report.
-  // `handleDelete` calls `pruneCreateDeletePair(id)` (which removes the un-synced
-  // create), but then STILL `recordOp(Ops.delete(...))`. So a file created and
-  // deleted before any sync does NOT fully cancel: a phantom `delete` op survives
-  // and is pushed to the server, referencing a contentHash whose blob was never
-  // uploaded (the create was pruned). The comment on pruneCreateDeletePair —
-  // "remove both ops. They cancel out — remote doesn't know the file ever existed"
-  // — describes the INTENDED behaviour this test pins. It's currently only
-  // cosmetically harmless (a peer no-ops the orphan tombstone, as the test above
-  // proves), but it's a spurious op / audit-G-style leak of an unheld contentHash.
-  // Fix: have handleDelete skip recordOp when pruneCreateDeletePair pruned a create
-  // (i.e. the file was never synced). Then un-skip this test.
-  test.skip('the create/delete pair fully cancels — no op for the transient file is ever pushed', async () => {
+  // A file created and deleted before any sync fully cancels: `handleDelete` sees
+  // that `pruneCreateDeletePair` removed an un-synced create and emits NO delete op,
+  // so nothing tmp-shaped is ever pushed — not even a tombstone referencing a
+  // contentHash whose blob was never uploaded (which would be a phantom / audit-G
+  // leak). The registry tombstone still stands locally.
+  test('the create/delete pair fully cancels — no op for the transient file is ever pushed', async () => {
     const server = new FakeSyncServer();
     const A = await TestDevice.create('dev-a');
     await A.seedFile('keep.md', 'keep me\n', 1000);

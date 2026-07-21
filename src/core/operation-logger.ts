@@ -294,8 +294,15 @@ export class OperationLogger {
     // local-only tombstone; emitting an op would leak the '' sentinel (audit G).
     if (entry.contentHash === '') return;
 
-    // If there's a pending create for this file, cancel them out
-    this.pruneCreateDeletePair(entry.id);
+    // A file created then deleted before any sync never reached a peer, so the
+    // pair fully cancels: prune the un-synced create and emit NO delete op (a
+    // tombstone op would reference a contentHash whose blob was never uploaded —
+    // a phantom, audit-G-adjacent leak). The registry tombstone above still
+    // stands. Persist the pruned log ourselves, since we skip `recordOp`.
+    if (this.pruneCreateDeletePair(entry.id)) {
+      await this.saveOpLog();
+      return;
+    }
 
     await this.recordOp(Ops.delete(entry.id, path, entry.contentHash, hlcTs));
   }
@@ -379,17 +386,19 @@ export class OperationLogger {
   }
 
   /**
-   * If a file was created then deleted before any sync, remove both ops.
-   * They cancel out — remote doesn't know the file ever existed.
+   * If a file was created then deleted before any sync, remove the create (and any
+   * subsequent pending ops for it). They cancel out — remote never learned the file
+   * existed. Returns whether a pending create was found and pruned, so the caller
+   * knows to emit no delete op for the fully-cancelled pair.
    */
-  private pruneCreateDeletePair(fileId: string): void {
-    const createIdx = this.pendingOps.findIndex(
+  private pruneCreateDeletePair(fileId: string): boolean {
+    const hasPendingCreate = this.pendingOps.some(
       op => op.fileId === fileId && op.type === 'create',
     );
-    if (createIdx !== -1) {
-      // Remove the create and all subsequent ops for this file
-      this.pendingOps = this.pendingOps.filter(op => op.fileId !== fileId);
-    }
+    if (!hasPendingCreate) return false;
+    // Remove the create and all subsequent ops for this file.
+    this.pendingOps = this.pendingOps.filter(op => op.fileId !== fileId);
+    return true;
   }
 
   // ─── Helpers ─────────────────────────────────────────────────────────────
