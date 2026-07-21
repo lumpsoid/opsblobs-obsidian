@@ -216,7 +216,7 @@ across all three conflict kinds.)
 
 ---
 
-### F — No cross-op log integrity against the untrusted server `[Medium, threat-model dependent]`
+### F — No cross-op log integrity against the untrusted server `[Medium, threat-model dependent]` · ✅ DONE (decision recorded)
 
 **Location:** op format (no chaining field); `OpRecord` (`server-sync.ts:26-32`).
 
@@ -230,6 +230,25 @@ reordering but says nothing about completeness. The threat model already states
 **Recommended:** decide explicitly. Either add a chaining/attestation mechanism,
 or document in the spec that log-completeness is out of scope (availability, not
 integrity). Right now it's an unstated gap.
+
+**Resolution (decision, 2026-07-21):** log completeness is **out of scope for v1**
+— it is an *availability* property, not *integrity*. The threat model is now
+documented explicitly in `docs/server-api-spec.md` (new "Integrity guarantees vs.
+log completeness" subsection + §10 Out of scope) and cross-referenced from
+`docs/ops-sync-data-safety-spec.md` (non-goal note under the invariants). Rationale:
+
+- **Reorder** → neutralized by the convergent max-HLC-per-`fileId` fold.
+- **Replay** → neutralized; a stale op's lower HLC loses under LWW.
+- **Omission / truncation** → degrades to **staleness** (self-heals on delivery),
+  never fabricated/corrupt bytes (content-addressed + re-hashed on fetch) — so the
+  data-safety invariants hold even under a withholding server.
+
+The only property not provided is **freshness** (proving no op was withheld). A
+per-record `prevHash` chain does **not** compose with concurrent append (D1: no
+compare-and-swap, server-assigned `seq`); a **per-device** chain is feasible but
+catches only intra-device gaps, not tail-withholding. Full defense needs
+device-to-device high-water gossip or a trusted attestation — a **v2** candidate,
+not a format change now. **No op-format change.**
 
 ---
 

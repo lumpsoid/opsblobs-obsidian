@@ -51,6 +51,15 @@ never to fabricate, overwrite with empty, or silently clobber.
 5. **Monotonic logical time.** Locally-issued HLCs never regress below timestamps
    this device has already issued, even across restarts / wall-clock changes.
 
+**Non-goal — log completeness against a malicious server.** These invariants
+guard against *corruption*, not *incompleteness*. A withholding/truncating server
+degrades to **staleness** (the client converges to an older state that self-heals
+when the ops arrive), never to fabricated or overwritten bytes — content is
+content-addressed and re-hashed on fetch, and reorder/replay are absorbed by the
+convergent LWW-over-HLC fold. Proving the log is *complete* (a freshness/anti-fork
+guarantee) is explicitly out of v1 scope; see `docs/server-api-spec.md` §
+"Integrity guarantees vs. log completeness" and `OP_FORMAT_AUDIT.md` finding F.
+
 ### Test harness (use the REAL stack, never a reimplementation)
 
 - Pure merge findings (F1, F2, F6): unit-test `mergeVaultStates` directly with

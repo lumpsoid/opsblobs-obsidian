@@ -10,6 +10,31 @@ The server is **untrusted**: it stores only ciphertext and the minimum metadata 
 and route data. It never decrypts, and it never merges — **all merge/conflict resolution happens
 on the client** (see `src/merge/*`).
 
+### Integrity guarantees vs. log completeness (threat model)
+
+"Untrusted" is scoped precisely. The format defends **confidentiality** (E2E AES-256-GCM; the
+server sees only ciphertext + blinded hashes) and **per-record integrity** (GCM authenticates each
+`OpRecord` body — the server cannot forge or tamper an op without the key). It does **not** attempt
+to defend **log completeness** against a malicious server, and this is a deliberate v1 non-goal:
+
+- **Reorder** is neutralized by design — the client folds the log by max-HLC-per-`fileId`, so state
+  is replay-order-independent (`reconstructRemoteState`).
+- **Replay** of a stale op is neutralized — a lower HLC loses to newer state under LWW.
+- **Omission / truncation** (a server withholding ops, or a tail of them) degrades to **staleness**,
+  not corruption: the client converges to an older state that self-heals once the ops are delivered.
+  Content is content-addressed and **re-hashed on fetch**, so a withholding server can never cause
+  fabricated or corrupt bytes to land (upholds the data-safety invariants — no fabricated content,
+  no silent overwrite).
+
+The one property not provided is **freshness** — a client cannot *prove* it has seen every op a
+peer authored, so a deliberately withholding ("forking") server is indistinguishable from
+"hasn't synced yet." Closing that needs device-to-device high-water gossip or a trusted
+attestation; a per-record `prevHash` chain does **not** compose with concurrent append (D1: no
+compare-and-swap, server-assigned `seq` — a client can't know what precedes its op at append time).
+A **per-device** chain (each device chains its own ops by author) is feasible and catches gaps
+within one device's subsequence, but not tail-withholding. Both are candidate **v2** hardenings if
+freshness ever enters scope; see `OP_FORMAT_AUDIT.md` finding F.
+
 ---
 
 ## 1. Design decisions
@@ -249,3 +274,8 @@ same key yields the same HMAC across devices.
 
 Server implementation/hosting, storage backend, the token/account system internals, billing,
 and any server-side merge (there is none — see the top of this document).
+
+**Log completeness / freshness** against a malicious or buggy server is out of scope for v1 —
+it is an *availability* property, not an integrity one (omission/truncation/replay all degrade to
+staleness, never silent corruption; see [Integrity guarantees vs. log completeness](#integrity-guarantees-vs-log-completeness-threat-model)).
+Detecting deliberate withholding would require gossip or attestation; revisit in v2.
