@@ -2,7 +2,7 @@
 //  Obsidian Vault Sync — Main Plugin Entry
 // ─────────────────────────────────────────────
 
-import { Plugin, Notice, addIcon, MarkdownView } from 'obsidian';
+import { Plugin, Notice, addIcon } from 'obsidian';
 import { SyncSettings, DEFAULT_SETTINGS } from './types';
 import { HybridLogicalClock } from './core/hlc';
 import { FileRegistry } from './core/file-registry';
@@ -10,7 +10,7 @@ import { ContentStore } from './core/content-store';
 import { randomUuid } from './core/encoding';
 import { OperationLogger } from './core/operation-logger';
 import { resolveDeleteStrategy } from './core/conflict-policy';
-import { SyncApplicator, DEFER_CONFLICT } from './network/sync-applicator';
+import { SyncApplicator } from './network/sync-applicator';
 import { ObsidianVaultFiles } from './network/obsidian-vault-files';
 import { ObsidianMetadataStore } from './network/obsidian-metadata-store';
 import { ObsidianVaultWatcher } from './network/obsidian-vault-watcher';
@@ -27,6 +27,9 @@ import { BinaryConflictModal } from './ui/binary-conflict-modal';
 import { SyncStatusModal } from './ui/sync-status-modal';
 import { ConfirmModal } from './ui/confirm-modal';
 import { SyncSettingTab } from './ui/settings-tab';
+import { SyncCoordinator } from './network/sync-coordinator';
+import { ObsidianEditorSaver } from './network/obsidian-editor-saver';
+import { ObsidianNotifier } from './network/obsidian-notifier';
 
 // ─── Ribbon icon SVG ────────────────────────────────────────────────────────
 const SYNC_ICON_ID = 'vault-sync-icon';
@@ -43,23 +46,19 @@ export default class VaultSyncPlugin extends Plugin {
   private opLogger!: OperationLogger;
   private applicator!: SyncApplicator;
   private syncState!: SyncStateStore;
+  private coordinator!: SyncCoordinator;
   private crypto = new VaultCrypto();
 
   private ribbonIcon: HTMLElement | null = null;
   private statusBarItem: HTMLElement | null = null;
   private syncInProgress = false;
   private autoSyncHandle: number | null = null;
-  /** Source of the round currently running — read by the conflict-handler
-   *  closures so an unattended `'auto'` round defers conflicts (no blocking modal,
-   *  cursor held) instead of interrupting the user or silently consuming them
-   *  (S5). Safe as a single field: triggerSync runs at most one round at a time. */
-  private currentSyncSource: 'manual' | 'auto' = 'manual';
 
   /** Conflicts the user has skipped/dismissed and not yet resolved — drives the
    *  ribbon's "needs attention" state and the status modal. Read from the
-   *  persisted sync-state so it survives restarts. */
+   *  persisted sync-state (via the coordinator) so it survives restarts. */
   private outstandingConflictCount(): number {
-    return this.syncState.get().outstandingConflicts.length;
+    return this.coordinator.outstandingConflictCount();
   }
 
   // ─── Lifecycle ────────────────────────────────────────────────────────────
@@ -104,69 +103,32 @@ export default class VaultSyncPlugin extends Plugin {
       this.contentStore,
       this.opLogger,
       this.hlc,
-      // Conflict handler
-      async (action) => {
-        // Unattended auto-sync must not pop a blocking modal: record the conflict
-        // as outstanding and defer it (cursor held) to the next manual sync (S5).
-        if (this.currentSyncSource === 'auto') {
-          await this.syncState.recordConflict({ fileId: action.fileId, path: action.localPath, kind: 'content', firstSeen: Date.now() });
-          return DEFER_CONFLICT;
-        }
-        const resolved = await new Promise<Uint8Array | null>(resolve => {
-          new ConflictResolutionModal(
-            this.app,
-            action.localPath,
-            action.mergeResult,
-            action.localContent,
-            action.remoteContent,
-            resolve,
-          ).open();
-        });
-        // A skip (null) leaves the two devices divergent — record it as
-        // outstanding so it's visible and re-openable instead of vanishing. A real
-        // resolution clears any prior outstanding entry for this file.
-        if (resolved === null) {
-          await this.syncState.recordConflict({ fileId: action.fileId, path: action.localPath, kind: 'content', firstSeen: Date.now() });
-        } else {
-          await this.syncState.clearConflict(action.fileId);
-        }
-        return resolved;
-      },
-      // Delete conflict handler
-      async (action) => {
-        const strategy = resolveDeleteStrategy(this.settings.deleteConflictStrategy);
-        // 'ask' under auto-sync would open a modal — defer instead (S5). A
-        // non-'ask' strategy is the user's standing policy and still runs
-        // unattended, exactly as before.
-        if (strategy === 'ask' && this.currentSyncSource === 'auto') {
-          await this.syncState.recordConflict({ fileId: action.fileId, path: action.path, kind: 'delete', firstSeen: Date.now() });
-          return DEFER_CONFLICT;
-        }
-        const decision = strategy !== 'ask'
-          ? strategy
-          // 'ask' — let the user decide per file.
-          : await new Promise<'keep_deleted' | 'restore'>(resolve => {
-              new DeleteConflictModal(this.app, action.path, action.side, resolve).open();
-            });
-        // Delete conflicts always resolve (the modal defaults to 'restore' on
-        // dismiss), so clear any outstanding entry rather than recording a skip.
-        await this.syncState.clearConflict(action.fileId);
-        return decision;
-      },
-      // Binary conflict handler — binary files can't be three-way merged, so the
-      // user picks which whole version to keep (presented by filename + metadata).
-      async (action) => {
-        // Unattended auto-sync must not pop a blocking modal — defer (S5).
-        if (this.currentSyncSource === 'auto') {
-          await this.syncState.recordConflict({ fileId: action.fileId, path: action.localPath, kind: 'binary', firstSeen: Date.now() });
-          return DEFER_CONFLICT;
-        }
-        const decision = await new Promise<'keep_local' | 'keep_remote'>(resolve => {
-          new BinaryConflictModal(this.app, action, resolve).open();
-        });
-        await this.syncState.clearConflict(action.fileId);
-        return decision;
-      },
+      // Conflict handlers delegate the manual/auto branching + outstanding-conflict
+      // bookkeeping to the coordinator (S5); the plugin supplies only the Obsidian
+      // modal that a *manual* round opens to get the user's decision.
+      (action) =>
+        this.coordinator.decideContentConflict(action, a =>
+          new Promise<Uint8Array | null>(resolve => {
+            new ConflictResolutionModal(
+              this.app, a.localPath, a.mergeResult, a.localContent, a.remoteContent, resolve,
+            ).open();
+          }),
+        ),
+      (action) =>
+        this.coordinator.decideDeleteConflict(
+          resolveDeleteStrategy(this.settings.deleteConflictStrategy),
+          action,
+          a =>
+            new Promise<'keep_deleted' | 'restore'>(resolve => {
+              new DeleteConflictModal(this.app, a.path, a.side, resolve).open();
+            }),
+        ),
+      (action) =>
+        this.coordinator.decideBinaryConflict(action, a =>
+          new Promise<'keep_local' | 'keep_remote'>(resolve => {
+            new BinaryConflictModal(this.app, a, resolve).open();
+          }),
+        ),
     );
 
     // Load persisted state
@@ -175,6 +137,24 @@ export default class VaultSyncPlugin extends Plugin {
     await this.contentStore.init();
     await this.registry.load();
     await this.opLogger.load();
+
+    // The obsidian-free orchestrator: owns the capture sequence, the round
+    // outcome bookkeeping, the manual/auto conflict branching, and reset/rebaseline.
+    // The plugin keeps only the Obsidian glue (guards, ribbon, modals, settings).
+    this.coordinator = new SyncCoordinator({
+      editorSaver: new ObsidianEditorSaver(this.app),
+      notifier: new ObsidianNotifier(),
+      opLogger: this.opLogger,
+      syncState: this.syncState,
+      hlc: this.hlc,
+      registry: this.registry,
+      runRound: () => this.runRound(),
+      persistHlc: () => this.hlcStore.save(this.hlc.getCurrent()),
+      markSynced: async () => {
+        this.settings.lastSyncTime = Date.now();
+        await this.saveSettings();
+      },
+    });
 
     // Reconcile registry with current vault AND emit ops for anything that
     // changed while we weren't listening — crucially, the files already present
@@ -284,28 +264,38 @@ export default class VaultSyncPlugin extends Plugin {
 
   // ─── Sync ─────────────────────────────────────────────────────────────────
 
-  /**
-   * Best-effort flush of unsaved editor buffers to disk before a sync, so the
-   * drift capture in `triggerSync` sees the latest bytes rather than a stale disk
-   * copy. Obsidian persists the editor on its own idle debounce anyway, so this
-   * only narrows the window — and it must never throw (fully guarded): the on-disk
-   * `captureOfflineChanges` pass is the actual safety net. `save` is accessed
-   * defensively because its presence in the public typings varies across Obsidian
-   * versions.
-   */
-  private async forceSaveOpenEditors(): Promise<void> {
-    try {
-      for (const leaf of this.app.workspace.getLeavesOfType('markdown')) {
-        const view = leaf.view;
-        if (!(view instanceof MarkdownView)) continue;
-        const save = (view as unknown as { save?: () => Promise<void> }).save;
-        if (typeof save === 'function') await save.call(view);
-      }
-    } catch (err) {
-      console.warn('Vault Sync: force-save of open editors failed (non-fatal):', err);
-    }
+  /** Build and run one sync round, returning its summary. The plugin owns the
+   *  Obsidian-coupled transport wiring (HttpServerApi/host/progress); the
+   *  coordinator drives *when* this runs and what happens around it. */
+  private runRound(): Promise<SyncRoundSummary> {
+    const api = new HttpServerApi({
+      baseUrl: this.settings.serverUrl,
+      vaultId: this.settings.vaultId,
+      token: this.settings.serverToken,
+    });
+    const host = new PluginVaultSyncHost(
+      this.vaultFiles,
+      this.settings.deviceId,
+      this.registry,
+      this.contentStore,
+      this.opLogger,
+      this.applicator,
+      this.hlc,
+      new CursorStore(this.metadata),
+    );
+    const client = new ServerSyncClient({
+      api,
+      crypto: this.crypto,
+      host,
+      hlc: this.hlc,
+      onProgress: (label) => this.statusBarItem?.setText(`⟳ ${label}`),
+    });
+    return client.runSync();
   }
 
+  /** The Obsidian shell around a sync round: the reentrancy/config/crypto guards
+   *  and ribbon transitions. The round's actual work (capture → run → record) lives
+   *  in the obsidian-free {@link SyncCoordinator}. */
   private async triggerSync(source: 'manual' | 'auto'): Promise<void> {
     if (this.syncInProgress) {
       if (source === 'manual') new Notice('Sync already in progress.');
@@ -326,92 +316,17 @@ export default class VaultSyncPlugin extends Plugin {
     }
 
     this.syncInProgress = true;
-    this.currentSyncSource = source;
     this.updateRibbonState('syncing');
-
     try {
-      // Get every just-made edit onto disk and into an op *before* building local
-      // state — otherwise an edit made moments before pressing sync is pushed only
-      // on a LATER round (the reported "sync doesn't take my change" bug). Three
-      // stages, cheapest first:
-      //   1. force-save unsaved editor buffers so their bytes reach disk;
-      //   2. flush() drains already-armed debounce timers (the fast path);
-      //   3. captureOfflineChanges() re-hashes every live file against the registry
-      //      and emits an op for any drift — the real safety net, since it captures
-      //      an edit even when its `modify` event hasn't fired yet. Idempotent, so
-      //      running it every sync never duplicates ops.
-      await this.forceSaveOpenEditors();
-      await this.opLogger.flush();
-      await this.opLogger.captureOfflineChanges();
-
-      const api = new HttpServerApi({
-        baseUrl: this.settings.serverUrl,
-        vaultId: this.settings.vaultId,
-        token: this.settings.serverToken,
-      });
-      const host = new PluginVaultSyncHost(
-        this.vaultFiles,
-        this.settings.deviceId,
-        this.registry,
-        this.contentStore,
-        this.opLogger,
-        this.applicator,
-        this.hlc,
-        new CursorStore(this.metadata),
-      );
-      const client = new ServerSyncClient({
-        api,
-        crypto: this.crypto,
-        host,
-        hlc: this.hlc,
-        onProgress: (label) => this.statusBarItem?.setText(`⟳ ${label}`),
-      });
-
-      const summary = await client.runSync();
-
-      // Persist logical time after the round (F7): the merge/apply path advances
-      // the clock via merge()/setCurrent() outside op-recording, so capture it
-      // here in addition to the per-op cadence in OperationLogger.
-      await this.hlcStore.save(this.hlc.getCurrent());
-
-      await this.recordRoundOutcome(summary);
-      await this.syncState.clearError();
-
-      this.settings.lastSyncTime = Date.now();
-      await this.saveSettings();
-
-      if (source === 'manual') new Notice('✅ Vault sync complete');
+      const outcome = await this.coordinator.sync(source);
       // Land on the conflict state (not idle) if the round left conflicts the user
       // still needs to resolve, so the indicator doesn't silently go green.
-      this.updateRibbonState(this.outstandingConflictCount() > 0 ? 'conflict' : 'idle');
-    } catch (err) {
-      console.error('Vault Sync error:', err);
-      new Notice(`❌ Sync failed: ${(err as Error).message}`);
-      await this.syncState.setError((err as Error).message, Date.now());
-      this.updateRibbonState('error');
+      if (!outcome.ok) this.updateRibbonState('error');
+      else this.updateRibbonState(this.outstandingConflictCount() > 0 ? 'conflict' : 'idle');
     } finally {
       this.syncInProgress = false;
       this.updateStatusBar();
     }
-  }
-
-  /** Fold a completed round's summary into the persisted sync-state (S2): the
-   *  one-line last-sync record plus the deferred/stranded lists, resolving the
-   *  round's raw fileIds/hashes to vault paths for display. */
-  private async recordRoundOutcome(summary: SyncRoundSummary): Promise<void> {
-    const now = Date.now();
-    const deferred = summary.deferred.map(fileId => ({
-      fileId,
-      path: this.registry.getById(fileId)?.path ?? fileId,
-      reason: 'drift' as const,
-      at: now,
-    }));
-    const stranded = summary.stranded.map(contentHash => ({ contentHash, at: now }));
-    await this.syncState.setRound(
-      { at: now, pushed: summary.pushed, pulled: summary.pulled, conflicts: this.outstandingConflictCount() },
-      deferred,
-      stranded,
-    );
   }
 
   /** Public entry point for the settings "Sync now" button. */
@@ -462,9 +377,8 @@ export default class VaultSyncPlugin extends Plugin {
    * those changes will be re-captured (and pushed next sync), not discarded.
    */
   async resetSyncState(): Promise<void> {
-    const pending = this.opLogger.getPendingOps().length;
-    if (pending > 0) {
-      const confirmed = await new Promise<boolean>(resolve => {
+    await this.coordinator.reset(pending =>
+      new Promise<boolean>(resolve => {
         new ConfirmModal(this.app, {
           title: 'Rebuild sync metadata?',
           message:
@@ -472,11 +386,8 @@ export default class VaultSyncPlugin extends Plugin {
             'and pushed on the next sync — nothing is discarded. Vault content is never touched.',
           confirmText: 'Rebuild',
         }, resolve).open();
-      });
-      if (!confirmed) return;
-    }
-    await this.registry.reconcileWithVault(this.hlc.now());
-    await this.opLogger.captureOfflineChanges();
+      }),
+    );
     this.updateStatusBar();
   }
 
@@ -497,20 +408,20 @@ export default class VaultSyncPlugin extends Plugin {
       return;
     }
     const fileCount = this.registry.getActiveEntries().length;
-    const confirmed = await new Promise<boolean>(resolve => {
-      new ConfirmModal(this.app, {
-        title: 'Re-baseline this device to the server?',
-        message:
-          'Every file on THIS device will be pushed to the server as the authoritative ' +
-          'version. If another device edited the same file, this device\'s version will ' +
-          `win the merge there. Vault content on this device is never touched. (${fileCount} file${fileCount !== 1 ? 's' : ''}.)`,
-        confirmText: 'Re-baseline & push',
-      }, resolve).open();
-    });
-    if (!confirmed) return;
-
-    await this.opLogger.captureAllAsBaseline();
-    await this.triggerSync('manual');
+    await this.coordinator.rebaseline(
+      () =>
+        new Promise<boolean>(resolve => {
+          new ConfirmModal(this.app, {
+            title: 'Re-baseline this device to the server?',
+            message:
+              'Every file on THIS device will be pushed to the server as the authoritative ' +
+              'version. If another device edited the same file, this device\'s version will ' +
+              `win the merge there. Vault content on this device is never touched. (${fileCount} file${fileCount !== 1 ? 's' : ''}.)`,
+            confirmText: 'Re-baseline & push',
+          }, resolve).open();
+        }),
+      () => this.triggerSync('manual'),
+    );
   }
 
   /**
