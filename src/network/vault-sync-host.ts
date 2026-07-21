@@ -8,7 +8,7 @@
 //  Deferred out of P3 (which tested the round against in-memory fakes); this is
 //  the production wiring.
 
-import { VaultState, FileEntry, MergeAction } from '../types';
+import { VaultState, FileEntry, MergeAction, Operation } from '../types';
 import { VaultSyncHost } from './server-sync';
 import { VaultFiles } from '../ports/vault-files';
 import { FileRegistry } from '../core/file-registry';
@@ -17,6 +17,7 @@ import { OperationLogger } from '../core/operation-logger';
 import { SyncApplicator } from './sync-applicator';
 import { HybridLogicalClock } from '../core/hlc';
 import { CursorStore } from './cursor-store';
+import { VersionDagStore } from './version-dag-store';
 
 export class PluginVaultSyncHost implements VaultSyncHost {
   constructor(
@@ -28,6 +29,7 @@ export class PluginVaultSyncHost implements VaultSyncHost {
     private applicator: SyncApplicator,
     private hlc: HybridLogicalClock,
     private cursor: CursorStore,
+    private versionDagStore: VersionDagStore,
   ) {}
 
   /**
@@ -81,6 +83,13 @@ export class PluginVaultSyncHost implements VaultSyncHost {
 
   async clearPendingOps(): Promise<void> {
     await this.opLogger.clearOps();
+  }
+
+  async recordVersionEdges(ops: Operation[]): Promise<void> {
+    if (ops.length === 0) return;
+    const dag = await this.versionDagStore.load();
+    for (const op of ops) dag.addVersion(op.contentHash, op.parents, op.fileId);
+    await this.versionDagStore.save(dag);
   }
 
   loadCursor(): Promise<number> {

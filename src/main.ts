@@ -18,6 +18,7 @@ import { VaultCrypto, saltForVault } from './network/encryption';
 import { ServerSyncClient, SyncRoundSummary } from './network/server-sync';
 import { HttpServerApi } from './network/server-http';
 import { CursorStore } from './network/cursor-store';
+import { VersionDagStore } from './network/version-dag-store';
 import { HlcStore } from './network/hlc-store';
 import { SyncStateStore } from './network/sync-state-store';
 import { PluginVaultSyncHost } from './network/vault-sync-host';
@@ -301,6 +302,7 @@ export default class VaultSyncPlugin extends Plugin {
       this.applicator,
       this.hlc,
       new CursorStore(this.metadata),
+      new VersionDagStore(this.metadata),
     );
     const client = new ServerSyncClient({
       api,

@@ -101,6 +101,11 @@ export interface VaultSyncHost {
   clearPendingOps(): Promise<void>;
   loadCursor(): Promise<number>;
   saveCursor(cursor: number): Promise<void>;
+  /** Record the causal parent edges of these ops into the persisted version-DAG
+   *  (sync v2): each op contributes `contentHash → parents` under its `fileId`, so
+   *  a later round can compute LCA merge bases from structure. Behaviour-inert in
+   *  itself — nothing reads the DAG for merging yet (Step 2b). */
+  recordVersionEdges(ops: Operation[]): Promise<void>;
 }
 
 export interface ServerSyncOptions {
@@ -200,6 +205,11 @@ export class ServerSyncClient {
     // resolution be timestamped below the remote it resolves.
     this.hlc.setCurrent(merge.mergedHlc);
     const { deferred, converged } = await this.host.applyMerge(merge.actions, local, remote);
+
+    // Record causal edges for the content DAG (sync v2): both our authored ops
+    // (the snapshot taken before clearPendingOps) and the ops we pulled contribute
+    // `contentHash → parents`. Nothing reads the DAG for merging yet (Step 2b).
+    await this.host.recordVersionEdges([...local.pendingOps, ...pulled.map(p => p.op)]);
 
     // ── 5. Advance the cursor past everything we consumed ────────────────────
     // Persist the *pull* cursor, not the append's headCursor: another device may

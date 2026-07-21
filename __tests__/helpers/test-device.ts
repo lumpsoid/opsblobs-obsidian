@@ -20,6 +20,7 @@ import { OperationLogger } from '../../src/core/operation-logger';
 import { SyncApplicator, DeferConflict } from '../../src/network/sync-applicator';
 import { PluginVaultSyncHost } from '../../src/network/vault-sync-host';
 import { CursorStore } from '../../src/network/cursor-store';
+import { VersionDagStore } from '../../src/network/version-dag-store';
 import { HlcStore } from '../../src/network/hlc-store';
 import { FakeVaultFiles } from './fakes/vault-files';
 import { FakeMetadataStore } from './fakes/metadata-store';
@@ -70,6 +71,9 @@ export class TestDevice {
   readonly opLogger: OperationLogger;
   readonly applicator: SyncApplicator;
   readonly cursorStore: CursorStore;
+  /** The persisted content version-DAG store (sync v2), over the same fakes as the
+   *  rest of the stack — a test can `load()` it to assert accumulated parent edges. */
+  readonly versionDagStore: VersionDagStore;
   /** Persists logical time per-op (mirrors production), so a `reload()` can seed
    *  the HLC from disk and logical time never regresses across the restart (F7). */
   readonly hlcStore: HlcStore;
@@ -130,6 +134,7 @@ export class TestDevice {
       async a => this.resolveBinaryConflict?.(a) ?? 'keep_local',
     );
     this.cursorStore = new CursorStore(this.metadata);
+    this.versionDagStore = new VersionDagStore(this.metadata);
     this.host = new PluginVaultSyncHost(
       this.files,
       deviceId,
@@ -139,6 +144,7 @@ export class TestDevice {
       this.applicator,
       this.hlc,
       this.cursorStore,
+      this.versionDagStore,
     );
 
     // Record the merge actions each round applies, delegating to the real host.
