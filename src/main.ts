@@ -457,6 +457,39 @@ export default class VaultSyncPlugin extends Plugin {
   }
 
   /**
+   * Re-baseline this device to the server (S4): treat this device as the source of
+   * truth and force-push its full state up. Emits a pending op for every live file
+   * (via `captureAllAsBaseline`, which re-asserts even unchanged files) and then
+   * runs a normal sync round — so a server that has drifted, lost data, or was
+   * rebuilt is reconstructed from this client. Vault content here is never touched;
+   * the round summary lands in the sync-state and is visible in the status modal.
+   *
+   * Destructive on *other* devices in the sense that this device's version wins any
+   * concurrent edit, so it is gated behind an explicit confirmation.
+   */
+  async rebaselineToServer(): Promise<void> {
+    if (!this.isServerConfigured()) {
+      new Notice('Vault Sync: configure a server and passphrase in Settings → Vault Sync first.');
+      return;
+    }
+    const fileCount = this.registry.getActiveEntries().length;
+    const confirmed = await new Promise<boolean>(resolve => {
+      new ConfirmModal(this.app, {
+        title: 'Re-baseline this device to the server?',
+        message:
+          'Every file on THIS device will be pushed to the server as the authoritative ' +
+          'version. If another device edited the same file, this device\'s version will ' +
+          `win the merge there. Vault content on this device is never touched. (${fileCount} file${fileCount !== 1 ? 's' : ''}.)`,
+        confirmText: 'Re-baseline & push',
+      }, resolve).open();
+    });
+    if (!confirmed) return;
+
+    await this.opLogger.captureAllAsBaseline();
+    await this.triggerSync('manual');
+  }
+
+  /**
    * Re-check for conflicts: rewind the sync cursor to the start so the next sync
    * re-pulls the whole server log and recomputes every merge. A conflict that was
    * skipped (or dismissed) — whose remote op the cursor has already moved past,

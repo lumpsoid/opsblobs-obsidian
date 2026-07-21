@@ -19,6 +19,7 @@ export interface SettingsHost extends Plugin {
   setupAutoSync(): void;
   clearContentCache(): Promise<number>;
   resetSyncState(): Promise<void>;
+  rebaselineToServer(): Promise<void>;
   recheckConflicts(): Promise<void>;
   syncNow(): Promise<void>;
   openSyncStatus(): void;
@@ -289,6 +290,22 @@ export class SyncSettingTab extends PluginSettingTab {
           await this.host.resetSyncState();
           btn.setButtonText('Done');
           setTimeout(() => { btn.setButtonText('Reset').setDisabled(false); }, 2000);
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('Re-baseline this device to the server')
+      .setDesc('Push every file on this device to the server as the authoritative version — ' +
+        'use to rebuild or recover the server from a device you trust. If another device ' +
+        'edited the same file, this device wins. Vault content here is never touched.')
+      .addButton(btn => {
+        btn.setButtonText('Re-baseline').setWarning().onClick(async () => {
+          btn.setDisabled(true);
+          try {
+            await this.host.rebaselineToServer();
+          } finally {
+            btn.setButtonText('Re-baseline').setDisabled(false);
+          }
         });
       });
   }

@@ -122,6 +122,62 @@ export class OperationLogger {
     if (changed) await this.saveOpLog();
   }
 
+  /**
+   * Re-baseline this device to the server (S4): emit a pending op carrying the
+   * *current* content of EVERY live, non-excluded file — even one whose registry
+   * hash already matches. This is the deliberate difference from
+   * {@link captureOfflineChanges}, which skips unchanged files: a baseline must
+   * (re)assert every file so a server that has lost or never received them is
+   * fully reconstructed from this client. The user has confirmed this device is
+   * authoritative, so its version wins the merge on peers (last-writer-wins by the
+   * fresh HLC each op is stamped with).
+   *
+   * Non-destructive: reads the vault, never writes it. Idempotent at the registry
+   * level — `registerFile` returns the existing id rather than minting a duplicate,
+   * and `updateContentHash` is a no-op when nothing drifted. Tombstoned (deleted)
+   * entries are intentionally not re-emitted; a baseline asserts what exists now.
+   * Run it, then a normal sync round uploads the blobs + appends the ops (the
+   * append is idempotent by `clientOpId`, so a retried round can't duplicate).
+   */
+  async captureAllAsBaseline(): Promise<void> {
+    let changed = false;
+
+    for (const ref of this.files.list()) {
+      const path = ref.path;
+      if (this.isExcluded(path)) continue;
+
+      const content = await this.files.read(path);
+      if (content === null) continue;
+      const hash = await hashContent(content);
+      await this.contentStore.put(hash, content);
+
+      const entry = this.registry.getByPath(path);
+      const hlcTs = this.hlc.now();
+
+      if (!entry) {
+        const id = await this.registry.registerFile({ path }, hlcTs, hash);
+        this.pendingOps.push(Ops.create(id, path, hash, hlcTs));
+      } else {
+        // Capture whether this was a never-synced placeholder *before* correcting
+        // the registry (updateContentHash mutates the entry object in place), so
+        // we still emit a `create` — not an `update` referencing content no peer
+        // holds — for a file that was only ever a reconcile placeholder (audit G).
+        const wasPlaceholder = entry.contentHash === '';
+        if (entry.contentHash !== hash) {
+          await this.registry.updateContentHash(path, hash, hlcTs);
+        }
+        this.pendingOps.push(
+          wasPlaceholder
+            ? Ops.create(entry.id, path, hash, hlcTs)
+            : Ops.update(entry.id, path, hash, hlcTs),
+        );
+      }
+      changed = true;
+    }
+
+    if (changed) await this.saveOpLog();
+  }
+
   startListening(): void {
     this.watcher.start({
       // Return the handler promise so a test-driven watcher can await the async
