@@ -1,10 +1,18 @@
 # Obsidian community plugin
 
+> **Working on the sync engine?** This file is generic Obsidian-plugin boilerplate.
+> Read **`docs/sync-engineering-guide.md`** first — it covers this project's actual sync
+> architecture, data-safety invariants, testing approach, and the hard-won lessons. Don't
+> change anything under `src/core`, `src/merge`, or `src/network` without it.
+
 ## Project overview
 
 - Target: Obsidian Community Plugin (TypeScript → bundled JavaScript).
 - Entry point: `main.ts` compiled to `main.js` and loaded by Obsidian.
 - Required release artifacts: `main.js`, `manifest.json`, and optional `styles.css`.
+- This is an **end-to-end-encrypted vault sync** with client-side conflict resolution
+  against an untrusted server. The interesting engineering is the sync engine — see the
+  guide above.
 
 ## Environment & tooling
 
