@@ -143,10 +143,10 @@ export class SyncApplicator {
           return null;
         }
         const hash = await hashContent(action.content);
-        if (await this.wouldTruncateNonEmpty(currentPath, action.content)) {
-          console.warn(`Vault Sync: skipping write_local for ${currentPath} — refusing to truncate a non-empty file with empty content`);
-          return null;
-        }
+        // A zero-byte payload here is a LEGITIMATE empty edit: state-merge returns
+        // no_op whenever a winner's bytes are actually missing (F1), so it never
+        // emits a fabricated empty write. Writing empty is therefore the correct
+        // propagation of a user emptying a file — not a truncation to refuse (G13).
         await this.files.write(action.path, action.content);
         await this.contentStore.put(hash, action.content);
         // Adopt the remote file's identity (its UUID) so both devices track this
@@ -235,10 +235,9 @@ export class SyncApplicator {
         const hlcTs = this.hlc.now();
         const hash = await hashContent(action.content);
         if (decision === 'restore') {
-          if (await this.wouldTruncateNonEmpty(action.path, action.content)) {
-            console.warn(`Vault Sync: skipping delete_conflict restore for ${action.path} — refusing to overwrite a non-empty file with empty content`);
-            return null;
-          }
+          // state-merge already declined (no_op) to raise a delete_conflict whose
+          // surviving bytes are missing (F1), so `action.content` is real — an
+          // empty payload is a genuinely-empty file to restore, not a truncation.
           // Keep the file. Re-assert its presence (undeleting our own copy if we
           // were the deleting side) and make the restored content the new ancestor.
           await this.files.write(action.path, action.content);
@@ -268,10 +267,8 @@ export class SyncApplicator {
         // (runSync already advanced the clock past the merged HLC).
         const hlcTs = this.hlc.now();
         const hash = await hashContent(content);
-        if (await this.wouldTruncateNonEmpty(path, content)) {
-          console.warn(`Vault Sync: skipping binary_conflict resolution for ${path} — refusing to overwrite a non-empty file with empty content`);
-          return null;
-        }
+        // The chosen side's bytes are carried in the action (never fabricated), so
+        // an empty payload is a legitimately-empty version to keep, not a truncation.
         await this.files.write(path, content);
         await this.contentStore.put(hash, content);
         await this.registry.adoptRemote(action.fileId, path, hash, hlcTs);
@@ -303,24 +300,6 @@ export class SyncApplicator {
     const current = await this.files.read(path);
     if (current === null) return false;
     return (await hashContent(current)) !== snapshotHash;
-  }
-
-  /**
-   * Defense-in-depth for F1: a destructive write must never *truncate* a file —
-   * i.e. replace existing non-empty bytes with an empty buffer. State-merge
-   * already declines to emit a write/restore when the winning side's bytes are
-   * missing; this is the backstop if an empty buffer nonetheless reaches the
-   * applicator. It targets the real hazard (silent truncation of a non-empty
-   * file) rather than "any empty content": writing empty over an already-empty
-   * or absent file is harmless, and — crucially — a peer's genuinely-empty file
-   * must still be created here on first sync (its empty-hash blob isn't in this
-   * device's persistent store yet), so we gate on the *current on-disk* content,
-   * not the content store. The read only happens for the rare empty-buffer case.
-   */
-  private async wouldTruncateNonEmpty(path: string, content: Uint8Array): Promise<boolean> {
-    if (content.length > 0) return false;
-    const current = await this.files.read(path);
-    return current !== null && current.length > 0;
   }
 
   private async updateAncestorHashes(

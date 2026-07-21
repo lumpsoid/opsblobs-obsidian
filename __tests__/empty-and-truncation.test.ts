@@ -2,17 +2,21 @@
 // Sync scenarios — empty files, the truncation guard, and exclusions
 // ─────────────────────────────────────────────
 //
-//  Spec Part 2 G12/G13/G17. The interesting tension: the applicator's
-//  `wouldTruncateNonEmpty` guard (defense-in-depth for F1) refuses to overwrite a
-//  non-empty file with empty bytes — which correctly stops a *fabricated* empty
-//  write, but ALSO blocks a user *legitimately emptying* a file from reaching the
-//  peer. These tests pin both faces of that guard, and flag the false-positive as
-//  a known bug rather than asserting the divergence is desired.
+//  Spec Part 2 G12/G13/G17. Empty-file handling and the truncation guarantee:
+//  a user *legitimately emptying* a file must propagate to the peer (G13), while a
+//  *fabricated/missing-content* empty must never truncate a non-empty file (G12).
+//  The protection against the latter lives in state-merge (no_op when a winner's
+//  bytes are missing), NOT a blanket applicator refusal — the former applicator
+//  guard was a false-positive that blocked legitimate empties, and is now gone.
 //
-//  Driven through the real device stack (TestDevice) + FakeSyncServer.
+//  Driven through the real device stack (TestDevice) + FakeSyncServer; G12 asserts
+//  the merge guarantee directly.
 
 import { describe, test, expect, beforeAll } from 'vitest';
+import { VaultState } from '../src/types';
+import { HybridLogicalClock } from '../src/core/hlc';
 import { ServerSyncClient } from '../src/network/server-sync';
+import { mergeVaultStates } from '../src/merge/state-merge';
 import { VaultCrypto } from '../src/network/encryption';
 import { FakeSyncServer } from '../src/network/fake-server';
 import { TestDevice } from './helpers/test-device';
@@ -60,9 +64,8 @@ describe('empty files, truncation guard, and exclusions', () => {
     expect(await text(B, 'e.md')).toBe('now it has content\n');
   });
 
-  // ── G13 (a): non-empty → empty. The DESIRED behaviour — currently BLOCKED. ──
-  // eslint-disable-next-line vitest/no-disabled-tests
-  test.skip('KNOWN BUG (G13a): legitimately emptying a file should propagate, but the truncation guard blocks it', async () => {
+  // ── G13 (a): non-empty → empty is a legitimate edit that must propagate. ────
+  test('legitimately emptying a file propagates to the peer (G13a)', async () => {
     const api = new FakeSyncServer();
     const [A, B] = await pair(api);
 
@@ -76,39 +79,53 @@ describe('empty files, truncation guard, and exclusions', () => {
     await client(api, A).runSync();
     await client(api, B).runSync();
 
-    // DESIRED: B converges to the empty file. TODAY this FAILS — the applicator's
-    // wouldTruncateNonEmpty guard refuses to overwrite B's non-empty copy with the
-    // (legitimate) empty content, so B stays on the stale text and the two devices
-    // diverge permanently on a normal sync. See the mechanism test below. Fixing it
-    // needs the guard to distinguish a genuine empty EDIT (op-backed, content
-    // present) from a fabricated/missing-content empty — e.g. only refuse when the
-    // empty content is NOT a real, hash-verified op payload.
+    // The merge produces a clean write_local with zero-byte content, and the
+    // applicator now performs it (the false-positive truncation guard is gone), so
+    // B converges to the empty file instead of diverging on the stale text. The F1
+    // protection against a *fabricated/missing-content* empty lives where it belongs
+    // — state-merge, which no_ops when a winner's bytes are absent (see G12 below).
+    expect(B.applied.some(a => a.type === 'write_local' && a.content.length === 0)).toBe(true);
     expect(await text(B, 'n.md')).toBe('');
   });
 
-  // The mechanism behind the bug above, asserted honestly: the merge DOES decide to
-  // empty B's file (a clean write_local with zero-byte content), but the applicator
-  // declines to perform the write. This is the guard firing — correct for a
-  // fabricated empty, a false-positive for a legitimate one. It is the ONLY
-  // real-world path that reaches the guard: state-merge already returns no_op when a
-  // winner's bytes are genuinely missing (resolveContentConflict), so the guard
-  // never actually fires for the missing-content hazard it was written for.
-  test('the truncation guard blocks the empty write the merge produced (root cause of G13a)', async () => {
-    const api = new FakeSyncServer();
-    const [A, B] = await pair(api);
+  // ── G12: the REAL truncation protection lives in state-merge, not a blanket
+  //    applicator refusal. When the HLC-winning side's bytes are genuinely missing,
+  //    the merge returns no_op — it NEVER emits a truncating empty write_local — so
+  //    a non-empty local file is left untouched (F1). This is the guarantee the
+  //    removed applicator guard was standing in for; here it's pinned at its source.
+  test('a missing-content winner no_ops at the merge — a non-empty file is never truncated (G12)', () => {
+    const clockLocal = new HybridLogicalClock('dev-a');
+    const clockRemote = new HybridLogicalClock('dev-b');
 
-    await A.seedFile('n.md', 'content here\n', 1000);
-    await client(api, A).runSync();
-    await client(api, B).runSync();
+    // Local holds a non-empty file; remote has a higher-HLC edit whose content is
+    // NOT in either store (a transient/absent blob — the real truncation hazard).
+    const local: VaultState = {
+      deviceId: 'dev-a',
+      hlc: clockLocal.now(),
+      pendingOps: [],
+      fileEntries: new Map([['f1', {
+        id: 'f1', path: 'n.md', contentHash: 'local-nonempty',
+        hlcTimestamp: clockLocal.now(), deleted: false,
+        ancestorContentHash: 'base', ancestorPath: 'n.md',
+      }]]),
+      contentStore: new Map([['local-nonempty', new TextEncoder().encode('content here\n')]]),
+    };
+    const remote: VaultState = {
+      deviceId: 'dev-b',
+      hlc: clockRemote.now(),
+      pendingOps: [],
+      fileEntries: new Map([['f1', {
+        id: 'f1', path: 'n.md', contentHash: 'remote-missing',
+        hlcTimestamp: clockRemote.now(), deleted: false,
+        ancestorContentHash: 'base', ancestorPath: 'n.md',
+      }]]),
+      contentStore: new Map(), // winner's bytes absent
+    };
 
-    await A.editFile('n.md', '', 2000);
-    await client(api, A).runSync();
-    await client(api, B).runSync();
-
-    // The merge asked to empty the file…
-    expect(B.applied.some(a => a.type === 'write_local' && a.content.length === 0)).toBe(true);
-    // …but the guard stopped the write, so B still holds the old content (divergence).
-    expect(await text(B, 'n.md')).toBe('content here\n');
+    const { actions } = mergeVaultStates(local, remote);
+    // No truncating/empty write is ever produced — the file is deferred, not clobbered.
+    expect(actions).toContainEqual(expect.objectContaining({ type: 'no_op', fileId: 'f1' }));
+    expect(actions.some(a => a.type === 'write_local')).toBe(false);
   });
 
   // ── G17: excluded paths are never captured as ops. ──────────────────────────
