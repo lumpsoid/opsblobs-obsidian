@@ -23,3 +23,6 @@ data.json
 
 test-vault
 /test-vault
+
+# Test coverage output
+coverage/
