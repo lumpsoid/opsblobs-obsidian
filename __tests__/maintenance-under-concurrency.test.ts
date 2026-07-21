@@ -177,4 +177,42 @@ describe('maintenance operations with a concurrent peer', () => {
     expect(await text(B, 'note.md')).toBe(R);
     expect(A.entry(id)!.contentHash).toBe(B.entry(id)!.contentHash);
   });
+
+  // ── Auto-adopt reports convergence (the stuck-badge bug) ────────────────────
+  // Repro of the reported bug: B skips a raw-edit conflict (recorded outstanding at
+  // the plugin level), then a LATER round adopts A's resolution automatically via
+  // `supersedes` — a clean write_local that never re-enters the conflict handler.
+  // TestDevice has no SyncStateStore, so we assert the signal the coordinator needs:
+  // the round's SyncRoundSummary.converged must include the file on the adopt round
+  // (so the plugin clears the badge) and must NOT include it on the skip round.
+  test('a conflict that resolves automatically is reported in summary.converged', async () => {
+    const api = new FakeSyncServer();
+    const [A, B, id] = await sharedBase(api, 'note.md', 'shared\n');
+
+    await A.editFile('note.md', 'AAA\n', 2000);
+    await B.editFile('note.md', 'BBB\n', 2000);
+
+    // B pushes its edit first; A pulls it, resolves the conflict, queues the
+    // resolution op (which supersedes both raw edits) — not yet pushed.
+    await client(api, B).runSync();
+    const R = 'AAA\nBBB\n';
+    A.resolveConflict = () => enc(R);
+    await client(api, A).runSync();            // A: pull BBB → conflict → resolve; opR pending
+
+    // B pulls only A's RAW edit and SKIPS it (the dismiss). This round settles
+    // nothing for the file, so it must NOT be reported as converged.
+    B.resolveConflict = () => null;
+    const skipRound = await client(api, B).runSync();
+    expect(await text(B, 'note.md')).toBe('BBB\n');      // kept its own version
+    expect(skipRound.converged).not.toContain(id);
+
+    // A pushes the resolution; B pulls it and adopts it automatically (supersedes)
+    // — a write_local, no conflict handler. THIS round must report the file as
+    // converged, which is what lets the plugin clear the stale outstanding badge.
+    await client(api, A).runSync();            // push opR
+    const adoptRound = await client(api, B).runSync();
+    expect(await text(B, 'note.md')).toBe(R);            // converged to the resolution
+    expect(B.applied.filter(a => a.type === 'conflict')).toHaveLength(1); // only the skipped one; adopt was NOT a conflict
+    expect(adoptRound.converged).toContain(id);
+  });
 });

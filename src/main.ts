@@ -433,6 +433,10 @@ export default class VaultSyncPlugin extends Plugin {
    * no-op, so this is safe to run anytime. Then it runs a sync.
    */
   async recheckConflicts(): Promise<void> {
+    // Wipe the outstanding-conflict badges first: the replay below re-records any
+    // that are still genuine, so this also self-heals a badge left stuck by a file
+    // that resolved automatically (adopting a peer's resolution) in a prior round.
+    await this.coordinator.clearAllOutstandingConflicts();
     await new CursorStore(this.metadata).save(0);
     await this.triggerSync('manual');
   }

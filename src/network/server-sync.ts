@@ -92,10 +92,11 @@ export interface VaultSyncHost {
    *  contentStore populated with at least every pending op's content + ancestors. */
   buildLocalState(): Promise<VaultState>;
   /** Apply merge actions to the real vault (writes/deletes/moves, conflict
-   *  prompts). Returns the set of fileIds whose destructive action was deferred
-   *  because the file drifted on disk during the round (F5) — the caller holds
-   *  the cursor so their remote ops re-pull next round. */
-  applyMerge(actions: MergeAction[], local: VaultState, remote: VaultState): Promise<Set<string>>;
+   *  prompts). Returns `deferred` (fileIds whose destructive action was skipped for
+   *  on-disk drift (F5) or an auto-deferred conflict — the caller holds the cursor
+   *  so their remote ops re-pull next round) and `converged` (fileIds a converging
+   *  action settled this round, so a stale outstanding-conflict badge can clear). */
+  applyMerge(actions: MergeAction[], local: VaultState, remote: VaultState): Promise<{ deferred: Set<string>; converged: Set<string> }>;
   /** Drop the pending ops once they are durably on the server. */
   clearPendingOps(): Promise<void>;
   loadCursor(): Promise<number>;
@@ -126,6 +127,10 @@ export interface SyncRoundSummary {
   deferred: string[];
   /** content hashes whose blob couldn't be fetched this round (F3). */
   stranded: string[];
+  /** fileIds a converging action settled this round — the plugin clears any stale
+   *  outstanding-conflict badge for these (a file that resolved automatically, e.g.
+   *  by adopting a peer's `supersedes` resolution, never re-enters the handler). */
+  converged: string[];
 }
 
 export class ServerSyncClient {
@@ -194,7 +199,7 @@ export class ServerSyncClient {
     // rather than re-conflicting. Doing this after apply would let the
     // resolution be timestamped below the remote it resolves.
     this.hlc.setCurrent(merge.mergedHlc);
-    const drifted = await this.host.applyMerge(merge.actions, local, remote);
+    const { deferred, converged } = await this.host.applyMerge(merge.actions, local, remote);
 
     // ── 5. Advance the cursor past everything we consumed ────────────────────
     // Persist the *pull* cursor, not the append's headCursor: another device may
@@ -213,13 +218,14 @@ export class ServerSyncClient {
     // drifted on disk mid-round (F5), the remote op it skipped must re-pull so it
     // re-merges against the edit we just re-captured. Its content WAS available
     // (not F3's case), so cap the cursor at this round's start.
-    await this.host.saveCursor(safeCursor(pulled, pulledCursor, missingContent, startCursor, drifted.size > 0));
+    await this.host.saveCursor(safeCursor(pulled, pulledCursor, missingContent, startCursor, deferred.size > 0));
 
     return {
       pushed,
       pulled: pulled.length,
-      deferred: [...drifted],
+      deferred: [...deferred],
       stranded: [...missingContent],
+      converged: [...converged],
     };
   }
 

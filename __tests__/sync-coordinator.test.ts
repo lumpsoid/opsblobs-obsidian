@@ -17,7 +17,7 @@ import { DEFER_CONFLICT } from '../src/network/sync-applicator';
 import { SyncCoordinator } from '../src/network/sync-coordinator';
 import { TestDevice } from './helpers/test-device';
 
-const EMPTY_SUMMARY: SyncRoundSummary = { pushed: 0, pulled: 0, deferred: [], stranded: [] };
+const EMPTY_SUMMARY: SyncRoundSummary = { pushed: 0, pulled: 0, deferred: [], stranded: [], converged: [] };
 
 /** Build a coordinator over a real device stack with recording ports + a stubbed
  *  round. `order` captures the pre-sync capture sequence; `runRound` returns
@@ -80,7 +80,7 @@ describe('SyncCoordinator', () => {
 
   test('a happy round folds the summary into sync-state and clears any prior error', async () => {
     const id = 'fileX';
-    const h = await harness({ summary: { pushed: 2, pulled: 3, deferred: [id], stranded: ['hashY'] } });
+    const h = await harness({ summary: { pushed: 2, pulled: 3, deferred: [id], stranded: ['hashY'], converged: [] } });
     await h.syncState.setError('stale failure', 1); // a leftover error from a previous round
 
     await h.coordinator.sync('manual');
@@ -130,6 +130,32 @@ describe('SyncCoordinator', () => {
     // A real resolution for the same file clears the outstanding entry.
     const resolved = await h.coordinator.decideContentConflict(contentAction('f1', 'a.md'), async () => new Uint8Array([1]));
     expect(resolved).toEqual(new Uint8Array([1]));
+    expect(h.syncState.get().outstandingConflicts).toHaveLength(0);
+  });
+
+  test('a round that reports a converged file clears its stale outstanding-conflict badge', async () => {
+    // The reported bug: B skipped a conflict (recorded outstanding), then a later
+    // round adopted the peer's resolution automatically (a clean write_local, never
+    // re-entering decide*), leaving the badge stuck. The round now reports the file
+    // in `summary.converged`, and sync() clears it — while an unrelated skip stays.
+    const h = await harness({ summary: { pushed: 0, pulled: 1, deferred: [], stranded: [], converged: ['fResolved'] } });
+    await h.syncState.recordConflict({ fileId: 'fResolved', path: 'resolved.md', kind: 'content', firstSeen: 1 });
+    await h.syncState.recordConflict({ fileId: 'fOther', path: 'other.md', kind: 'content', firstSeen: 1 });
+
+    await h.coordinator.sync('manual');
+
+    const outstanding = h.syncState.get().outstandingConflicts;
+    expect(outstanding.map(c => c.fileId)).toEqual(['fOther']); // fResolved cleared, fOther kept
+    expect(h.syncState.get().lastSync?.conflicts).toBe(1);      // count reflects the clear
+  });
+
+  test('clearAllOutstandingConflicts empties the badge set (Re-check self-heal)', async () => {
+    const h = await harness();
+    await h.syncState.recordConflict({ fileId: 'a', path: 'a.md', kind: 'content', firstSeen: 1 });
+    await h.syncState.recordConflict({ fileId: 'b', path: 'b.md', kind: 'content', firstSeen: 1 });
+    expect(h.syncState.get().outstandingConflicts).toHaveLength(2);
+
+    await h.coordinator.clearAllOutstandingConflicts();
     expect(h.syncState.get().outstandingConflicts).toHaveLength(0);
   });
 

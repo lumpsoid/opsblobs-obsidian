@@ -128,6 +128,16 @@ export class SyncStateStore {
     if (this.state.outstandingConflicts.length !== before) await this.persist();
   }
 
+  /** Drop every outstanding conflict. Used by "Re-check for conflicts", which
+   *  replays the whole server log — any still-genuine conflict is re-recorded
+   *  during that round, so wiping first self-heals badges left stuck by a file
+   *  that resolved automatically without re-entering the conflict handler. */
+  async clearAllConflicts(): Promise<void> {
+    if (this.state.outstandingConflicts.length === 0) return;
+    this.state.outstandingConflicts = [];
+    await this.persist();
+  }
+
   /** Replace the last-round summary and the transient per-round lists
    *  (deferred/stranded) with this round's outcome. */
   async setRound(record: SyncRoundSummaryRecord, deferred: DeferredFile[], stranded: StrandedContent[]): Promise<void> {

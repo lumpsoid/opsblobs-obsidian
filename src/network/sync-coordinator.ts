@@ -126,6 +126,12 @@ export class SyncCoordinator {
       const summary = await this.runRound();
 
       await this.persistHlc();
+      // Clear the outstanding-conflict badge for any file that converged this round
+      // — above all one that resolved AUTOMATICALLY (adopting a peer's `supersedes`
+      // resolution via a clean write_local), which never re-enters `decide*` and so
+      // would otherwise leave a stale "1 conflict to resolve" forever. Done before
+      // recordRoundOutcome so the round's `conflicts` count reflects the clear.
+      for (const fileId of summary.converged) await this.syncState.clearConflict(fileId);
       await this.recordRoundOutcome(summary);
       await this.syncState.clearError();
       await this.markSynced();
@@ -144,6 +150,14 @@ export class SyncCoordinator {
   /** Number of conflicts the user still needs to resolve — drives ribbon/status. */
   outstandingConflictCount(): number {
     return this.syncState.get().outstandingConflicts.length;
+  }
+
+  /** Wipe every outstanding-conflict badge. Called by "Re-check for conflicts"
+   *  before it replays the whole server log: a still-genuine conflict re-surfaces
+   *  and is re-recorded that round, while a badge left stuck by an automatic
+   *  resolution is cleared for good. */
+  async clearAllOutstandingConflicts(): Promise<void> {
+    await this.syncState.clearAllConflicts();
   }
 
   /**
