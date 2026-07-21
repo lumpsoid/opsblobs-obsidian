@@ -10,7 +10,7 @@ import { ContentStore } from './core/content-store';
 import { randomUuid } from './core/encoding';
 import { OperationLogger } from './core/operation-logger';
 import { resolveDeleteStrategy } from './core/conflict-policy';
-import { SyncApplicator } from './network/sync-applicator';
+import { SyncApplicator, DEFER_CONFLICT } from './network/sync-applicator';
 import { ObsidianVaultFiles } from './network/obsidian-vault-files';
 import { ObsidianMetadataStore } from './network/obsidian-metadata-store';
 import { ObsidianVaultWatcher } from './network/obsidian-vault-watcher';
@@ -49,6 +49,11 @@ export default class VaultSyncPlugin extends Plugin {
   private statusBarItem: HTMLElement | null = null;
   private syncInProgress = false;
   private autoSyncHandle: number | null = null;
+  /** Source of the round currently running — read by the conflict-handler
+   *  closures so an unattended `'auto'` round defers conflicts (no blocking modal,
+   *  cursor held) instead of interrupting the user or silently consuming them
+   *  (S5). Safe as a single field: triggerSync runs at most one round at a time. */
+  private currentSyncSource: 'manual' | 'auto' = 'manual';
 
   /** Conflicts the user has skipped/dismissed and not yet resolved — drives the
    *  ribbon's "needs attention" state and the status modal. Read from the
@@ -101,6 +106,12 @@ export default class VaultSyncPlugin extends Plugin {
       this.hlc,
       // Conflict handler
       async (action) => {
+        // Unattended auto-sync must not pop a blocking modal: record the conflict
+        // as outstanding and defer it (cursor held) to the next manual sync (S5).
+        if (this.currentSyncSource === 'auto') {
+          await this.syncState.recordConflict({ fileId: action.fileId, path: action.localPath, kind: 'content', firstSeen: Date.now() });
+          return DEFER_CONFLICT;
+        }
         const resolved = await new Promise<Uint8Array | null>(resolve => {
           new ConflictResolutionModal(
             this.app,
@@ -124,6 +135,13 @@ export default class VaultSyncPlugin extends Plugin {
       // Delete conflict handler
       async (action) => {
         const strategy = resolveDeleteStrategy(this.settings.deleteConflictStrategy);
+        // 'ask' under auto-sync would open a modal — defer instead (S5). A
+        // non-'ask' strategy is the user's standing policy and still runs
+        // unattended, exactly as before.
+        if (strategy === 'ask' && this.currentSyncSource === 'auto') {
+          await this.syncState.recordConflict({ fileId: action.fileId, path: action.path, kind: 'delete', firstSeen: Date.now() });
+          return DEFER_CONFLICT;
+        }
         const decision = strategy !== 'ask'
           ? strategy
           // 'ask' — let the user decide per file.
@@ -138,6 +156,11 @@ export default class VaultSyncPlugin extends Plugin {
       // Binary conflict handler — binary files can't be three-way merged, so the
       // user picks which whole version to keep (presented by filename + metadata).
       async (action) => {
+        // Unattended auto-sync must not pop a blocking modal — defer (S5).
+        if (this.currentSyncSource === 'auto') {
+          await this.syncState.recordConflict({ fileId: action.fileId, path: action.localPath, kind: 'binary', firstSeen: Date.now() });
+          return DEFER_CONFLICT;
+        }
         const decision = await new Promise<'keep_local' | 'keep_remote'>(resolve => {
           new BinaryConflictModal(this.app, action, resolve).open();
         });
@@ -303,6 +326,7 @@ export default class VaultSyncPlugin extends Plugin {
     }
 
     this.syncInProgress = true;
+    this.currentSyncSource = source;
     this.updateRibbonState('syncing');
 
     try {

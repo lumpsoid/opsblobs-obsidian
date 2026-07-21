@@ -17,7 +17,7 @@ import { HybridLogicalClock } from '../../src/core/hlc';
 import { FileRegistry } from '../../src/core/file-registry';
 import { ContentStore } from '../../src/core/content-store';
 import { OperationLogger } from '../../src/core/operation-logger';
-import { SyncApplicator } from '../../src/network/sync-applicator';
+import { SyncApplicator, DeferConflict } from '../../src/network/sync-applicator';
 import { PluginVaultSyncHost } from '../../src/network/vault-sync-host';
 import { CursorStore } from '../../src/network/cursor-store';
 import { FakeVaultFiles } from './fakes/vault-files';
@@ -25,17 +25,18 @@ import { FakeMetadataStore } from './fakes/metadata-store';
 import { FakeVaultWatcher } from './fakes/vault-watcher';
 
 /** How a device resolves a text conflict surfaced during merge — returns the
- *  resolved bytes (a real user's modal choice), or null to skip it. */
+ *  resolved bytes (a real user's modal choice), null to skip it, or DEFER_CONFLICT
+ *  to defer it (what main.ts's auto-sync closure returns: hold the cursor, S5). */
 export type ConflictResolver =
-  (action: Extract<MergeAction, { type: 'conflict' }>) => Uint8Array | null;
+  (action: Extract<MergeAction, { type: 'conflict' }>) => Uint8Array | null | DeferConflict;
 
 /** How a device resolves a delete/modify(-or-rename) conflict. */
 export type DeleteConflictResolver =
-  (action: Extract<MergeAction, { type: 'delete_conflict' }>) => 'keep_deleted' | 'restore';
+  (action: Extract<MergeAction, { type: 'delete_conflict' }>) => 'keep_deleted' | 'restore' | DeferConflict;
 
 /** How a device resolves a concurrent binary-file conflict (whole-version pick). */
 export type BinaryConflictResolver =
-  (action: Extract<MergeAction, { type: 'binary_conflict' }>) => 'keep_local' | 'keep_remote';
+  (action: Extract<MergeAction, { type: 'binary_conflict' }>) => 'keep_local' | 'keep_remote' | DeferConflict;
 
 export class TestDevice {
   readonly files = new FakeVaultFiles();

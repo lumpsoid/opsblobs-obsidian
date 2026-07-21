@@ -11,9 +11,20 @@ import { OperationLogger } from '../core/operation-logger';
 import { HybridLogicalClock } from '../core/hlc';
 import { nextAncestorHash } from '../merge/ancestor-policy';
 
-export type ConflictHandler = (action: Extract<MergeAction, { type: 'conflict' }>) => Promise<Uint8Array | null>;
-export type DeleteConflictHandler = (action: Extract<MergeAction, { type: 'delete_conflict' }>) => Promise<'keep_deleted' | 'restore'>;
-export type BinaryConflictHandler = (action: Extract<MergeAction, { type: 'binary_conflict' }>) => Promise<'keep_local' | 'keep_remote'>;
+/**
+ * A conflict handler may return this instead of a decision to *defer* the
+ * conflict (S5): the applicator applies nothing, adds the fileId to the deferred
+ * set, and the round holds its cursor (exactly like an F5 drift) so the conflict
+ * re-presents next round rather than being consumed. Unattended auto-sync uses
+ * this — it must never open a blocking modal nor silently skip: it records the
+ * conflict as outstanding and leaves the actual decision to the next manual sync.
+ */
+export const DEFER_CONFLICT = Symbol('defer-conflict');
+export type DeferConflict = typeof DEFER_CONFLICT;
+
+export type ConflictHandler = (action: Extract<MergeAction, { type: 'conflict' }>) => Promise<Uint8Array | null | DeferConflict>;
+export type DeleteConflictHandler = (action: Extract<MergeAction, { type: 'delete_conflict' }>) => Promise<'keep_deleted' | 'restore' | DeferConflict>;
+export type BinaryConflictHandler = (action: Extract<MergeAction, { type: 'binary_conflict' }>) => Promise<'keep_local' | 'keep_remote' | DeferConflict>;
 
 /** A user-resolved conflict that must be re-emitted as an op so it replicates.
  *  `kind` is the op it becomes: an `update` (content conflict, or a delete
@@ -173,6 +184,9 @@ export class SyncApplicator {
 
       case 'conflict': {
         const resolved = await this.onConflict(action);
+        // Auto-sync deferral (S5): apply nothing, hold the cursor. Checked before
+        // the null/skip branch because the sentinel is a truthy symbol.
+        if (resolved === DEFER_CONFLICT) { deferred.add(action.fileId); return null; }
         if (!resolved) return null;
         // The resolution is a fresh decision the CRDT replay can't reproduce, so
         // it must become its own op. Timestamp it *now*: runSync has already
@@ -197,6 +211,8 @@ export class SyncApplicator {
 
       case 'delete_conflict': {
         const decision = await this.onDeleteConflict(action);
+        // Auto-sync deferral (S5): apply nothing, hold the cursor for next round.
+        if (decision === DEFER_CONFLICT) { deferred.add(action.fileId); return null; }
         // Timestamp the decision *now* so it dominates the delete/edit it
         // supersedes (runSync already advanced the clock past the merged HLC),
         // and tag it with both sides so a peer still holding either adopts the
@@ -228,6 +244,8 @@ export class SyncApplicator {
         // exactly like `delete_conflict`, so a peer still holding either side
         // adopts the decision via `supersedes` instead of re-prompting.
         const decision = await this.onBinaryConflict(action);
+        // Auto-sync deferral (S5): apply nothing, hold the cursor for next round.
+        if (decision === DEFER_CONFLICT) { deferred.add(action.fileId); return null; }
         const keepLocal = decision === 'keep_local';
         const content = keepLocal ? action.localContent : action.remoteContent;
         const path = keepLocal ? action.localPath : action.remotePath;
