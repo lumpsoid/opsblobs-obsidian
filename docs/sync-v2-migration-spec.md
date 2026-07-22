@@ -29,6 +29,20 @@ truth; each device's DAG is a derived cache).
 
 ### What is committed on `sync-robustness-fixes` (newest first)
 
+- `a627d76` feat(sync): surface conflicts as in-context 3-way markers, resolved by
+  the next save — **Step 5, DONE.** A text `conflict` is surfaced NON-BLOCKINGLY as
+  inline zdiff3 markers at the real path (no modal, no cursor hold); the file is
+  recorded *two-headed* (`FileEntry.conflictParents = [A, B]` via
+  `registry.markConflicted`). `state-merge.resolveContentConflict` gained a two-headed
+  guard (never re-conflict / nest markers; adopt a peer's merge-node resolution
+  descending from both heads, else hold). `op-logger.flushModify` emits `Ops.merge`
+  (parents = the two heads) when a save removes the markers, or a non-blocking notice
+  while they remain. The applicator `conflict` case writes markers (F5-drift-guarded)
+  instead of calling a resolver; `onConflict` / `coordinator.decideContentConflict` /
+  `ConflictResolutionModal` wiring REMOVED (delete/binary keep their handlers). New
+  `diff3` helpers `renderConflictMarkers` / `renderMarkersFromResult` /
+  `hasConflictMarkers`. `src/ui/conflict-modal.ts` is now dead (retained as the Step 6
+  compare reference). **206 pass.**
 - `b62e039` feat(merge): retire the scalar ancestor + supersedes; reconcile over
   the op-id DAG — **THE folded Step 3 core, DONE (atomic).** The scalar content
   ancestor and `supersedes` are gone; the three-way base is the DAG LCA and every
@@ -345,12 +359,11 @@ built as part of `b62e039`. Kept as the map of what lives where.
 - `merge-node-convergence.test.ts` + `resolution-convergence.test.ts` pin the
   merge-node chain (the latter asserts an `m-` two-parent node).
 
-Current green count: **200** (`npm run build && npx vitest run`). Branch
-`sync-robustness-fixes`, last commit `b62e039` — the folded Step 3 core is DONE;
-**Step 5 (inline 3-way conflict markers) is next.** (The count dropped from 209
-because the 9 `ancestor-policy.test.ts` unit tests were removed with the file; the
-send_remote-path-rule + delete/rename intent they guarded are now preserved through
-the DAG and the delete-rename / concurrent-conflict integration suites.)
+Current green count: **206** (`npm run build && npx vitest run`). Branch
+`sync-robustness-fixes`, last commit `a627d76` — Step 5 (inline conflict markers) is
+DONE; **Step 6 (conflicts panel + compare UX) is next.** (206 = the 200 at `b62e039`,
+minus 3 removed content-modal/skip tests that covered now-deleted behaviour, plus 9
+new marker tests — `conflict-markers.test.ts` and `inline-conflict-resolution.test.ts`.)
 
 ## Working rules
 
