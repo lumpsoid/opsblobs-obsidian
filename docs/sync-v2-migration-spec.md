@@ -81,6 +81,67 @@ FF-adopt → fall through to three-way) is the other subtlety to preserve.
 The Rework section below is now historical (done); Steps 3–8 remain, subject to the
 re-order above.
 
+### Findings from R1/R2/2b — load-bearing, read before Step 3+
+
+Non-obvious facts and known gaps discovered while implementing the identity flip.
+Each will bite a continuation that doesn't know it.
+
+1. **`op.id === hlcToString(op.hlcTimestamp)` is now load-bearing for head
+   tracking.** `FileRegistry.adoptRemote` derives the new `headVersionId` as
+   `hlcToString(hlc)` — it only has the action's `hlc`, not the remote `Operation`,
+   and relies on this equality (holds for a plain remote write, a fast-forward, and
+   a conflict resolution, since `action.hlc` is the adopted op's `hlcTimestamp`). If
+   op-id derivation ever stops being `hlcToString(hlc)`, `adoptRemote` sets a wrong
+   head silently. The logger sets the head explicitly from `op.id` at each mint
+   site, so only `adoptRemote` carries this coupling. Step 4 (merge nodes) touches
+   this path — keep the invariant or pass the op-id explicitly.
+
+2. **Clean three-way merges mint a *synthetic* head not in the DAG** (the Step-3/4
+   ordering hazard above). Two devices merging the same pair compute the *same*
+   `hlcMax`, so they land on the same synthetic id string and the same content —
+   they converge — but neither has a DAG node. The next edit's base then resolves
+   via the **scalar ancestor fallback**. Step 4 fixes this by making clean merges
+   real two-parent DAG nodes; until then the scalar ancestor is load-bearing.
+
+3. **The `localAtHead` guard is a data-safety invariant, not an optimisation.** In
+   `resolveContentConflict`, the DAG fast-forward adopts a remote descendant only
+   when `dag.contentHashOf(le.headVersionId) === le.contentHash` — i.e. local is
+   actually AT its head. An unlogged in-window edit (the debounce race) leaves the
+   head stale while `buildLocalState` corrects `le.contentHash` from disk; without
+   the guard the merge would treat the stale head as representing local and adopt a
+   remote descendant, silently clobbering the edit (`concurrent-conflict-dataloss`
+   test 1 pins this). Preserve it through any merge refactor.
+
+4. **`buildLocalState` stages only live content + the scalar `ancestorContentHash`
+   bytes — NOT arbitrary DAG LCA base bytes** (`network/vault-sync-host.ts`). When
+   the true LCA base is deeper than the local scalar ancestor (multi-round offline
+   divergence), its bytes aren't staged, so the merge sees a *known-but-missing
+   base* and correctly degrades to a conflict (never a silent union) — but that is
+   *more* conflicts than necessary. To let deep-LCA merges succeed, stage the DAG
+   base's bytes (`dag.contentHashOf(base)`) in `buildLocalState`, and retain them
+   in GC (Step 8). Also note: once the scalar ancestor is removed (Step 3), the
+   `resolved.ancestorContentHash` staging line disappears — replace it with
+   DAG-base staging or three-way merges lose their base bytes entirely.
+
+5. **DAG persistence is a full rewrite per round, not the incremental append the
+   decisions doc §3 corollary calls for.** `VersionDagStore.save` does
+   `JSON.stringify(dag.toJSON())` over the whole graph every round (inherited from
+   Step 2a). Correct, but `O(vault-history)` per round — the very mobile cost the
+   op-id design set out to avoid. Deferred perf; make it append-only (one line per
+   new edge) before the DAG grows large. Not required for correctness.
+
+6. **The delete / rename-vs-delete / binary branches still read the scalar
+   ancestor.** 2b only moved `resolveContentConflict`'s both-modified base+FF onto
+   the DAG. `isUnchangedSinceAncestor` (used by the one-sided-delete branches) and
+   the binary changed-since-base check still use `ancestorContentHash` /
+   `ancestorPath`. On the *remote* side these are now `null` (retired in
+   `reconstructRemoteState`), which is behaviour-preserving only because
+   `isUnchangedSinceAncestor(re)` was already always-false for a projected remote
+   entry (an op's content never equals its own parent's). Step 3 must reimplement
+   rename-vs-delete detection (spec says: op path-history / `lastSyncedPath`) AND
+   the "unchanged since the common base" test over the DAG, not just delete the
+   fields — the *local* side still genuinely relies on them today.
+
 ## Working rules
 
 - **One step = one commit.** Sequential; each depends on the previous.
