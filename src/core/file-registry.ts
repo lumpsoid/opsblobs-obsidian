@@ -63,7 +63,25 @@ export class FileRegistry {
   /** Register a newly created file. Returns the assigned UUID. */
   async registerFile(ref: VaultFileRef, hlc: HLC, contentHash: string): Promise<string> {
     const existing = this.pathIndex.get(ref.path);
-    if (existing) return existing;   // already tracked
+    if (existing) {
+      // A create event for a path we still track as a TOMBSTONE is a re-create: the
+      // file was deleted, then a new file was made at the same path. Resurrect the
+      // entry in place (reusing its id) so it isn't left marked `deleted` with a stale
+      // contentHash while the caller's setHeadVersion advances its head to the new
+      // create op — otherwise buildLocalState would project the just-created file as
+      // deleted. The create op is still a fresh DAG root (`parents: []`); this fixes
+      // only local registry consistency, not the causal link, so a peer that deleted
+      // the file still sees a delete/create conflict (the safe outcome), not a silent
+      // un-delete.
+      const entry = this.entries.get(existing);
+      if (entry && entry.deleted) {
+        entry.deleted = false;
+        entry.contentHash = contentHash;
+        entry.hlcTimestamp = hlc;
+        await this.save();
+      }
+      return existing;   // already tracked (live), or resurrected just now
+    }
 
     const id = this.generateUUID();
     const entry: FileEntry = {
