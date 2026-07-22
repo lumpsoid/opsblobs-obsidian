@@ -3,8 +3,8 @@
   "name": "Vault Sync",
   "version": "0.1.0",
   "minAppVersion": "0.15.0",
-  "description": "Peer-to-peer vault sync across devices using CRDT-based conflict resolution. No third-party server required.",
-  "author": "Community",
-  "authorUrl": "https://github.com/obsidian-vault-sync",
+  "description": "End-to-end-encrypted vault sync across devices. Conflict resolution runs on your devices; the server only ever holds encrypted data.",
+  "author": "lumpsoid",
+  "authorUrl": "https://github.com/lumpsoid/obsidian-sync-p2p",
   "isDesktopOnly": false
 }
