@@ -9,6 +9,7 @@
 import { FileEntry, HLC, SyncSettings } from '../types';
 import { MetadataStore } from '../ports/metadata-store';
 import { VaultFiles, VaultFileRef } from '../ports/vault-files';
+import { VersionDag } from './version-dag';
 import { hlcCompare, hlcToString } from './hlc';
 import { isExcluded } from './exclusion-policy';
 import { randomUuid } from './encoding';
@@ -306,15 +307,23 @@ export class FileRegistry {
   /**
    * The content hashes still referenced by the registry — the keep-set for
    * garbage-collecting the content store. A live (non-deleted) entry keeps its
-   * current content. Three-way merge *base* bytes are no longer pinned by a scalar
-   * ancestor here; retaining DAG-reachable bases is the GC's job (sync v2, Step 8),
-   * so a base that is GC'd degrades a deep merge to a conflict (safe), never data
-   * loss.
+   * current content. When a {@link VersionDag} is supplied (sync v2, Step 8), the
+   * keep-set additionally retains the bytes of every version *reachable from each
+   * live head* — the plausible three-way merge bases, since `LCA(head, peerHead)`
+   * is always an ancestor of `head`. Retaining them keeps deep merges byte-exact
+   * across the retention window; a base that IS dropped (unreachable, or the DAG is
+   * absent) degrades a deep merge to a conflict (safe — the merge surfaces markers
+   * rather than fabricating an empty ancestor), never data loss. The DAG parent
+   * links themselves are tiny and persisted separately, so they outlive the bytes.
    */
-  referencedHashes(): Set<string> {
+  referencedHashes(dag?: VersionDag): Set<string> {
     const keep = new Set<string>();
     for (const entry of this.entries.values()) {
-      if (!entry.deleted && entry.contentHash) keep.add(entry.contentHash);
+      if (entry.deleted) continue;
+      if (entry.contentHash) keep.add(entry.contentHash);
+      if (dag && entry.headVersionId) {
+        for (const hash of dag.reachableContentHashes(entry.headVersionId)) keep.add(hash);
+      }
     }
     return keep;
   }

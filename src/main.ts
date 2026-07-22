@@ -419,9 +419,13 @@ export default class VaultSyncPlugin extends Plugin {
   // ─── Maintenance (wired from settings) ───────────────────────────────────────
 
   /** Garbage-collect the content store down to what the registry still
-   *  references (live content + retained ancestors). Returns the count removed. */
+   *  references (live content + the DAG-reachable merge bases of each live head).
+   *  Returns the count removed. The version-DAG's parent links are retained
+   *  separately (and are tiny), so a base whose bytes are GC'd only degrades a deep
+   *  merge to a conflict — never data loss. */
   async clearContentCache(): Promise<number> {
-    const keep = this.registry.referencedHashes();
+    const dag = await new VersionDagStore(this.metadata).load();
+    const keep = this.registry.referencedHashes(dag);
     const before = (await this.contentStore.listHashes()).length;
     const retentionMs = this.settings.ancestorRetentionDays * 86_400_000;
     await this.contentStore.gc(keep, retentionMs, Date.now());
