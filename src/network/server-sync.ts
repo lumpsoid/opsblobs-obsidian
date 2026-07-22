@@ -219,6 +219,22 @@ export class ServerSyncClient {
     this.hlc.setCurrent(merge.mergedHlc);
     const { deferred, deferredConflicts } = await this.host.applyMerge(merge.actions, local, remote);
 
+    // ── 4b. Multi-head reconciliation sweep (causal audit Finding B) ─────────
+    // `reconstructRemoteState` collapses concurrent remote heads for one file to the
+    // single HLC-max op, so when we pulled ≥2 heads for a file the main merge only
+    // reconciled our head against that one — the other head(s) landed in the DAG as
+    // stranded leaves nothing reconciled. Fold them into our head here, so THIS
+    // device converges by itself instead of depending on whichever peer already
+    // computed the merge staying online to push it. Reuses the ordinary pairwise
+    // `mergeVaultStates` path (a clean fold mints a `write_merge`; overlapping edits
+    // surface a conflict), so newly-minted merge nodes replicate on the next round
+    // like any other resolution. May add to `missingContent` (an extra leaf's bytes
+    // weren't fetched by the HLC-max projection) so `safeCursor` re-pulls it (F3).
+    // Files the main apply deferred (F5 drift, or an auto-deferred delete/binary
+    // conflict) are skipped: their cursor is held so the whole round re-pulls, and
+    // reconciling them here would write over the very in-window edit F5 protects.
+    await this.reconcileConcurrentHeads(pulled, dag, local.deviceId, missingContent, deferred);
+
     // ── 5. Advance the cursor past everything we consumed ────────────────────
     // Persist the *pull* cursor, not the append's headCursor: another device may
     // have appended between our pull and our push, and those ops sit at
@@ -288,16 +304,30 @@ export class ServerSyncClient {
 
     this.onProgress?.(`Downloading ${wanted.size} file(s)…`);
     for (const contentHash of wanted) {
-      const blinded = await this.crypto.blindHash(contentHash);
-      const envelope = await this.api.getBlob(blinded);
-      if (!envelope) { missing.add(contentHash); continue; } // absent — merge no-ops it; hold the cursor (F3)
-      const content = await this.crypto.decryptBlob(envelope);
-      if ((await sha256Hex(content)) !== contentHash) {
-        throw new Error(`Blob ${blinded} failed content-hash verification`);
-      }
+      const content = await this.fetchBlob(contentHash);
+      if (!content) { missing.add(contentHash); continue; } // absent — merge no-ops it; hold the cursor (F3)
       remote.contentStore.set(contentHash, content);
     }
     return missing;
+  }
+
+  /**
+   * Fetch one blob by its (unblinded) content hash: blind it, GET the encrypted
+   * envelope, decrypt, and verify it hashes back to the asserted hash. Returns
+   * `null` when the blob is absent on the server (a transient F3 stranding the
+   * caller handles by holding the cursor). Shared by {@link fetchRemoteBlobs} and
+   * the multi-head reconciliation sweep, which stages an extra concurrent leaf's
+   * bytes the HLC-max projection never fetched.
+   */
+  private async fetchBlob(contentHash: string): Promise<Uint8Array | null> {
+    const blinded = await this.crypto.blindHash(contentHash);
+    const envelope = await this.api.getBlob(blinded);
+    if (!envelope) return null;
+    const content = await this.crypto.decryptBlob(envelope);
+    if ((await sha256Hex(content)) !== contentHash) {
+      throw new Error(`Blob ${blinded} failed content-hash verification`);
+    }
+    return content;
   }
 
   /**
@@ -358,6 +388,147 @@ export class ServerSyncClient {
       }
     }
   }
+
+  /**
+   * Multi-head reconciliation sweep (causal audit Finding B). The remote projection
+   * keeps only the HLC-max op per fileId, so a round that pulled ≥2 concurrent heads
+   * for one file reconciled our head against just that one and left the rest as
+   * un-reconciled DAG leaves. Fold every such extra leaf into our head with the
+   * ordinary pairwise `mergeVaultStates` — a clean fold mints a `write_merge` node,
+   * overlapping edits surface a conflict (markers) — until a single head remains.
+   *
+   * Determinism/commutativity across devices: `mergeVersionId` is content-addressed
+   * and order-independent in its parents, and we fold the extra leaves in a fixed
+   * order (sorted by version-id), so two devices sweeping the same leaves mint the
+   * identical merge node(s) and fast-forward onto each other (no storm). For the
+   * common two-head case both devices fold the same pair, so they converge exactly.
+   *
+   * Scope is the files a *peer* touched this round (the only place a second head can
+   * arrive alongside the collapsed HLC-max). We only fold live↔live edits that share
+   * a real common base — a disconnected re-create root (Finding A) or a tombstone
+   * leaf is left alone (benign per the audit) rather than unioned. An extra leaf's
+   * bytes weren't fetched by the projection, so we stage them here; if the blob is
+   * absent we add its hash to `missingContent` so `safeCursor` holds the cursor and
+   * the leaf re-pulls next round (F3), never silently dropped.
+   */
+  private async reconcileConcurrentHeads(
+    pulled: PulledOp[],
+    dag: VersionDag,
+    ownDeviceId: string,
+    missingContent: Set<string>,
+    deferred: Set<string>,
+  ): Promise<void> {
+    // fileIds a peer touched this round, plus a lookup from a leaf's version-id
+    // (op-id) to the pulled op that carries its path/HLC/type/contentHash — the DAG
+    // node alone doesn't record those.
+    const touched = new Set<string>();
+    const opById = new Map<string, Operation>();
+    for (const { op } of pulled) {
+      opById.set(op.id, op);
+      if (op.hlcTimestamp.deviceId !== ownDeviceId) touched.add(op.fileId);
+    }
+    if (touched.size === 0) return;
+
+    // Each successful fold removes one leaf; the extras are bounded by the ops we
+    // pulled, so this terminates. The +touched guard covers the initial pass.
+    const maxFolds = pulled.length + touched.size + 1;
+    for (let step = 0; step < maxFolds; step++) {
+      const local = await this.host.buildLocalState();
+      // Fold any merge node a previous iteration minted (now a pending op, not yet
+      // in the persisted DAG) into the graph so this fold's LCA/leaf scan sees it.
+      dag = await this.host.recordVersionEdges(local.pendingOps);
+
+      let folded = false;
+      for (const fileId of [...touched].sort()) {
+        // A file the main apply deferred (F5 drift / auto-deferred conflict) re-pulls
+        // next round with the cursor held; reconciling it now would overwrite the
+        // in-window edit the deferral is protecting. Leave it for a settled round.
+        if (deferred.has(fileId)) continue;
+        const le = local.fileEntries.get(fileId);
+        if (!le || le.deleted || !le.headVersionId) continue;
+        const localHead = le.headVersionId;
+
+        // Extra concurrent leaves: open leaves of this file our head does NOT already
+        // descend from. Sorted → deterministic fold order across devices.
+        const extras = dag.leaves(fileId)
+          .filter(v => v !== localHead && !dag.isAncestor(v, localHead))
+          .sort();
+        if (extras.length === 0) continue;
+
+        // First *foldable* extra: a live (non-tombstone) peer edit that shares a real
+        // common base with our head (a genuine Finding-B concurrent edit). A leaf with
+        // no pulled op this round (no metadata to project), a delete, or a disconnected
+        // lineage (mergeBase null — a re-create root, Finding A) is skipped, not unioned.
+        let leafId: string | undefined;
+        let leafOp: Operation | undefined;
+        for (const cand of extras) {
+          const op = opById.get(cand);
+          if (!op || op.type === 'delete') continue;
+          if (dag.mergeBase(localHead, cand) === null) continue;
+          leafId = cand; leafOp = op; break;
+        }
+        if (!leafId || !leafOp) continue;
+
+        const leafHash = dag.contentHashOf(leafId) ?? leafOp.contentHash;
+        // Stage the extra leaf's bytes (the HLC-max projection never fetched them).
+        // Absent on the server → hold the cursor (F3) and retry next round.
+        let bytes = local.contentStore.get(leafHash) ?? null;
+        if (!bytes) bytes = await this.fetchBlob(leafHash);
+        if (!bytes) { missingContent.add(leafHash); continue; }
+
+        // Reconcile our head against this one extra leaf via the ordinary pairwise
+        // merge. The base (LCA) bytes are already staged by buildLocalState (they are
+        // reachable from our head); a known-but-missing base degrades to a conflict
+        // inside mergeVaultStates (F1), never a union.
+        const localOne = singleFileState(local, fileId);
+        const remoteOne = leafRemoteState(leafOp, leafId, leafHash, bytes);
+        const merge = mergeVaultStates(localOne, remoteOne, dag);
+        this.hlc.setCurrent(merge.mergedHlc);
+        await this.host.applyMerge(merge.actions, localOne, remoteOne);
+        folded = true;
+        break; // rebuild from fresh state before the next fold
+      }
+      if (!folded) break;
+    }
+  }
+}
+
+/** A single-file view of the local snapshot, for reconciling one extra leaf against
+ *  the file's head without the merge touching unrelated files. Shares the snapshot's
+ *  content store (read-only in the merge), which already holds the head's bytes and
+ *  the DAG-reachable base bytes. */
+function singleFileState(local: VaultState, fileId: string): VaultState {
+  const le = local.fileEntries.get(fileId)!;
+  return {
+    deviceId: local.deviceId,
+    hlc: local.hlc,
+    fileEntries: new Map([[fileId, le]]),
+    pendingOps: [],
+    contentStore: local.contentStore,
+  };
+}
+
+/** Project one extra concurrent leaf as a one-file remote `VaultState` the pairwise
+ *  merge consumes exactly like the normal remote projection: the leaf's op-id is the
+ *  head the merge reconstructs the base (LCA) from, and its bytes are staged so the
+ *  three-way merge can read the remote side. */
+function leafRemoteState(op: Operation, leafId: string, leafHash: string, bytes: Uint8Array): VaultState {
+  const entry: FileEntry = {
+    id: op.fileId,
+    path: op.path,
+    contentHash: leafHash,
+    hlcTimestamp: op.hlcTimestamp,
+    deleted: false,
+    lastSyncedPath: null,
+    headVersionId: leafId,
+  };
+  return {
+    deviceId: 'server',
+    hlc: op.hlcTimestamp,
+    fileEntries: new Map([[op.fileId, entry]]),
+    pendingOps: [],
+    contentStore: new Map([[leafHash, bytes]]),
+  };
 }
 
 /** How many times a stale-cursor 409 is recovered by re-pulling before we give

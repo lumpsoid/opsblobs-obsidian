@@ -66,6 +66,28 @@ export class VersionDag {
   }
 
   /**
+   * The open *leaves* of a file — the versions of `fileId` that no other node
+   * descends from (nothing lists them as a parent). One leaf ⇒ converged; two or
+   * more ⇒ divergence (concurrent heads that were never united into a merge node).
+   * Used by the multi-head reconciliation sweep (server-sync) to find concurrent
+   * remote heads the HLC-max projection collapsed and left un-reconciled, so the
+   * puller folds them itself rather than waiting on the peer that merged them. A
+   * parent-only stub (no own edge recorded yet) carries `fileId === ''`, so it is
+   * never mis-reported as a leaf of a real file.
+   */
+  leaves(fileId: string): string[] {
+    const hasChild = new Set<string>();
+    for (const node of this.nodes.values()) {
+      for (const p of node.parents) hasChild.add(p);
+    }
+    const out: string[] = [];
+    for (const [id, node] of this.nodes) {
+      if (node.fileId === fileId && !hasChild.has(id)) out.push(id);
+    }
+    return out;
+  }
+
+  /**
    * True when `versionId` is a *merge node* — a reconciliation of two (or more)
    * heads, i.e. it has ≥2 causal parents. Distinguishes a user-resolved conflict
    * (restore/keep-deleted/binary pick, or a clean/text merge) from a plain linear

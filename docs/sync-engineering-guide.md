@@ -440,6 +440,9 @@ logic.**
 
 - `docs/sync-v2-decisions.md` — **why** the engine is a commit DAG keyed by op-id (the
   identity decision, the CRDT rejection, the determinism split, the conflict UX rationale).
+- `docs/multi-head-reconciliation.md` — how a file with **more than two** concurrent heads
+  converges (`reconcileConcurrentHeads`): the push-before-apply lag that lets concurrent raw
+  heads coexist, the sweep that folds them, and the self-healing 3+-head fold-tree footnote.
 - `docs/sync-v2-migration-spec.md` — the ordered, committed migration from v1 → v2
   (point-in-time, but the definitive record of *how each piece landed*).
 - `docs/sync-test-coverage-spec.md` — the testability refactor + two-device scenario

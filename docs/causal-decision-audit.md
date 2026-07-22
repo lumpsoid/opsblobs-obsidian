@@ -35,7 +35,7 @@ audit that enumerated **73 causal-decision points** across `state-merge`, `opera
 |----|------|-------|---------|----------|
 | FIXED | `state-merge` same-content `no_op` | D1 | **fixed** — mints `write_merge` to unite heads | — |
 | A | delete-convergence head-stranding + re-create behavior | D1 | **RE-DIAGNOSED**: stranding benign; re-create conflict is by-design; a real minor bug (re-create left `deleted`) **FIXED** | low |
-| B | `server-sync.ts:~437` `reconstructRemoteState` HLC-max per fileId | D1/D5 | **CONFIRMED gap** — silent-divergence window, eventually-consistent, never lossy | low–med |
+| B | `server-sync.ts:~437` `reconstructRemoteState` HLC-max per fileId | D1/D5 | **FIXED** — multi-head reconciliation sweep folds every stranded concurrent leaf | — |
 | C | `state-merge.ts:~672` `isUnchangedSinceBase` (`contentHash === baseContent`) | D2 | **CLEARED** (data-safe) | — |
 | D | `state-merge.ts:~364` binary `changed since base` by hash | D2 | head-stranding, no net loss — likely OK | low |
 | E | `file-registry.ts:~128` `applyRemoteEntry` HLC-only overwrite | D5 | **dead code** (no callers) | n/a |
@@ -68,32 +68,61 @@ was left `deleted: true` with a stale `contentHash` while its head advanced —
 entry in place (`deleted=false`, fresh `contentHash`/`hlc`) on a create over a tombstone.
 Pinned by `recreate-after-delete.test.ts` → "FIX … resurrects a consistent live entry".
 
-### B — `reconstructRemoteState` collapses concurrent remote heads (CONFIRMED, low–med)
+### B — `reconstructRemoteState` collapses concurrent remote heads (FIXED)
 
 The remote projection keeps only the **HLC-max op per fileId** (`VaultState` is one entry per
-fileId). When a device pulls two concurrent remote heads for one file (3 devices — B edits &
-pushes B1, C edits & pushes C1), the puller A merges only against the HLC-max (C1) and
-**silently ignores B1**, which stays a DAG leaf A never reconciles. Traced dynamics:
+fileId). When a device pulled two concurrent remote heads for one file (3 devices — B edits &
+pushes B1, C edits & pushes C1), the puller A merged only against the HLC-max (C1) and
+**silently ignored B1**, which stayed a DAG leaf A never reconciled. Traced dynamics:
 
 - **The merge does get computed — by C.** C pulls B1 *before* pushing C1, so C produces the
-  merge node M = `merge(B1, C1)` (`write_local, write_merge`). The puller A, however, adopts
-  only C1 → ends at the partial `"base\nC-edit"`, missing B's edit.
+  merge node M = `merge(B1, C1)` (`write_local, write_merge`). The puller A, however, adopted
+  only C1 → ended at the partial `"base\nC-edit"`, missing B's edit.
 - **Self-heals in the common case:** once C re-syncs and pushes M, A and B fast-forward onto
-  it and all three converge (verified: full round-robin → all `"B-edit\nC-edit"`).
-- **Permanent divergence only in a narrow window:** if C computes M then goes offline *before
-  pushing it*, A stays at the partial view indefinitely (B's edit invisible). **No data
-  loss** — B1 is durable on the server and in A's DAG; A simply never reconciles it.
+  it and all three converge (full round-robin → all `"B-edit\nC-edit"`).
+- **Permanent divergence in a narrow window:** if C computed M then went offline *before
+  pushing it*, A stayed at the partial view indefinitely (B's edit invisible). **No data
+  loss** — B1 is durable on the server and in A's DAG; A simply never reconciled it.
 
-So it is a real *silent-divergence window*, but eventually-consistent under normal syncing and
-never lossy — hence low–med, not high.
-**Fix (design decision, deferred).** Make any device that pulls ≥2 concurrent remote leaves
-for a file reconcile them itself, rather than depend on the specific pull-both device staying
-online: either the projection surfaces *all* concurrent heads per fileId (invasive — changes
-`VaultState` shape), or the round adds a **multi-head reconciliation sweep** after apply (fold
-the local head with each extra DAG leaf via the existing pairwise `mergeVaultStates`, minting
-a merge node). A cheaper interim: **surface** it (detect >1 un-reconciled remote leaf and
-defer/flag) so the window is loud, not silent. Discovery test:
-`causal-audit-discovery.test.ts` → "three devices: two concurrent edits".
+**Fix (landed) — multi-head reconciliation sweep.** `ServerSyncClient.runSync` now runs
+`reconcileConcurrentHeads` after the main merge+apply. It makes *any* device that pulled ≥2
+concurrent leaves reconcile them itself, instead of depending on the pull-both device staying
+online:
+
+- **Scope.** The files a *peer* touched this round (where a second head can arrive alongside
+  the collapsed HLC-max). Files the main apply deferred (F5 drift / auto-deferred conflict) are
+  skipped — their cursor is held so the whole round re-pulls and reconciles once settled;
+  reconciling them here would write over the very in-window edit F5 protects.
+- **Enumerate.** For each such file, `VersionDag.leaves(fileId)` gives the open leaves; the
+  *extra* leaves are those the local head does not already descend from (`!isAncestor`). Only
+  live↔live edits that share a real common base (`mergeBase !== null`) are folded — a
+  disconnected re-create root (Finding A) or a tombstone leaf is left alone (benign), never
+  unioned.
+- **Fold.** The local head is folded with each extra leaf, one at a time in **version-id sorted
+  order**, through the *existing* pairwise `mergeVaultStates` — a clean fold mints a
+  `write_merge` node (deterministic content-addressed id, commutative in parents, so two
+  devices sweeping the same leaves mint the identical node and fast-forward onto each other);
+  overlapping edits surface a conflict (inline zdiff3 markers, two-headed) exactly like the
+  normal two-head path. The loop rebuilds local state and repeats until one head remains.
+- **Base + leaf bytes.** The three-way base `LCA(head, leaf)` is an ancestor of the local head,
+  so `buildLocalState` already staged its bytes (`reachableContentHashes`); a known-but-missing
+  base degrades to a conflict inside `mergeVaultStates` (F1). The extra leaf's own bytes weren't
+  fetched by the HLC-max projection, so the sweep stages them (`fetchBlob`); if the blob is
+  absent it is added to `missingContent` so `safeCursor` holds the cursor and the leaf re-pulls
+  next round (F3), never silently dropped.
+- **Round invariants.** The minted merge node is a pending op, pushed next round like any other
+  resolution (push-before-apply is unaffected — the sweep pushes nothing itself). The cursor is
+  still the persisted pull cursor, held back on a missing leaf.
+
+Now-active tests (`causal-audit-discovery.test.ts`): "three devices: two concurrent edits to
+one file both converge on the puller" (the un-skipped acceptance test), and "puller converges
+to the merged content on its own, no further B/C sync" (the permanent-divergence angle — A
+reaches `"B-edit\nC-edit"` in one round, survives a reload, and its merge node later
+fast-forwards onto B without a re-conflict).
+
+The durable design note — the mechanism, the push-before-apply lag, and the 3+-concurrent-head
+convergence/determinism analysis (a self-healing fold-tree footnote) — lives in
+`docs/multi-head-reconciliation.md`.
 
 ### C — `isUnchangedSinceBase` on recurred content (CLEARED, data-safe)
 
