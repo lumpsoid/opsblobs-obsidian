@@ -118,7 +118,8 @@ now **folded into Step 3**, because the remaining `supersedes` uses live in the
 same delete / create-collision / binary branches that Step 3 must move onto the DAG
 (finding #6). Do them as one coherent commit (or split by branch if it stays green).
 
-**The folded Step 3 — retire the scalar ancestor AND the rest of `supersedes`:**
+**The folded Step 3 — retire the scalar ancestor AND the rest of `supersedes` (✅ ALL
+DONE in `b62e039`; the checklist below is what was carried out):**
 - Delete `merge/ancestor-policy.ts` + its test; remove `ancestorContentHash` /
   `ancestorPath` from `FileEntry` and every writer (`file-registry.adoptRemote` /
   `setAncestorHash`, `sync-applicator.updateAncestorHashes`, `vault-sync-host`).
@@ -140,12 +141,20 @@ fall through to three-way); the phantom-delete / F5 / F3 guards.
 
 The Rework section below is now historical (done); Steps 5–8 remain unchanged.
 
-### Step 3 core — the atomic removal: FULL DESIGN (worked out, not yet coded)
+### Step 3 core — the atomic removal: FULL DESIGN (✅ IMPLEMENTED as `b62e039`)
 
-The two prerequisites (`0cf33b8`, `af4a7a4`) are in. What remains is ONE atomic
+> **This section is HISTORICAL** — it is the design that was implemented verbatim as
+> the atomic commit `b62e039`. Kept for provenance and to explain *why* each branch
+> is shaped the way it is; do not re-implement. The one place the code went beyond
+> this design: `buildLocalState` also folds the round's pending-op edges into the
+> in-memory staging DAG (a fresh head can't otherwise reach its base for byte
+> staging, since the persisted DAG gains those edges only later in the round). Where
+> the prose below says "the merge does X" / "Step 3 adds X", read it as done.
+
+The two prerequisites (`0cf33b8`, `af4a7a4`) were in. What remained was ONE atomic
 commit: remove the scalar ancestor + `supersedes` together and move the
-delete/binary/create-collision branches onto the DAG. It cannot be split green
-(the `supersedes` producers and consumers must move together). The design:
+delete/binary/create-collision branches onto the DAG. It could not be split green
+(the `supersedes` producers and consumers had to move together). The design:
 
 **New DAG helper.** `VersionDag.isMergeNode(v): boolean` = `(parents.size ?? 0) >= 2`
 — distinguishes a *resolution* (two-parent merge node) from a plain linear op, so
@@ -197,8 +206,10 @@ isUnchangedSinceBase(survivor, other, dag):
 - `binary_conflict` action carries `parents`; applicator mints an `update` merge
   node for the chosen side (FF-adopted by peers — version-based, content-agnostic).
 - Then DELETE `Ops.resolveUpdate`/`resolveDelete`, `recordResolvedUpdate`/`Delete`,
-  and the `supersedes` branches in `resolveContentConflict` (200/209 — binary now
-  FF-adopts) and `resolveCreateCollision` (replaced by a DAG-FF branch there).
+  and the `supersedes` branches in `resolveContentConflict` (binary now FF-adopts)
+  and `resolveCreateCollision` (replaced by a DAG-FF branch there). *(As built, the
+  applicator unifies all resolution minting in one `mintMergeResolution` helper with
+  a `deleted` flag, rather than separate update/delete PendingResolution kinds.)*
 
 **Create-collision:** `resolveCreateCollision` gets a DAG-FF branch at the top —
 `isAncestor(le.head, re.head)` → adopt `re` (the resolution merge node descends from
@@ -289,33 +300,36 @@ Each will bite a continuation that doesn't know it. **Status tags added after 4a
    `delete-rename-conflict` suite requires. Don't "simplify" it to read only the
    survivor's path.
 
-### Primitives that already exist (built in 4a/4b + prereqs) — REUSE these in Step 3
+### Primitives (built in 4a/4b + prereqs, then extended by Step 3 `b62e039`)
+
+All of these now exist in the code — the **bolded** "Step 3 adds/added" items were
+built as part of `b62e039`. Kept as the map of what lives where.
 
 - `mergeVersionId(contentHash, parents)` (`core/operations.ts`, async) →
   deterministic `m-<sha256>` id, parents sorted (commutative). Merge/resolution
   nodes use it instead of `hlcToString(hlc)`.
 - `Ops.merge(fileId, path, contentHash, hlc, parents, id)` → an `update` merge node
-  (id precomputed by the caller). **Step 3 adds `Ops.mergeDelete(…)` (type `delete`)
-  by the same pattern.**
+  (id precomputed by the caller). **Step 3 added `Ops.mergeDelete(…)` (type
+  `delete`) by the same pattern.**
 - `OperationLogger.recordMergeOp(fileId, path, contentHash, hlc, parents, id)` →
-  records the pending merge op + `setHeadVersion`. **Step 3 adds `recordMergeDelete`.**
-- Applicator `write_merge` case and the `conflict` case's `action.parents` branch
-  are the TEMPLATE for minting a merge node: `hash` the bytes → `id =
-  mergeVersionId(hash, parents)` → `adoptRemote(…, id)` → return
-  `{ kind: 'merge', …, parents, id }` (recorded after `clearOps`). Delete/binary
-  resolutions copy this shape (keep_deleted uses the mergeDelete variant).
-- `PendingResolution` in `sync-applicator.ts` already has `kind: 'merge'` with
-  `parents`/`id`. **Step 3 adds `deleted?: boolean` to dispatch merge vs mergeDelete.**
-- `VersionDag.reachableContentHashes(v)` (base-bytes staging) exists.
-  `VersionDag.contentHashOf` / `isAncestor` / `mergeBase` (returns `MULTIPLE_BASES`
-  sentinel) exist. **Step 3 adds `VersionDag.isMergeNode(v)` = `parents.size >= 2`.**
-- `write_merge` MergeAction + `conflict.parents?` already in `types.ts`. **Step 3
-  adds `parents?` to `delete_conflict`/`binary_conflict` and removes `parentHashes`
-  + `supersedes` + `ancestorContentHash`/`ancestorPath`, adds
-  `FileEntry.lastSyncedPath?`.**
-- New test file `__tests__/merge-node-convergence.test.ts` (keep; it pins the whole
-  merge-node chain). `resolution-convergence.test.ts` strengthened to assert the
-  resolution is an `m-` two-parent node with no `supersedes`.
+  records the pending merge op + `setHeadVersion`. **Step 3 added `recordMergeDelete`.**
+- Applicator: **Step 3 unified all merge-node minting in `mintMergeResolution(fileId,
+  path, contentHash, hlc, parents, deleted?)`** — `hash` the bytes → `id =
+  mergeVersionId(hash, parents)` → `adoptRemote(…, id)` (skipped for a tombstone) →
+  return the PendingResolution (recorded after `clearOps`). `write_merge`, `conflict`,
+  `delete_conflict` (restore + keep_deleted), and `binary_conflict` all route through it.
+- `PendingResolution` in `sync-applicator.ts` is now `{ fileId, path, contentHash,
+  hlc, parents, id, deleted? }` (the `kind: 'update'|'delete'|'merge'` union was
+  collapsed — **`deleted` dispatches recordMergeOp vs recordMergeDelete**).
+- `VersionDag.reachableContentHashes(v)` (base-bytes staging), `contentHashOf` /
+  `isAncestor` / `mergeBase` (returns `MULTIPLE_BASES`) exist. **Step 3 added
+  `VersionDag.isMergeNode(v)` = `parents.size >= 2`.**
+- `types.ts`: **Step 3 added `parents?` to `delete_conflict`/`binary_conflict`,
+  removed `parentHashes` from all conflict actions + `supersedes` + `Operation`'s
+  `supersedes`; `FileEntry` dropped `ancestorContentHash`/`ancestorPath`/`supersedes`
+  and gained `lastSyncedPath?`.**
+- `merge-node-convergence.test.ts` + `resolution-convergence.test.ts` pin the
+  merge-node chain (the latter asserts an `m-` two-parent node).
 
 Current green count: **200** (`npm run build && npx vitest run`). Branch
 `sync-robustness-fixes`, last commit `b62e039` — the folded Step 3 core is DONE;
@@ -505,13 +519,12 @@ tracks the latest op.
 
 ## Step 3 — Retire `ancestor-policy` and `ancestorContentHash`
 
-> ⚠️ **SUPERSEDED / FOLDED.** This original Step 3 and the Step 4 below have been
-> merged into ONE atomic commit. Step 4a/4b (merge nodes for clean merges +
-> content-conflict resolutions) already shipped (`b1ef94e`, `2595d94`); the two
-> prerequisites shipped (`0cf33b8`, `af4a7a4`). The operative, worked-out plan for
-> the remaining atomic commit is **§"Step 3 core — the atomic removal: FULL
-> DESIGN"** near the top of this file. These two sections are kept only for the
-> original goal statements + commit-message seeds.
+> ✅ **DONE (SUPERSEDED / FOLDED).** This original Step 3 and the Step 4 below were
+> merged into ONE atomic commit, shipped as **`b62e039`** (Step 4a/4b had already
+> shipped the merge-node halves in `b1ef94e`/`2595d94`; the prereqs in
+> `0cf33b8`/`af4a7a4`). The worked-out plan that was implemented is §"Step 3 core —
+> the atomic removal: FULL DESIGN" near the top. These two sections are kept only for
+> the original goal statements + commit-message seeds — nothing here is open.
 
 **Goal:** delete the scalar ancestor and its policy entirely.
 
@@ -530,10 +543,10 @@ tracks the latest op.
 
 ## Step 4 — Two-parent merge nodes; retire `supersedes`
 
-> ⚠️ **PARTLY DONE / FOLDED.** Clean merges (4a, `b1ef94e`) and content-conflict
-> resolutions (4b, `2595d94`) are DONE. The remaining `supersedes` removal
-> (binary/delete/create-collision) is folded into the atomic Step 3 core — see
-> §"Step 3 core" near the top. Kept for the original goal statement.
+> ✅ **DONE / FOLDED.** Clean merges (4a, `b1ef94e`) and content-conflict resolutions
+> (4b, `2595d94`) shipped first; the remaining `supersedes` removal
+> (binary/delete/create-collision) shipped in the atomic Step 3 core `b62e039`.
+> `supersedes` is now gone entirely. Kept for the original goal statement.
 
 **Goal:** resolutions and clean merges are versions with `parents: [A, B]`.
 
