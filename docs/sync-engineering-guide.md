@@ -491,6 +491,10 @@ logic.**
 - `OP_FORMAT_AUDIT.md` + `docs/ops-sync-data-safety-spec.md` — op wire format + the
   F-series data-safety invariants in depth.
 - `docs/server-api-spec.md` — the client↔server wire contract (the five endpoints).
+- `docs/pre-release-ux-audit-spec.md` — pre-release UX audit + remediation plan (onboarding,
+  conflict UX, terminology, settings IA, mobile). Point-in-time; presentation only.
+- `docs/mobile-perf-baseline-spec.md` — the mobile performance-baseline plan: benchmarks that
+  establish where time/RAM go **before** any optimization. Names the hot-path hypotheses.
 - `__tests__/helpers/fakes/README.md` — the semantic assumptions the real Obsidian
   adapters must honor.
 
