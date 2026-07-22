@@ -12,6 +12,8 @@
 import { describe, test, expect } from 'vitest';
 import { VersionDagStore } from '../src/network/version-dag-store';
 import { VersionDag } from '../src/core/version-dag';
+import { Operation } from '../src/types';
+import { TestDevice } from './helpers/test-device';
 import { FakeMetadataStore } from './helpers/fakes/metadata-store';
 
 const SNAPSHOT = '.vault-sync/version-dag.json';
@@ -125,5 +127,59 @@ describe('VersionDagStore: snapshot + journal', () => {
   test('missing snapshot and journal → empty DAG', async () => {
     const store = new VersionDagStore(new FakeMetadataStore());
     expect((await store.load()).size()).toBe(0);
+  });
+});
+
+describe('VersionDagStore: auto-compaction (deferred coverage)', () => {
+  // ── DEFERRED (test.skip): auto-compaction fired from inside the round path ──────
+  //
+  // COVERAGE GAP. `recordVersionEdges` (vault-sync-host.ts) appends the round's new
+  // edges, then calls `shouldCompact()` and, once past the threshold, `compact()`.
+  // The three store primitives are each unit-tested above (append→load, compact
+  // folds+clears, load tolerates a torn line). What is NOT exercised end-to-end is
+  // the *wiring* that triggers compaction automatically inside a real round — it
+  // takes COMPACT_THRESHOLD (500) genuinely-new edges to cross, and that constant is
+  // module-private, so a test asserting it would hardcode-couple to `500`.
+  //
+  // WHY DEFERRED, not written now. The clean, non-brittle way to prove this cheaply
+  // is a `compactThreshold` injection on VersionDagStore (a constructor option), so
+  // the test can set it to e.g. 3 rather than manufacturing 500 edges and pinning a
+  // constant that may change. That hook does not exist yet. Priority is low:
+  // `compact()` and its precondition are individually covered; only their
+  // auto-invocation in `recordVersionEdges` is unproven, and that wiring is three
+  // visible lines. When the hook lands: add it, un-skip below, and drop COUNT to a
+  // handful with the injected threshold.
+  //
+  // WHAT IT ASSERTS. After recording more edges than the threshold through the real
+  // host, the journal has been folded into the snapshot and cleared, and `load()`
+  // still reconstructs every edge (compaction loses nothing).
+  test.skip('recordVersionEdges auto-compacts once the journal crosses the threshold', async () => {
+    const device = await TestDevice.create('dev-a');
+    const COUNT = 501; // > COMPACT_THRESHOLD (500) — the coupling a compactThreshold hook removes
+
+    // Synthetic disconnected edges (each its own DAG root) — this test cares about
+    // persistence/compaction plumbing, not merge topology, so it drives
+    // recordVersionEdges directly rather than through the user-action helpers.
+    const ops: Operation[] = Array.from({ length: COUNT }, (_, i) => ({
+      v: 1,
+      id: `op-${i}`,
+      hlcTimestamp: { wallTime: i + 1, counter: 0, deviceId: 'dev-a' },
+      fileId: `file-${i}`,
+      type: 'update',
+      path: `note-${i}.md`,
+      contentHash: `hash-${i}`,
+      parents: [],
+    }));
+
+    await device.host.recordVersionEdges(ops);
+
+    // Crossed the threshold → the journal was folded into the snapshot and cleared.
+    expect(device.metadata.has('.vault-sync/version-dag.json')).toBe(true);
+    expect(device.metadata.has('.vault-sync/version-dag.log')).toBe(false);
+
+    // …and every recorded edge survives the compaction.
+    const dag = await device.versionDagStore.load();
+    expect(dag.size()).toBe(COUNT);
+    expect(dag.has(`op-${COUNT - 1}`)).toBe(true);
   });
 });
