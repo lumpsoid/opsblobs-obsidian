@@ -29,6 +29,25 @@ truth; each device's DAG is a derived cache).
 
 ### What is committed on `sync-robustness-fixes` (newest first)
 
+- `096fa54` refactor(sync): derive conflict state from DAG heads; drop the badge
+  lifecycle — **Step 7, DONE.** "Conflicts" is now a derived query, not a
+  hand-maintained set. Removed the `SyncStateStore` outstanding-conflict lifecycle
+  wholesale (`outstandingConflicts` + `recordConflict`/`clearConflict`/
+  `clearAllConflicts`), the coordinator's clear-on-convergence loop +
+  `clearAllOutstandingConflicts` self-heal, and the now-dead `SyncRoundSummary.converged`
+  plumbing (applicator → host → server-sync → coordinator). Conflicts are two derived
+  facts: text = the registry's two-headed files (`listTwoHeadedConflicts`, since Step
+  6); delete/binary auto-defers = this round's **`deferredConflicts`** (the applicator
+  tags the two DEFER_CONFLICT sites), folded into the observable `deferred` list with
+  `reason: 'conflict'` (vs F5 `'drift'`) and replaced wholesale each round — the held
+  cursor re-surfaces them, so no record/clear/self-heal. `main.conflictCount()` =
+  two-headed files + `coordinator.deferredConflictCount()` (both derived);
+  `decide{Delete,Binary}Conflict` only defer-vs-resolve now; `recheckConflicts` drops
+  the badge-wipe; the status modal splits deferred into "needs attention" (conflict) vs
+  "retries automatically" (drift). Test rewrites: maintenance-under-concurrency (derived
+  two-headed clearing, not `summary.converged`), sync-coordinator (reason-tagging +
+  `deferredConflictCount`), sync-state-store (drop the conflict-set tests, add the
+  drift/conflict split). **212 pass** (215 − 3 removed badge-only tests).
 - `2b2145b` feat(ui): non-blocking conflicts panel with 3-way compare — **Step 6,
   DONE.** A persistent side-panel (`ConflictsView`, an `ItemView` — not a modal) lists
   the *two-headed* files (Step 5 markers on disk) and offers a per-hunk 3-way compare
@@ -129,28 +148,30 @@ flips `parents` **and** wires the DAG merge together (the DAG restores the FF th
 content-hash ancestor used to provide). This matches the spec's own note that "the
 reworked Step 2b is folded into R2's Done-when."
 
-### Immediate next action — Step 7 (simplify sync-state / conflict lifecycle)
+### Immediate next action — Step 8 (GC for merge bases + rewrite the engineering guide)
 
-> **➡ Step 6 is DONE (conflicts panel + compare UX, `2b2145b`).** A persistent
-> `ConflictsView` (ItemView) lists the two-headed files and offers a per-hunk 3-way
-> compare; applying a pick writes marker-free bytes → the Step-5 resolving save. The
-> panel's logic is the obsidian-free `diff3.parseConflictMarkers`/`resolveMarkedText`/
-> `countMarkerConflicts` + `core/conflict-inventory.listTwoHeadedConflicts` (all
-> unit-tested); the view is thin glue (manual-smoke). `main.ts` gained `registerView` +
-> the "Open conflicts panel" command + status-count/click-to-open + ribbon wiring, and
-> `conflictCount()` = two-headed text files + the delete/binary badge. Green gate:
-> **215 pass**. New test `conflict-panel.test.ts`. See the top commit-list entry.
+> **➡ Step 7 is DONE (derive conflict state; drop the badge lifecycle, `096fa54`).**
+> The `SyncStateStore` outstanding-conflict set + its record/clear/clearAll, the
+> coordinator's clear-on-convergence loop + `clearAllOutstandingConflicts` self-heal,
+> and the `SyncRoundSummary.converged` plumbing are all gone. "Conflicts" is two derived
+> facts: text = the registry's two-headed files (`listTwoHeadedConflicts`); delete/binary
+> auto-defers = this round's `deferredConflicts` (applicator-tagged at the two
+> DEFER_CONFLICT sites), surfaced in the observable `deferred` list with
+> `reason: 'conflict'` (vs `'drift'`) and replaced wholesale each round — the held cursor
+> re-surfaces them, so no bookkeeping. `conflictCount()` = two-headed files +
+> `coordinator.deferredConflictCount()`. Green gate: **212 pass**. See the top
+> commit-list entry.
 >
-> **The next step is §"Step 7 — Simplify sync-state / conflict lifecycle"** (below).
-> Note the two conflict-tracking mechanisms Step 6 left side-by-side, which Step 7
-> unifies: (a) the NEW two-headed text conflicts — a *derived* query over
-> `registry.conflictParents` (`twoHeadedConflicts()` / `listTwoHeadedConflicts`), and
-> (b) the OLD `SyncStateStore` outstanding-conflict badge, still hand-maintained for the
-> skipped/deferred delete/binary path (`coordinator.outstandingConflictCount()`). Step 6
-> sums both in `conflictCount()`; Step 7 makes "conflicts" a single derived query (the
-> text path already proves the shape) and retires the badge record/clear/self-heal
-> bookkeeping. Step 8 follows unchanged. The §"Step 3 core" and §"Step 5" sections below
-> are historical/spec — kept for provenance.
+> **The next step is §"Step 8 — GC for merge bases + rewrite the engineering guide"**
+> (below), the LAST migration step. Two parts: (1) `core/content-store.ts` GC retains
+> content for reachable heads + plausible merge bases (retain the parent-link *hashes*
+> longer; a missing base's bytes → degrade to markers, never fabricate — this closes
+> finding #4's GC gap, where `referencedHashes` doesn't yet see the DAG); (2) rewrite
+> `docs/sync-engineering-guide.md` for the v2 DAG model, folding in `sync-v2-decisions.md`
+> and marking the v1 scalar-ancestor sections historical. After Step 8, do the
+> §"After the migration" checklist (re-run the Go-server integration suite; manual smoke
+> in two real vaults; delete this spec's now-historical status notes). The
+> §"Step 3 core" and §"Step 5" sections below are historical/spec — kept for provenance.
 
 <!-- HISTORICAL (Step 5 handoff, kept for provenance):
 > **➡ Step 5 is DONE (inline conflict markers).** A text `conflict` is now surfaced
@@ -403,11 +424,11 @@ built as part of `b62e039`. Kept as the map of what lives where.
 - `merge-node-convergence.test.ts` + `resolution-convergence.test.ts` pin the
   merge-node chain (the latter asserts an `m-` two-parent node).
 
-Current green count: **215** (`npm run build && npx vitest run`). Branch
-`sync-robustness-fixes`, last commit `2b2145b` — Step 6 (conflicts panel + compare
-UX) is DONE; **Step 7 (simplify sync-state / conflict lifecycle) is next.** (215 =
-the 206 at `a627d76` plus 9 new panel tests in `conflict-panel.test.ts` — pure
-parse/resolve + inventory + a two-device e2e.)
+Current green count: **212** (`npm run build && npx vitest run`). Branch
+`sync-robustness-fixes`, last commit `096fa54` — Step 7 (derive conflict state; drop
+the badge lifecycle) is DONE; **Step 8 (GC for merge bases + rewrite the engineering
+guide) is next — the LAST step.** (212 = the 215 at `2b2145b` minus 3 badge-only tests
+removed with the outstanding-conflict lifecycle.)
 
 ## Working rules
 
@@ -687,6 +708,15 @@ the obsidian-free resolution logic is unit-tested.
 **Commit:** `feat(ui): non-blocking conflicts panel with 3-way compare`
 
 ## Step 7 — Simplify sync-state / conflict lifecycle
+
+> ✅ **DONE (`096fa54`).** Shipped as described. See the top status section + the
+> commit-list entry for the as-built summary. One clarification vs the sketch below:
+> the derived query for text conflicts is the existing `listTwoHeadedConflicts`
+> (Step 6) over `registry.conflictParents`, not a new `filesWithTwoHeads()`; and the
+> delete/binary auto-defers (which aren't two-headed on the DAG) are surfaced by
+> tagging this round's `deferred` entries `reason: 'conflict'` from the applicator's
+> `deferredConflicts` subset — derived per-round (replaced wholesale, cursor-held), so
+> still "no hand-maintained set." Kept below for the original goal/commit seed.
 
 **Goal:** "conflicts" is a derived query, not hand-maintained state.
 
