@@ -29,6 +29,21 @@ truth; each device's DAG is a derived cache).
 
 ### What is committed on `sync-robustness-fixes` (newest first)
 
+- `b62e039` feat(merge): retire the scalar ancestor + supersedes; reconcile over
+  the op-id DAG — **THE folded Step 3 core, DONE (atomic).** The scalar content
+  ancestor and `supersedes` are gone; the three-way base is the DAG LCA and every
+  reconciliation (content/delete/binary/create-collision resolution + clean merge)
+  is a two-parent merge node peers fast-forward onto. `FileEntry` drops
+  `ancestorContentHash`/`ancestorPath`/`supersedes`, gains `lastSyncedPath`;
+  `Operation` drops `supersedes`; conflict actions carry `parents` not
+  `parentHashes`. New: `isUnchangedSinceBase` (DAG + `lastSyncedPath` rename check,
+  reads the synced path from whichever side has it — preserves the delete/rename
+  asymmetry for a projected remote), `VersionDag.isMergeNode`, `Ops.mergeDelete` /
+  `recordMergeDelete`, applicator `mintMergeResolution`, registry `setSyncedPath`,
+  applicator `updateSyncedPaths` (path-only, no_op / first-sync send_remote).
+  Deleted `merge/ancestor-policy.ts` + test. `buildLocalState` folds the round's
+  pending-op edges into the in-memory staging DAG so a fresh head reaches its base
+  for byte staging (the old ancestor-staging line had masked this). **200 pass.**
 - `af4a7a4` feat(sync): stage DAG-reachable base bytes in buildLocalState —
   **Step 3 prerequisite, DONE.** `buildLocalState` stages the bytes of every
   version reachable from each file's head (`VersionDag.reachableContentHashes`),
@@ -80,15 +95,20 @@ flips `parents` **and** wires the DAG merge together (the DAG restores the FF th
 content-hash ancestor used to provide). This matches the spec's own note that "the
 reworked Step 2b is folded into R2's Done-when."
 
-### Immediate next action — the folded Step 3 (ORDERING HAZARD is now CLOSED)
+### Immediate next action — Step 5 (conflicts as inline 3-way markers)
 
-> **➡ Jump to §"Step 3 core — the atomic removal: FULL DESIGN"** (below, right after
-> this status block) for the complete, ready-to-code plan. The summary here is
-> context; that section is the spec to implement. Also read §"Primitives that
-> already exist" (in the findings block) — reuse them, don't rebuild. Green gate:
-> `npm run build && npx vitest run` (209 pass now).
+> **➡ The folded Step 3 core is DONE (`b62e039`).** The scalar ancestor and
+> `supersedes` are fully removed; reconciliation is entirely DAG merge nodes. The
+> next step is **§"Step 5 — Conflicts as inline markers at the real path
+> (non-blocking)"** (below): stop blocking on the modal, write zdiff3-style 3-way
+> markers at the real path, and let the next ordinary save (a merge op whose
+> parents are the two heads at conflict time) resolve. Green gate:
+> `npm run build && npx vitest run` (**200 pass** now). Steps 6–8 follow unchanged.
+>
+> The §"Step 3 core — the atomic removal: FULL DESIGN" section below is now
+> historical (implemented as `b62e039`) — kept for provenance; do not re-implement.
 
-Everything is green (**209 tests** as of `a544081`). The Step-3/4 ordering hazard is **resolved**:
+Everything is green (**200 tests** as of `b62e039`). The Step-3/4 ordering hazard was **resolved**:
 Step 4a/4b made clean merges AND content-conflict resolutions real two-parent DAG
 nodes, so a subsequent edit off a merged/resolved file descends from a real node —
 the scalar-ancestor fallback is no longer load-bearing for the content path
@@ -240,10 +260,14 @@ Each will bite a continuation that doesn't know it. **Status tags added after 4a
    ancestor bytes, not DAG LCA base bytes.~~ It now also stages every
    `dag.reachableContentHashes(headVersionId)` the content store holds, so a base
    deeper than the last sync is available and deep-LCA merges succeed instead of
-   degrading to a conflict. **Still TODO in Step 3:** the OLD
-   `resolved.ancestorContentHash` staging line is still present (additive) — remove
-   it in the purge; the DAG-reachable staging replaces it. **GC retention of these
-   base bytes is Step 8** (`referencedHashes` doesn't see the DAG yet).
+   degrading to a conflict. **DONE in Step 3 (`b62e039`):** the old
+   `resolved.ancestorContentHash` staging line is removed; DAG-reachable staging is
+   the sole path, and `buildLocalState` now also folds the round's *pending-op*
+   edges into the in-memory staging DAG so a fresh head can reach its base (the
+   persisted DAG only gains those edges later in the round — the deleted scalar line
+   had been masking this gap). **GC retention of these base bytes is still Step 8**
+   (`referencedHashes` doesn't see the DAG yet, so a GC'd base degrades a deep merge
+   to a conflict — safe, not loss).
 
 5. **DAG persistence is a full rewrite per round, not the incremental append the
    decisions doc §3 corollary calls for.** `VersionDagStore.save` does
@@ -252,13 +276,18 @@ Each will bite a continuation that doesn't know it. **Status tags added after 4a
    op-id design set out to avoid. Deferred perf; make it append-only (one line per
    new edge) before the DAG grows large. Not required for correctness.
 
-6. ⏳ **THE Step 3 core (still open).** The delete / rename-vs-delete / binary /
-   create-collision branches still read the scalar ancestor + `supersedes`. 2b/4b
-   only moved the *both-modified content* path onto the DAG. The move-head prereq
-   (`0cf33b8`) now makes LCA work across a rename, so the DAG rewrite in §"Step 3
-   core" above is unblocked. Reimplement rename-vs-delete on `lastSyncedPath` and
-   "unchanged since the common base" via `dag.mergeBase`, gate resolution-adoption
-   on `dag.isMergeNode` — do not just delete the fields.
+6. ✅ **DONE (`b62e039`).** ~~THE Step 3 core.~~ The delete / rename-vs-delete /
+   binary / create-collision branches are all on the DAG now: rename-vs-delete via
+   `lastSyncedPath` in `isUnchangedSinceBase` (reading the synced path from
+   whichever side carries it, so a projected-remote rename is still caught),
+   "unchanged since the common base" via `dag.mergeBase`, resolution-adoption gated
+   on `dag.isMergeNode` + `dag.isAncestor`. The scalar ancestor and `supersedes`
+   are gone. **Non-obvious for a continuation:** the `le.deleted && !re.deleted`
+   direction is now symmetric/commutative (it used to *always* conflict because the
+   projected remote's scalar ancestor was null) — the `lastSyncedPath`-from-either-
+   side rename check is what keeps the delete/rename asymmetry the
+   `delete-rename-conflict` suite requires. Don't "simplify" it to read only the
+   survivor's path.
 
 ### Primitives that already exist (built in 4a/4b + prereqs) — REUSE these in Step 3
 
@@ -288,9 +317,12 @@ Each will bite a continuation that doesn't know it. **Status tags added after 4a
   merge-node chain). `resolution-convergence.test.ts` strengthened to assert the
   resolution is an `m-` two-parent node with no `supersedes`.
 
-Current green count: **209** (`npm run build && npx vitest run`). Branch
-`sync-robustness-fixes`, last commit `a544081` (this handoff) — Step 3 core not yet
-coded.
+Current green count: **200** (`npm run build && npx vitest run`). Branch
+`sync-robustness-fixes`, last commit `b62e039` — the folded Step 3 core is DONE;
+**Step 5 (inline 3-way conflict markers) is next.** (The count dropped from 209
+because the 9 `ancestor-policy.test.ts` unit tests were removed with the file; the
+send_remote-path-rule + delete/rename intent they guarded are now preserved through
+the DAG and the delete-rename / concurrent-conflict integration suites.)
 
 ## Working rules
 
