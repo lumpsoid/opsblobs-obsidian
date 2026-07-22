@@ -29,39 +29,57 @@ truth; each device's DAG is a derived cache).
 
 ### What is committed on `sync-robustness-fixes` (newest first)
 
-- `50dd790` feat: persist a content version-DAG — **Step 2a. Keyed by content hash
-  → must be reworked to op-id (see Rework R2 below).**
+- `d61ab66` feat(merge): derive the three-way base from the op-id DAG (LCA) —
+  **Rework R1-flip + R2 + Step 2b, DONE.** `parents` are version-ids; the DAG is
+  keyed by op-id carrying `contentHash`; the merge fast-forwards / LCA-bases off
+  the DAG.
+- `e0be88a` refactor(sync): track headVersionId on the registry — **Rework R1a
+  (additive), DONE.** Registry persists `headVersionId`; nothing read it yet.
+- `50dd790` feat: persist a content version-DAG — Step 2a (superseded/reworked by
+  the two commits above; the store/plumbing were reused).
 - `b511e64` docs: refine Step 2 into 2a/2b.
-- `78de087` refactor: op `parents[]` replacing `baseContentHash` — **Step 1.
-  `parents` currently hold content hashes → must be reworked to version-ids (R1).**
+- `78de087` refactor: op `parents[]` replacing `baseContentHash` — Step 1
+  (parents' *meaning* reworked to version-ids by `d61ab66`).
 - `b6b3bed` docs: v2 decisions + this spec.
 - (earlier, unrelated to v2) `436ad7c` fast-forward sequential-edit fix (the
   `baseContentHash`+FF shipped in v1; superseded by the DAG), `cca55a6` onload
   gotcha, `628b5a7` cold-start phantom-delete fix.
 
-### What is sound vs. needs rework
+### Why R1 became two commits (not one)
 
-- **Sound / reusable as-is:** the `VersionDag` *structure* in `src/core/version-dag.ts`
-  (`addVersion` / `isAncestor` / `mergeBase` returning hash | `null` |
-  `MULTIPLE_BASES`) — it operates on opaque string keys, so it works unchanged over
-  op-ids. `src/network/version-dag-store.ts` persistence. The round-level
-  `recordVersionEdges` plumbing through `VaultSyncHost` / `PluginVaultSyncHost` /
-  `main.ts` / `TestDevice`.
-- **Needs rework (content-hash → op-id):** what gets fed into the DAG and the merge.
-  Today `Operation.parents` hold **content hashes** and `reconstructRemoteState`
-  maps `parents[0]` to the scalar `ancestorContentHash`. These must become
-  **version-ids** (op-ids), and the registry must gain a per-file `headVersionId`.
+The merge's fast-forward is load-bearing and depended on `parents` being **content
+hashes** (surfaced as `re.ancestorContentHash`). Flipping `parents` to version-ids
+*breaks* that FF until the merge reads the DAG — so R1's flip could not be a
+separately-green commit. The green-gate-honouring split was: `e0be88a` adds
+`headVersionId` additively (nothing reads it → trivially green), then `d61ab66`
+flips `parents` **and** wires the DAG merge together (the DAG restores the FF the
+content-hash ancestor used to provide). This matches the spec's own note that "the
+reworked Step 2b is folded into R2's Done-when."
 
-### Immediate next actions (do these in order)
+### Immediate next action — Step 3, with an ORDERING HAZARD
 
-1. **Rework R1** — make `parents` version-ids; add `headVersionId` to the registry.
-2. **Rework R2** — key the `VersionDag` population by version-id (op.id) not content
-   hash; carry `contentHash` as a node field for blob lookup.
-3. **Step 2b** — merge computes its base from the DAG (LCA over version-ids).
-4. Continue Steps 3–8 as written below.
+Everything is green (**204 tests**). The next planned step is **Step 3 (retire
+`ancestor-policy` + `ancestorContentHash`)** — but do NOT do it before reading this:
 
-R1+R2 are detailed in "## Rework — op-id identity" immediately after Step 2. Do them
-before Step 2b. Everything is green today (198 tests); keep it green per step.
+> **A clean three-way merge currently produces a *synthetic* head version-id that is
+> NOT a DAG node.** Redundant clean merges are not pushed, so no op (hence no DAG
+> node) is minted for them; `adoptRemote` sets the head to `hlcToString(hlcMax)`,
+> a version-id with no recorded content hash. The *next* edit off a clean-merged
+> file therefore can't find its base in the DAG (`contentHashOf` → undefined,
+> `mergeBase` → null) and **falls back to the scalar `ancestorContentHash`**, which
+> is still maintained by ancestor-policy. That fallback is what keeps clean-merged
+> files converging on subsequent edits (verified: the LCA test's second edit path).
+
+Consequence: **Step 3 (remove the scalar ancestor) must not land before Step 4
+(two-parent merge nodes), which makes clean merges real DAG nodes.** Recommended
+re-order: **do Step 4 before Step 3**, or fold them. If Step 3 goes first, a
+clean-merged file's next edit loses its base and can mis-merge / union — exactly
+the class of silent-divergence bug v2 exists to kill. The `localAtHead` guard in
+`resolveContentConflict` (an unlogged in-window edit leaves the head stale → don't
+FF-adopt → fall through to three-way) is the other subtlety to preserve.
+
+The Rework section below is now historical (done); Steps 3–8 remain, subject to the
+re-order above.
 
 ## Working rules
 
@@ -162,11 +180,15 @@ Step 2b is folded into R2's "Done when".
 
 ---
 
-## Rework — op-id identity (do BEFORE Step 2b)
+## Rework — op-id identity (✅ DONE — historical)
 
-Steps 1 and 2a are committed but used **content-hash** as the version identity,
-which cycles on recurring content. Rework them to **op-id** identity. Keep the suite
-green (198 today) at each rework commit.
+> **Committed as `e0be88a` (R1a additive `headVersionId`) + `d61ab66` (R1-flip +
+> R2 + Step 2b together).** Kept below for the design rationale. See the status
+> section above for the split rationale and the Step 3 ordering hazard.
+
+Steps 1 and 2a were committed but used **content-hash** as the version identity,
+which cycles on recurring content. Reworked to **op-id** identity, suite green
+(204) at each rework commit.
 
 ### Rework R1 — `parents` are version-ids; registry tracks `headVersionId`
 
