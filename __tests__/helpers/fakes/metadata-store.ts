@@ -23,6 +23,11 @@ export class FakeMetadataStore implements MetadataStore {
     if (!this.mtimes.has(path)) this.mtimes.set(path, this.clock);
   }
 
+  async append(path: string, data: string): Promise<void> {
+    this.files.set(path, (this.files.get(path) ?? '') + data);
+    if (!this.mtimes.has(path)) this.mtimes.set(path, this.clock);
+  }
+
   async exists(path: string): Promise<boolean> {
     if (this.files.has(path)) return true;
     // A directory "exists" if any file lives under it.

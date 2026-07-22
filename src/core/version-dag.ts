@@ -44,21 +44,29 @@ export class VersionDag {
    * parent-only stub recorded earlier may still be missing. A self-parent
    * (`parent === versionId`) is ignored defensively so a malformed op can't create
    * a 1-cycle (though op-ids are HLC-monotonic, so this can't arise in practice).
+   *
+   * Returns whether this call actually mutated the graph (a new node, a
+   * newly-learned parent, or a backfilled hash/fileId) — the incremental
+   * persistence layer journals only genuinely-new edges, so re-recording an op we
+   * already hold (our own ops re-pull every round) writes nothing.
    */
-  addVersion(versionId: string, parents: string[], contentHash: string, fileId: string): void {
+  addVersion(versionId: string, parents: string[], contentHash: string, fileId: string): boolean {
+    let changed = false;
     let node = this.nodes.get(versionId);
     if (!node) {
       node = { parents: new Set<string>(), contentHash, fileId };
       this.nodes.set(versionId, node);
+      changed = true;
     } else {
       // A node may have been created as a parent reference before its own edge was
       // recorded; backfill its blob address / fileId once the real op arrives.
-      if (!node.contentHash && contentHash) node.contentHash = contentHash;
-      if (!node.fileId && fileId) node.fileId = fileId;
+      if (!node.contentHash && contentHash) { node.contentHash = contentHash; changed = true; }
+      if (!node.fileId && fileId) { node.fileId = fileId; changed = true; }
     }
     for (const p of parents) {
-      if (p !== versionId) node.parents.add(p);
+      if (p !== versionId && !node.parents.has(p)) { node.parents.add(p); changed = true; }
     }
+    return changed;
   }
 
   has(versionId: string): boolean {

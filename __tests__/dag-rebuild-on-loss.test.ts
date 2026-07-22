@@ -23,7 +23,9 @@ import { FakeSyncServer } from '../src/network/fake-server';
 import { TestDevice } from './helpers/test-device';
 
 const SALT = new Uint8Array([9, 8, 7, 6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]);
-const DAG_PATH = '.vault-sync/version-dag.json';
+// The DAG persists as a snapshot + an append-only journal; a genuine loss drops both.
+const DAG_SNAPSHOT = '.vault-sync/version-dag.json';
+const DAG_JOURNAL = '.vault-sync/version-dag.log';
 
 const onDisk = async (d: TestDevice, path = 'note.md'): Promise<string> => {
   const bytes = await d.files.read(path);
@@ -61,8 +63,9 @@ describe('a lost version-DAG is rebuilt from the server log on the next sync', (
     expect((await B.versionDagStore.load()).has(head)).toBe(true);   // DAG is healthy…
     expect(await B.cursor()).toBeGreaterThan(0);                     // …and we've synced
 
-    // ── Simulate a lost/corrupt version-dag.json (torn write / deleted file). ─
-    await B.metadata.remove(DAG_PATH);
+    // ── Simulate a lost/corrupt version DAG (torn write / deleted files). ─────
+    await B.metadata.remove(DAG_SNAPSHOT);
+    await B.metadata.remove(DAG_JOURNAL);
     expect((await B.versionDagStore.load()).size()).toBe(0);         // loads empty
     expect((await B.versionDagStore.load()).has(head)).toBe(false);  // precondition: lost
 

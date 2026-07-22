@@ -17,7 +17,7 @@ import { OperationLogger } from '../core/operation-logger';
 import { SyncApplicator } from './sync-applicator';
 import { HybridLogicalClock } from '../core/hlc';
 import { CursorStore } from './cursor-store';
-import { VersionDagStore } from './version-dag-store';
+import { VersionDagStore, EdgeRecord } from './version-dag-store';
 import { VersionDag } from '../core/version-dag';
 
 export class PluginVaultSyncHost implements VaultSyncHost {
@@ -113,11 +113,24 @@ export class PluginVaultSyncHost implements VaultSyncHost {
     // Key by op-id (the version identity), carrying the content hash as the blob
     // address. A `move` carries no content parent and is not a new content version;
     // recording it is harmless (a childless node) but adds nothing, so skip it.
+    //
+    // Persist incrementally: append only the edges that actually changed the graph
+    // (addVersion reports it) — our own ops re-pull every round, so appending
+    // unconditionally would grow the journal without bound. The O(N) full rewrite
+    // is deferred to a periodic compaction.
+    const newEdges: EdgeRecord[] = [];
     for (const op of ops) {
       if (op.type === 'move') continue;
-      dag.addVersion(op.id, op.parents, op.contentHash, op.fileId);
+      if (dag.addVersion(op.id, op.parents, op.contentHash, op.fileId)) {
+        newEdges.push({ v: op.id, p: op.parents, c: op.contentHash, f: op.fileId });
+      }
     }
-    await this.versionDagStore.save(dag);
+    if (newEdges.length > 0) {
+      await this.versionDagStore.appendEdges(newEdges);
+      if (await this.versionDagStore.shouldCompact()) {
+        await this.versionDagStore.compact(dag);
+      }
+    }
     return dag;
   }
 

@@ -11,8 +11,14 @@
 export interface MetadataStore {
   /** File contents as text, or null if the path is absent. */
   read(path: string): Promise<string | null>;
-  /** Create-or-overwrite the file with text data. */
+  /** Create-or-overwrite the file with text data. Atomic — a reader never sees a
+   *  torn/partial file even if the process is killed mid-write. */
   write(path: string, data: string): Promise<void>;
+  /** Append text to the file, creating it if absent. Used by the version-DAG
+   *  journal to persist a round's *new* edges in O(delta) rather than rewriting
+   *  the whole graph. Need not be atomic — a torn trailing append is tolerated by
+   *  the journal reader, which drops an unparseable final line. */
+  append(path: string, data: string): Promise<void>;
   /** Whether a file or directory exists at the path. */
   exists(path: string): Promise<boolean>;
   /** Create a directory (and any missing parents). */

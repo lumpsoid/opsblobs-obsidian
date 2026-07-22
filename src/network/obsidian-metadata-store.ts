@@ -48,6 +48,13 @@ export class ObsidianMetadataStore implements MetadataStore {
     await adapter.rename(tmp, target);
   }
 
+  async append(path: string, data: string): Promise<void> {
+    // A plain (non-atomic) append — the journal reader tolerates a torn trailing
+    // line, and the whole file is content it can also re-derive from the log, so
+    // atomicity here would only cost the O(delta) win the journal exists for.
+    await this.app.vault.adapter.append(normalizePath(path), data);
+  }
+
   async exists(path: string): Promise<boolean> {
     return this.app.vault.adapter.exists(normalizePath(path));
   }
