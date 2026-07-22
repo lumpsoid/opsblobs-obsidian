@@ -149,6 +149,38 @@ describe('VaultCrypto — key verification', () => {
   });
 });
 
+describe('VaultCrypto — key-check record (passphrase/key-agreement guard)', () => {
+  test('a record built under a key verifies true only under the same passphrase+salt', async () => {
+    const a = new VaultCrypto();
+    const same = new VaultCrypto();
+    const wrongPass = new VaultCrypto();
+    const wrongSalt = new VaultCrypto();
+    await a.deriveFromPassphrase('pw', SALT);
+    await same.deriveFromPassphrase('pw', SALT);
+    await wrongPass.deriveFromPassphrase('pW', SALT);
+    await wrongSalt.deriveFromPassphrase('pw', SALT_2);
+
+    const record = await a.buildKeyCheck();
+
+    expect(await a.verifyKeyCheck(record)).toBe(true);          // self
+    expect(await same.verifyKeyCheck(record)).toBe(true);        // peer with the same key
+    expect(await wrongPass.verifyKeyCheck(record)).toBe(false);  // GCM auth fails — wrong key
+    expect(await wrongSalt.verifyKeyCheck(record)).toBe(false);
+  });
+
+  test('verifyKeyCheck returns false (never throws) on garbage bytes', async () => {
+    const a = new VaultCrypto();
+    await a.deriveFromPassphrase('pw', SALT);
+    expect(await a.verifyKeyCheck(new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]))).toBe(false);
+  });
+
+  test('the record before derivation throws', async () => {
+    const vc = new VaultCrypto();
+    await expect(vc.buildKeyCheck()).rejects.toThrow();
+    await expect(vc.verifyKeyCheck(new Uint8Array(16))).rejects.toThrow();
+  });
+});
+
 describe('VaultCrypto — guards', () => {
   test('operations before derivation throw', async () => {
     const vc = new VaultCrypto();

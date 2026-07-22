@@ -184,6 +184,21 @@ GET /v1/vaults/{vaultId}/blobs/{hash}
 ```
 **200** `application/octet-stream` (encrypted bytes) · **404** if absent.
 
+### 5.4 Reserved key-check blob (client convention — no server change)
+
+The client stores a **key-check record** at a reserved, well-known blob key —
+`sha256("vault-sync:keycheck:v1")` (a fixed 64-hex value, *not* a blinded content hash, so it
+resolves to the same slot on every device regardless of passphrase and can't collide with a real
+content hash). The body is `encryptBlob(JSON{v,tag})` sealing the vault's `verifyTag`. On every
+round a device GETs this slot and verifies it against its own derived key *before* trusting or
+pushing; a mismatch (mistyped passphrase / wrong salt) fails clean rather than wedging the vault
+into two key regimes. The first device to establish the vault PUTs it (idempotent, first-write-
+wins). **This needs no server support beyond the ordinary blob endpoints** — it is opaque
+ciphertext at a normal blob key. GC caveat (phase 2): the key-check blob is referenced by no op,
+so a checkpoint-driven blob GC (§6) must treat this reserved key as always-live. Withholding it is
+an *availability* degradation (→ the pre-guard status quo), consistent with the §9-non-goal on log
+completeness.
+
 ---
 
 ## 6. Checkpoint endpoints (optional, phase 2)

@@ -174,7 +174,7 @@ describe('ServerSyncClient — full round against the fake', () => {
     // ── Round on A: push the create ──────────────────────────────────────────
     await client(server, vc, deviceA).runSync();
     expect(server.opCount).toBe(1);
-    expect(server.blobCount).toBe(1);
+    expect(server.blobCount).toBe(2); // the file's content blob + the vault key-check record
     expect(deviceA.pendingOps).toHaveLength(0);
     expect(await deviceA.cursor()).toBe(0); // nothing pulled; our own op re-pulls next round
 
@@ -226,7 +226,7 @@ describe('ServerSyncClient — full round against the fake', () => {
     // ── A pushes the create: both the blob and the op land on the server. ──
     await clientFor(deviceA).runSync();
     expect(inner.opCount).toBe(1);
-    expect(inner.blobCount).toBe(1);
+    expect(inner.blobCount).toBe(2); // the file's content blob + the vault key-check record
 
     // ── B pulls while the blob is unavailable — the op is consumed but its
     //    content can't be fetched, so the file must NOT be applied and the
@@ -295,7 +295,7 @@ describe('ServerSyncClient — full round against the fake', () => {
     await client(server, vc, deviceB).runSync();
 
     expect(server.opCount).toBe(2);   // two ops
-    expect(server.blobCount).toBe(1); // but one shared blob (dedup held)
+    expect(server.blobCount).toBe(2); // one shared content blob (dedup held) + the vault key-check record
   });
 
   test('runSync returns a summary of what the round did (S2)', async () => {

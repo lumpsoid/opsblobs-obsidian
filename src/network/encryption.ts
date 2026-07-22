@@ -108,6 +108,53 @@ export class VaultCrypto {
     return this.verifyTag.slice(0, 12);
   }
 
+  // --- Vault key-check record (passphrase/key-agreement guard) -------------------
+  //
+  //  The onboarding footgun this closes: a device with a mistyped passphrase syncing
+  //  into an empty vault would happily push ops under a divergent key, and the correct
+  //  device would later pull and die on a raw AES decrypt exception — the vault wedged
+  //  into two key regimes with no actionable message. The first device to establish a
+  //  vault stamps this record; every device confirms it against its own derived key
+  //  *before* trusting or pushing, turning that wedge into a clean "passphrase doesn't
+  //  match this vault" failure (see server-sync.ts's key-check step).
+
+  /**
+   * Build the encrypted key-check record to stamp on the server for this vault.
+   * It seals the verifyTag under the encryption key, so a peer can only reproduce
+   * and match it with the same passphrase+salt: decryption fails outright under a
+   * wrong key (GCM auth), and even a fluke decrypt won't match the tag. Encrypting
+   * (rather than storing the tag in the clear) avoids handing the untrusted server a
+   * stable per-passphrase fingerprint.
+   */
+  async buildKeyCheck(): Promise<Uint8Array> {
+    if (!this.verifyTag) throw new Error('No vault key derived');
+    const body = new TextEncoder().encode(JSON.stringify({ v: 1, tag: this.verifyTag }));
+    return this.seal(body);
+  }
+
+  /**
+   * Verify a key-check record produced by {@link buildKeyCheck}. Returns true only
+   * when this device's derived key both decrypts the record AND the sealed tag
+   * matches our own — i.e. same passphrase+salt. Any failure (wrong key → GCM auth
+   * error, or a mismatched/garbled tag) returns false rather than throwing, so the
+   * caller can surface a clean, self-explaining error.
+   */
+  async verifyKeyCheck(envelope: Uint8Array): Promise<boolean> {
+    if (!this.verifyTag) throw new Error('No vault key derived');
+    let plaintext: Uint8Array;
+    try {
+      plaintext = await this.open(envelope);
+    } catch {
+      return false; // wrong key — GCM authentication failed
+    }
+    try {
+      const parsed = JSON.parse(new TextDecoder().decode(plaintext)) as { tag?: unknown };
+      return parsed.tag === this.verifyTag;
+    } catch {
+      return false;
+    }
+  }
+
   // --- Op envelope: JSON ⇄ base64(nonce‖AES-GCM ciphertext) ---------------------
 
   /** Encrypt a serializable op record. Returns base64 for the JSON `ciphertext` field. */

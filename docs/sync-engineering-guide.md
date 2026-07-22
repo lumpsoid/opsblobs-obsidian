@@ -170,6 +170,17 @@ relevant `core`/`merge` unit) with a port for the Obsidian bit.
 
 `ServerSyncClient.runSync()` (`server-sync.ts`) — the order and the *why* both matter:
 
+0. **Key-agreement guard.** GET the vault's **key-check record** (a reserved, non-blinded
+   64-hex blob slot, `sha256("vault-sync:keycheck:v1")`) and `verifyKeyCheck` it against this
+   device's derived key *before* decrypting a single pulled op or pushing under our key. A
+   present record our key can't reproduce → throw `KeyMismatchError` (a mistyped passphrase /
+   wrong salt) — a clean, self-explaining failure instead of a two-key wedge or a raw AES
+   exception mid-pull. Absent → nobody stamped the vault yet; we `buildKeyCheck` + PUT it once
+   our key is *established* (we decrypted existing ops, or we're the first device pushing),
+   before pushing our ops. The PUT is idempotent/first-write-wins, so a race resolves to one
+   record and the loser is caught by the guard next round. A withholding server (omission →
+   staleness, per the spec threat model) degrades this to the pre-guard status quo, never
+   corruption.
 1. **`buildLocalState()`** — snapshot registry entries + pending ops + content. It
    re-hashes live files against the registry and corrects the snapshot to the *real disk
    hash* (never the stale recorded one) so the merge compares true content. It also

@@ -231,7 +231,7 @@ describe('round interruption & durability (C1–C4)', () => {
     // blob is on the server, the op is not, and the oplog wasn't cleared.
     const crashing = new ServerSyncClient({ api: crashOnce, crypto: vc, host: A.host, hlc: A.hlc });
     await expect(crashing.runSync()).rejects.toThrow('simulated crash after putBlob');
-    expect(inner.blobCount).toBe(1);
+    expect(inner.blobCount).toBe(2); // the file's content blob + the vault key-check record (both land before the append)
     expect(inner.opCount).toBe(0);
     expect(A.pendingOps).toHaveLength(1);
 
@@ -239,7 +239,7 @@ describe('round interruption & durability (C1–C4)', () => {
     //    already present (no re-upload), and the op lands exactly once. ──
     const A2 = await A.reload();
     await new ServerSyncClient({ api: inner, crypto: vc, host: A2.host, hlc: A2.hlc }).runSync();
-    expect(inner.blobCount).toBe(1);  // no duplicate blob
+    expect(inner.blobCount).toBe(2);  // no duplicate blob (content + key-check, both already present)
     expect(inner.opCount).toBe(1);    // op landed once
     expect(A2.pendingOps).toHaveLength(0);
 

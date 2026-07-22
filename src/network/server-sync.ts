@@ -60,6 +60,22 @@ export class StaleCursorError extends Error {
   }
 }
 
+/** The vault on the server was established under a different key than this device
+ *  derived — a mistyped passphrase (or wrong salt). Thrown *before* any remote op is
+ *  trusted or any local op is pushed, so a key mismatch is a clean, self-explaining
+ *  failure at the moment onboarding is most fragile, not a silent two-key wedge (or a
+ *  raw AES decrypt exception on the first pulled op). Surfaced verbatim by the
+ *  coordinator's error toast. */
+export class KeyMismatchError extends Error {
+  constructor() {
+    super(
+      "This device's sync passphrase doesn't match the vault already on the server. " +
+        'Check the passphrase in Vault Sync settings — it must be identical on every device.',
+    );
+    this.name = 'KeyMismatchError';
+  }
+}
+
 /**
  * The five spec endpoints (§4–§5). Implemented over `requestUrl` in prod
  * (HttpServerApi) and in memory for tests (FakeSyncServer). Blob bytes are the
@@ -186,6 +202,23 @@ export class ServerSyncClient {
   async runSync(): Promise<SyncRoundSummary> {
     if (!this.crypto.isReady()) throw new Error('Vault key not derived');
 
+    // ── 0. Passphrase / key-agreement guard ─────────────────────────────────
+    // Before we decrypt a single pulled op or push under our key, confirm this
+    // device's derived key is the one the vault was established with. A present
+    // record that our key can't reproduce means a mistyped passphrase (or wrong
+    // salt): fail loudly and actionably here rather than wedging the vault into two
+    // key regimes or dying on a raw AES exception mid-pull. Absent → nobody has
+    // stamped the vault yet; we claim it below once our key is established (we
+    // decrypted existing ops, or we're the first device pushing). The GET degrades
+    // to "no record" on a withholding server (spec threat model: omission → the
+    // pre-guard status quo, never corruption).
+    const keyCheckKey = await this.keyCheckBlobKey();
+    const existingKeyCheck = await this.api.getBlob(keyCheckKey);
+    if (existingKeyCheck && !(await this.crypto.verifyKeyCheck(existingKeyCheck))) {
+      throw new KeyMismatchError();
+    }
+    const keyCheckAbsent = existingKeyCheck === null;
+
     // Self-heal a lost/corrupt version-DAG before reading the cursor. If the graph
     // was torn away (an old build's non-atomic write, a deleted metadata file) but
     // we've synced before, rewind the cursor so this round re-pulls the whole
@@ -212,6 +245,18 @@ export class ServerSyncClient {
     // reconstructRemoteState docs).
     const remote = reconstructRemoteState(pulled.map(p => p.op), local.deviceId);
     const missingContent = await this.fetchRemoteBlobs(remote, local);
+
+    // ── 2b. Claim the key-check record if the vault has none yet ─────────────
+    // Stamp it once our key is established: either we successfully decrypted the
+    // remote ops we just pulled (our key matches an existing, pre-guard vault — this
+    // upgrades it in place), or we're the first device pushing into an empty vault (we
+    // define the key). PUT is idempotent and first-write-wins, so a race resolves to a
+    // single record and any wrong-key claimer is caught by the mismatch check above on
+    // the next device. Do this before pushing our ops so the guard never lags behind
+    // the very ops it protects.
+    if (keyCheckAbsent && (pulled.length > 0 || local.pendingOps.length > 0)) {
+      await this.api.putBlob(keyCheckKey, await this.crypto.buildKeyCheck());
+    }
 
     // ── 3. Push our pending ops (blobs first, then the append) ───────────────
     if (local.pendingOps.length > 0) {
@@ -280,6 +325,24 @@ export class ServerSyncClient {
       stranded: [...missingContent],
       deferredConflicts: [...deferredConflicts],
     };
+  }
+
+  /**
+   * The well-known blob slot that holds the vault's key-check record. A fixed,
+   * non-secret value hashed to 64 hex chars so it's format-compatible with a real
+   * content hash (the server treats blobs opaquely; some may validate the key shape)
+   * and cannot collide with a blinded content hash. It is deliberately *not* blinded
+   * by the vault key: a wrong-passphrase device must resolve the *same* slot so it
+   * finds — and fails to reproduce — the existing record, rather than looking past it.
+   * Per-vault namespacing comes from the `/vaults/{vaultId}/blobs/` path, so a constant
+   * body key is safe across vaults.
+   */
+  private cachedKeyCheckBlobKey?: string;
+  private async keyCheckBlobKey(): Promise<string> {
+    if (!this.cachedKeyCheckBlobKey) {
+      this.cachedKeyCheckBlobKey = await sha256Hex(new TextEncoder().encode('vault-sync:keycheck:v1'));
+    }
+    return this.cachedKeyCheckBlobKey;
   }
 
   /**
