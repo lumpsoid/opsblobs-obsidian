@@ -29,6 +29,26 @@ truth; each device's DAG is a derived cache).
 
 ### What is committed on `sync-robustness-fixes` (newest first)
 
+- `2b2145b` feat(ui): non-blocking conflicts panel with 3-way compare — **Step 6,
+  DONE.** A persistent side-panel (`ConflictsView`, an `ItemView` — not a modal) lists
+  the *two-headed* files (Step 5 markers on disk) and offers a per-hunk 3-way compare
+  (mine | base | theirs) with per-hunk pick + preview + global side-pickers. Applying a
+  resolution writes the marker-free bytes through the vault → the ordinary Step-5
+  resolving save (modify event → op-logger two-headed branch → two-parent merge node).
+  ALL decisions are obsidian-free + unit-tested: new `diff3.parseConflictMarkers`
+  (inverse of `renderMarkersFromResult`) / `resolveMarkedText` / `countMarkerConflicts`
+  (reuse the one `resolveConflictChunkLines` rule); new `core/conflict-inventory.ts`
+  `listTwoHeadedConflicts` (derived query over `registry.conflictParents` with per-head
+  HLC provenance parsed from the version-id). `main.ts`: `registerView` +
+  "Open conflicts panel" command; the status bar now shows the conflict **count** and
+  opens the panel on click; the ribbon/status conflict state now counts two-headed text
+  files (which drove NO indicator before Step 6) **plus** the delete/binary badges
+  (`conflictCount()` = `twoHeadedConflicts().length + outstandingConflictCount()`); a
+  round refreshes the panel explicitly (new/cleared two-headed files don't flow through
+  `opLogger.onChange`). `ui/conflict-modal.ts` remains dead (kept as the compare
+  reference — the panel supersedes it). **215 pass.** New test `conflict-panel.test.ts`
+  (pure parse/resolve + inventory + a two-device e2e proving the panel's resolved bytes
+  converge peers).
 - `a627d76` feat(sync): surface conflicts as in-context 3-way markers, resolved by
   the next save — **Step 5, DONE.** A text `conflict` is surfaced NON-BLOCKINGLY as
   inline zdiff3 markers at the real path (no modal, no cursor hold); the file is
@@ -109,8 +129,30 @@ flips `parents` **and** wires the DAG merge together (the DAG restores the FF th
 content-hash ancestor used to provide). This matches the spec's own note that "the
 reworked Step 2b is folded into R2's Done-when."
 
-### Immediate next action — Step 6 (conflicts panel + compare UX)
+### Immediate next action — Step 7 (simplify sync-state / conflict lifecycle)
 
+> **➡ Step 6 is DONE (conflicts panel + compare UX, `2b2145b`).** A persistent
+> `ConflictsView` (ItemView) lists the two-headed files and offers a per-hunk 3-way
+> compare; applying a pick writes marker-free bytes → the Step-5 resolving save. The
+> panel's logic is the obsidian-free `diff3.parseConflictMarkers`/`resolveMarkedText`/
+> `countMarkerConflicts` + `core/conflict-inventory.listTwoHeadedConflicts` (all
+> unit-tested); the view is thin glue (manual-smoke). `main.ts` gained `registerView` +
+> the "Open conflicts panel" command + status-count/click-to-open + ribbon wiring, and
+> `conflictCount()` = two-headed text files + the delete/binary badge. Green gate:
+> **215 pass**. New test `conflict-panel.test.ts`. See the top commit-list entry.
+>
+> **The next step is §"Step 7 — Simplify sync-state / conflict lifecycle"** (below).
+> Note the two conflict-tracking mechanisms Step 6 left side-by-side, which Step 7
+> unifies: (a) the NEW two-headed text conflicts — a *derived* query over
+> `registry.conflictParents` (`twoHeadedConflicts()` / `listTwoHeadedConflicts`), and
+> (b) the OLD `SyncStateStore` outstanding-conflict badge, still hand-maintained for the
+> skipped/deferred delete/binary path (`coordinator.outstandingConflictCount()`). Step 6
+> sums both in `conflictCount()`; Step 7 makes "conflicts" a single derived query (the
+> text path already proves the shape) and retires the badge record/clear/self-heal
+> bookkeeping. Step 8 follows unchanged. The §"Step 3 core" and §"Step 5" sections below
+> are historical/spec — kept for provenance.
+
+<!-- HISTORICAL (Step 5 handoff, kept for provenance):
 > **➡ Step 5 is DONE (inline conflict markers).** A text `conflict` is now surfaced
 > NON-BLOCKINGLY as inline zdiff3 markers at the real path — no modal, no cursor hold.
 > The file is recorded *two-headed* (`FileEntry.conflictParents = [A, B]` via
@@ -135,6 +177,8 @@ reworked Step 2b is folded into R2's Done-when."
 > The next step is **§"Step 6 — Conflicts panel + compare UX"** (below). Steps 7–8
 > follow unchanged. The §"Step 3 core — the atomic removal: FULL DESIGN" and §"Step 5"
 > sections below are historical/spec — kept for provenance.
+-->
+
 
 Everything is green (**200 tests** as of `b62e039`). The Step-3/4 ordering hazard was **resolved**:
 Step 4a/4b made clean merges AND content-conflict resolutions real two-parent DAG
@@ -359,11 +403,11 @@ built as part of `b62e039`. Kept as the map of what lives where.
 - `merge-node-convergence.test.ts` + `resolution-convergence.test.ts` pin the
   merge-node chain (the latter asserts an `m-` two-parent node).
 
-Current green count: **206** (`npm run build && npx vitest run`). Branch
-`sync-robustness-fixes`, last commit `a627d76` — Step 5 (inline conflict markers) is
-DONE; **Step 6 (conflicts panel + compare UX) is next.** (206 = the 200 at `b62e039`,
-minus 3 removed content-modal/skip tests that covered now-deleted behaviour, plus 9
-new marker tests — `conflict-markers.test.ts` and `inline-conflict-resolution.test.ts`.)
+Current green count: **215** (`npm run build && npx vitest run`). Branch
+`sync-robustness-fixes`, last commit `2b2145b` — Step 6 (conflicts panel + compare
+UX) is DONE; **Step 7 (simplify sync-state / conflict lifecycle) is next.** (215 =
+the 206 at `a627d76` plus 9 new panel tests in `conflict-panel.test.ts` — pure
+parse/resolve + inventory + a two-device e2e.)
 
 ## Working rules
 
@@ -615,6 +659,15 @@ an ordinary edit resolves, peers fast-forward. New `TestDevice` scenario covers 
 **Commit:** `feat(sync): surface conflicts as in-context 3-way markers, resolved by the next save`
 
 ## Step 6 — Conflicts panel + compare UX
+
+> ✅ **DONE (`2b2145b`).** Shipped as described. See the top status section + the
+> commit-list entry for the as-built summary (the pure `parseConflictMarkers`/
+> `resolveMarkedText`/`countMarkerConflicts` + `listTwoHeadedConflicts`, the
+> `ConflictsView` ItemView, the `main.ts` wiring, and `conflict-panel.test.ts`). One
+> deviation from the sketch below: the compare parses the on-disk MARKERS
+> (`base | mine | theirs` from `parseConflictMarkers`) rather than re-deriving the
+> 3-way from the DAG heads — so it needs no retained base bytes and honours any
+> hand-edit already in the file. Kept below for the original goal/commit seed.
 
 **Goal:** legible, non-blocking resolution UI (the user's UX concern).
 
