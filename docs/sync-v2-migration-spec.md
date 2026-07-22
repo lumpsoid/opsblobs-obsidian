@@ -29,6 +29,19 @@ truth; each device's DAG is a derived cache).
 
 ### What is committed on `sync-robustness-fixes` (newest first)
 
+- `2595d94` feat(merge): content-conflict resolutions become two-parent merge
+  nodes — **Step 4b, DONE.** A user-resolved content conflict is re-emitted as a
+  two-parent merge node (parents = the two conflicting heads; content-addressed
+  `m-` id); peers adopt it by the existing DAG fast-forward. `supersedes` remains
+  ONLY for the binary/delete/create-collision paths (moved in the folded Step 3).
+- `b1ef94e` feat(merge): clean merges become pushed two-parent DAG nodes — **Step
+  4a, DONE.** A clean three-way merge mints a real two-parent merge op (deterministic
+  content-addressed `m-<sha256(sorted-parents+contentHash)>` id via `Ops.merge` /
+  `mergeVersionId`), pushed like a resolution so its edges+blob replicate. This
+  **closes the Step-3/4 ordering hazard**: the next edit off a merged file now
+  descends from a real DAG node, not a synthetic head. Also fixed finding #1: the
+  `write_local` adoption path carries the remote op's real `headVersionId` and
+  `adoptRemote` records it (an op-id is not always `hlcToString(hlc)`).
 - `d61ab66` feat(merge): derive the three-way base from the op-id DAG (LCA) —
   **Rework R1-flip + R2 + Step 2b, DONE.** `parents` are version-ids; the DAG is
   keyed by op-id carrying `contentHash`; the merge fast-forwards / LCA-bases off
@@ -56,30 +69,39 @@ flips `parents` **and** wires the DAG merge together (the DAG restores the FF th
 content-hash ancestor used to provide). This matches the spec's own note that "the
 reworked Step 2b is folded into R2's Done-when."
 
-### Immediate next action — Step 3, with an ORDERING HAZARD
+### Immediate next action — the folded Step 3 (ORDERING HAZARD is now CLOSED)
 
-Everything is green (**204 tests**). The next planned step is **Step 3 (retire
-`ancestor-policy` + `ancestorContentHash`)** — but do NOT do it before reading this:
+Everything is green (**206 tests**). The Step-3/4 ordering hazard is **resolved**:
+Step 4a/4b made clean merges AND content-conflict resolutions real two-parent DAG
+nodes, so a subsequent edit off a merged/resolved file descends from a real node —
+the scalar-ancestor fallback is no longer load-bearing for the content path
+(proven by `merge-node-convergence.test.ts`). Steps 4a/4b did the parts of Step 4
+that had to precede Step 3; the REST of Step 4 (removing `supersedes` entirely) is
+now **folded into Step 3**, because the remaining `supersedes` uses live in the
+same delete / create-collision / binary branches that Step 3 must move onto the DAG
+(finding #6). Do them as one coherent commit (or split by branch if it stays green).
 
-> **A clean three-way merge currently produces a *synthetic* head version-id that is
-> NOT a DAG node.** Redundant clean merges are not pushed, so no op (hence no DAG
-> node) is minted for them; `adoptRemote` sets the head to `hlcToString(hlcMax)`,
-> a version-id with no recorded content hash. The *next* edit off a clean-merged
-> file therefore can't find its base in the DAG (`contentHashOf` → undefined,
-> `mergeBase` → null) and **falls back to the scalar `ancestorContentHash`**, which
-> is still maintained by ancestor-policy. That fallback is what keeps clean-merged
-> files converging on subsequent edits (verified: the LCA test's second edit path).
+**The folded Step 3 — retire the scalar ancestor AND the rest of `supersedes`:**
+- Delete `merge/ancestor-policy.ts` + its test; remove `ancestorContentHash` /
+  `ancestorPath` from `FileEntry` and every writer (`file-registry.adoptRemote` /
+  `setAncestorHash`, `sync-applicator.updateAncestorHashes`, `vault-sync-host`).
+- Move rename-vs-delete detection off `ancestorPath` onto op path-history / a
+  per-fileId `lastSyncedPath` (preserve `delete-rename-conflict`).
+- Rework the one-sided-delete branches: replace `isUnchangedSinceAncestor` +
+  `re.supersedes?.includes` with DAG fast-forward / LCA over version-ids (a delete
+  resolution becomes a two-parent tombstone merge node `[modifiedHead, deleteHead]`;
+  a peer FF-adopts it). Same for `resolveCreateCollision` and the binary branch.
+- Delete `Operation.supersedes`, `FileEntry.supersedes`, and every remaining
+  `supersedes` branch. Auto-adoption is then purely DAG fast-forward.
+- `buildLocalState` must stage the DAG base's bytes (`dag.contentHashOf(base)`) in
+  place of the `resolved.ancestorContentHash` staging line, or deep three-way
+  merges lose their base bytes (finding #4).
 
-Consequence: **Step 3 (remove the scalar ancestor) must not land before Step 4
-(two-parent merge nodes), which makes clean merges real DAG nodes.** Recommended
-re-order: **do Step 4 before Step 3**, or fold them. If Step 3 goes first, a
-clean-merged file's next edit loses its base and can mis-merge / union — exactly
-the class of silent-divergence bug v2 exists to kill. The `localAtHead` guard in
-`resolveContentConflict` (an unlogged in-window edit leaves the head stale → don't
-FF-adopt → fall through to three-way) is the other subtlety to preserve.
+**Preserve through the rework:** the `localAtHead` guard in `resolveContentConflict`
+(finding #3 — an unlogged in-window edit leaves the head stale → don't FF-adopt →
+fall through to three-way); the phantom-delete / F5 / F3 guards.
 
-The Rework section below is now historical (done); Steps 3–8 remain, subject to the
-re-order above.
+The Rework section below is now historical (done); Steps 5–8 remain unchanged.
 
 ### Findings from R1/R2/2b — load-bearing, read before Step 3+
 
