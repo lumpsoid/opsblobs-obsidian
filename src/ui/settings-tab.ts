@@ -16,6 +16,7 @@ export interface SettingsHost extends Plugin {
   saveSettings(): Promise<void>;
   applyVaultKey(): Promise<void>;
   vaultKeyFingerprint(): string | null;
+  testConnection(): Promise<string>;
   setupAutoSync(): void;
   clearContentCache(): Promise<number>;
   resetSyncState(): Promise<void>;
@@ -103,6 +104,23 @@ export class SyncSettingTab extends PluginSettingTab {
           });
         t.inputEl.type = 'password';
       });
+
+    const testSetting = new Setting(containerEl)
+      .setName('Test connection')
+      .setDesc('Check the server URL, token, vault, and passphrase without syncing anything.');
+    testSetting.addButton(btn => {
+      btn.setButtonText('Test').onClick(async () => {
+        btn.setButtonText('Testing…').setDisabled(true);
+        testSetting.setDesc('Testing…');
+        try {
+          testSetting.setDesc(await this.host.testConnection());
+        } catch (e) {
+          testSetting.setDesc(`✗ ${(e as Error).message}`);
+        } finally {
+          btn.setButtonText('Test').setDisabled(false);
+        }
+      });
+    });
 
     // ── Encryption ────────────────────────────────────────────────────────
     new Setting(containerEl).setName('Encryption').setHeading();

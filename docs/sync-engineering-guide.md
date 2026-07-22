@@ -161,7 +161,9 @@ relevant `core`/`merge` unit) with a port for the Obsidian bit.
 | `network/sync-state-store.ts` | The **observable** sync state (`.vault-sync/sync-state.json`): `deferred` files (each `reason: 'drift' \| 'conflict'`), `stranded` content, last error, last-round summary. No outstanding-conflict set (retired in Step 7). |
 | `network/cursor-store.ts` / `hlc-store.ts` | Scalar cursor + persisted HLC. |
 | `network/encryption.ts` | `VaultCrypto` — passphrase-derived key, op/blob envelopes, blinded content hashes (unlinkable dedup). |
-| `network/server-http.ts` / `fake-server.ts` | Real HTTP `ServerApi` vs in-memory fake (contract-tested to be equivalent). |
+| `network/server-http.ts` / `fake-server.ts` | Real HTTP `ServerApi` vs in-memory fake (contract-tested to be equivalent). `HttpServerApi` bounds every `requestUrl` with `withTimeout` and maps each transport outcome to the typed error family (401/403→auth, 404→not-found, 5xx→server, no-response→network). |
+| `network/sync-errors.ts` | The **user-actionable typed-error family** every round can throw — `KeyMismatchError` (passphrase guard), `AuthError`/`NotFoundError`/`ServerError`/`NetworkError`/`TimeoutError` (transport), `DecryptError` (wrong/legacy key at pull), `StaleCursorError` (internal, F4). Each `message` is written for the user; the coordinator toasts it verbatim. Obsidian-free. |
+| `network/with-timeout.ts` | Pure `withTimeout(op, ms, label)` — bounds a hung `requestUrl` (which has no native timeout) and rejects with `TimeoutError`. The detached request is harmless (idempotent writes). |
 | `ui/conflicts-view.ts` | The non-blocking Conflicts panel (an `ItemView`): lists two-headed files + a per-hunk 3-way compare; applying writes marker-free bytes through the ordinary save path. |
 
 ---
@@ -494,6 +496,9 @@ logic.**
 
 **Known manual-smoke surface** (not covered by automated tests, verify by hand before a
 release): the `obsidian-*` adapters, `src/ui/` views/modals and rendering, `main.ts`
-wiring, the editor force-save, and end-to-end behavior in a real vault. The
+wiring, the editor force-save, the settings **Test connection** preflight
+(`plugin.testConnection` → `ServerSyncClient.preflight`) and the typed-error toasts
+(`KeyMismatchError`/`AuthError`/`NetworkError`/`TimeoutError` wording in a real vault),
+and end-to-end behavior in a real vault. The
 `npm run test:integration` suite covers the real server wire but still runs the client
 over fakes for the vault side.

@@ -16,6 +16,7 @@ import { ObsidianMetadataStore } from './network/obsidian-metadata-store';
 import { ObsidianVaultWatcher } from './network/obsidian-vault-watcher';
 import { VaultCrypto, saltForVault } from './network/encryption';
 import { ServerSyncClient, SyncRoundSummary } from './network/server-sync';
+import { KeyMismatchError } from './network/sync-errors';
 import { HttpServerApi } from './network/server-http';
 import { CursorStore } from './network/cursor-store';
 import { VersionDagStore } from './network/version-dag-store';
@@ -323,10 +324,10 @@ export default class VaultSyncPlugin extends Plugin {
 
   // ─── Sync ─────────────────────────────────────────────────────────────────
 
-  /** Build and run one sync round, returning its summary. The plugin owns the
-   *  Obsidian-coupled transport wiring (HttpServerApi/host/progress); the
-   *  coordinator drives *when* this runs and what happens around it. */
-  private runRound(): Promise<SyncRoundSummary> {
+  /** Build a ServerSyncClient wired to the real transport + local vault. The plugin
+   *  owns this Obsidian-coupled wiring (HttpServerApi/host/progress); shared by the
+   *  sync round and the settings "Test connection" preflight. */
+  private buildSyncClient(): ServerSyncClient {
     const api = new HttpServerApi({
       baseUrl: this.settings.serverUrl,
       vaultId: this.settings.vaultId,
@@ -343,14 +344,37 @@ export default class VaultSyncPlugin extends Plugin {
       new CursorStore(this.metadata),
       new VersionDagStore(this.metadata),
     );
-    const client = new ServerSyncClient({
+    return new ServerSyncClient({
       api,
       crypto: this.crypto,
       host,
       hlc: this.hlc,
       onProgress: (label) => this.setStatusBarText(`⟳ ${label}`),
     });
-    return client.runSync();
+  }
+
+  /** Build and run one sync round, returning its summary. The coordinator drives
+   *  *when* this runs and what happens around it. */
+  private runRound(): Promise<SyncRoundSummary> {
+    return this.buildSyncClient().runSync();
+  }
+
+  /**
+   * Non-mutating setup check for the settings "Test connection" button: derive the
+   * key, then preflight the server + token + vault + passphrase. Returns a friendly
+   * success line; a setup mistake throws one of the typed errors (whose message is
+   * already user-actionable) so the button surfaces it before the first real round.
+   */
+  async testConnection(): Promise<string> {
+    if (!this.isServerConfigured()) {
+      throw new Error('Set the server URL, vault ID, and passphrase first.');
+    }
+    await this.applyVaultKey();
+    const { keyState } = await this.buildSyncClient().preflight();
+    if (keyState === 'mismatch') throw new KeyMismatchError();
+    return keyState === 'match'
+      ? '✓ Connected — server reachable, token accepted, and the passphrase matches this vault.'
+      : '✓ Connected — server reachable and token accepted. The vault has no data yet; this device will establish the key on first sync.';
   }
 
   /** The Obsidian shell around a sync round: the reentrancy/config/crypto guards

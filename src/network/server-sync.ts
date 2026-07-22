@@ -50,31 +50,24 @@ export interface AppendResult {
   headCursor: number;
 }
 
-/** A too-stale `baseCursor` was rejected (spec §9.3 — a server MAY 409). Lives
- *  here (not in the obsidian-coupled server-http.ts) so this obsidian-free
- *  orchestrator can catch it without a cycle; HttpServerApi imports it from here. */
-export class StaleCursorError extends Error {
-  constructor() {
-    super('Server rejected append: cursor too stale, re-pull first');
-    this.name = 'StaleCursorError';
-  }
-}
-
-/** The vault on the server was established under a different key than this device
- *  derived — a mistyped passphrase (or wrong salt). Thrown *before* any remote op is
- *  trusted or any local op is pushed, so a key mismatch is a clean, self-explaining
- *  failure at the moment onboarding is most fragile, not a silent two-key wedge (or a
- *  raw AES decrypt exception on the first pulled op). Surfaced verbatim by the
- *  coordinator's error toast. */
-export class KeyMismatchError extends Error {
-  constructor() {
-    super(
-      "This device's sync passphrase doesn't match the vault already on the server. " +
-        'Check the passphrase in Vault Sync settings — it must be identical on every device.',
-    );
-    this.name = 'KeyMismatchError';
-  }
-}
+// The typed, user-actionable error family lives in `sync-errors.ts` (obsidian-free,
+// shared with the HTTP transport). Re-exported here so existing importers of
+// `StaleCursorError` / `KeyMismatchError` from this module keep working.
+import {
+  StaleCursorError,
+  KeyMismatchError,
+  DecryptError,
+} from './sync-errors';
+export {
+  StaleCursorError,
+  KeyMismatchError,
+  AuthError,
+  NotFoundError,
+  ServerError,
+  NetworkError,
+  TimeoutError,
+  DecryptError,
+} from './sync-errors';
 
 /**
  * The five spec endpoints (§4–§5). Implemented over `requestUrl` in prod
@@ -165,6 +158,19 @@ export interface SyncRoundSummary {
    *  `reason:'conflict'` in the observable state — the derived replacement for the
    *  old hand-maintained outstanding-conflict set (sync v2 Step 7). */
   deferredConflicts: string[];
+}
+
+/** Whether this device's passphrase agrees with the vault already on the server:
+ *  `match` (key-check verified), `mismatch` (a record exists but our key can't
+ *  reproduce it — wrong passphrase), or `unstamped` (no key-check record yet — an
+ *  empty or pre-guard vault, so agreement can't be proven until data exists). */
+export type PreflightKeyState = 'match' | 'mismatch' | 'unstamped';
+
+/** Result of a non-mutating {@link ServerSyncClient.preflight}. Reaching this point
+ *  means the server + token + vault were reachable (any failure threw a typed error);
+ *  `keyState` reports the passphrase check. */
+export interface PreflightResult {
+  keyState: PreflightKeyState;
 }
 
 export class ServerSyncClient {
@@ -328,6 +334,25 @@ export class ServerSyncClient {
   }
 
   /**
+   * Preflight the configured server + token + vault + passphrase WITHOUT mutating
+   * anything — the settings "Test connection" affordance, so a setup mistake is
+   * caught before the first real round wedges on it. A read-only `blobs:check([])`
+   * validates URL + token + vault reachability (server-http maps any failure to the
+   * typed error family). Then it reads the key-check record to report whether this
+   * device's passphrase matches the vault already on the server.
+   */
+  async preflight(): Promise<PreflightResult> {
+    if (!this.crypto.isReady()) throw new Error('Vault key not derived');
+    // Reachability + auth, side-effect-free: the server must answer an empty check 200.
+    await this.api.checkBlobs([]);
+    const record = await this.api.getBlob(await this.keyCheckBlobKey());
+    const keyState: PreflightKeyState =
+      record === null ? 'unstamped'
+        : (await this.crypto.verifyKeyCheck(record)) ? 'match' : 'mismatch';
+    return { keyState };
+  }
+
+  /**
    * The well-known blob slot that holds the vault's key-check record. A fixed,
    * non-secret value hashed to 64 hex chars so it's format-compatible with a real
    * content hash (the server treats blobs opaquely; some may validate the key shape)
@@ -357,7 +382,18 @@ export class ServerSyncClient {
     for (;;) {
       const page = await this.api.pullOps(cursor, this.opsLimit);
       for (const rec of page.ops) {
-        ops.push({ seq: rec.seq, op: await this.crypto.decryptOp<Operation>(rec.ciphertext) });
+        let op: Operation;
+        try {
+          op = await this.crypto.decryptOp<Operation>(rec.ciphertext);
+        } catch {
+          // A raw AES/GCM failure here means our key can't read this vault's data —
+          // almost always a wrong passphrase. The key-check guard catches this up
+          // front for stamped vaults; this is the actionable fallback for a
+          // pre-guard vault with no key-check record. (Never a KeyMismatchError here:
+          // that's reserved for the explicit key-check, which already passed.)
+          throw new DecryptError();
+        }
+        ops.push({ seq: rec.seq, op });
       }
       cursor = page.nextCursor;
       if (!page.hasMore || page.ops.length === 0) break;
