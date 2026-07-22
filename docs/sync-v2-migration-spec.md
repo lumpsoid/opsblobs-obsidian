@@ -82,7 +82,13 @@ reworked Step 2b is folded into R2's Done-when."
 
 ### Immediate next action — the folded Step 3 (ORDERING HAZARD is now CLOSED)
 
-Everything is green (**206 tests**). The Step-3/4 ordering hazard is **resolved**:
+> **➡ Jump to §"Step 3 core — the atomic removal: FULL DESIGN"** (below, right after
+> this status block) for the complete, ready-to-code plan. The summary here is
+> context; that section is the spec to implement. Also read §"Primitives that
+> already exist" (in the findings block) — reuse them, don't rebuild. Green gate:
+> `npm run build && npx vitest run` (209 pass now).
+
+Everything is green (**209 tests** as of `a544081`). The Step-3/4 ordering hazard is **resolved**:
 Step 4a/4b made clean merges AND content-conflict resolutions real two-parent DAG
 nodes, so a subsequent edit off a merged/resolved file descends from a real node —
 the scalar-ancestor fallback is no longer load-bearing for the content path
@@ -203,24 +209,23 @@ deleted to go green.
 ### Findings from R1/R2/2b — load-bearing, read before Step 3+
 
 Non-obvious facts and known gaps discovered while implementing the identity flip.
-Each will bite a continuation that doesn't know it.
+Each will bite a continuation that doesn't know it. **Status tags added after 4a/4b
++ prereqs.**
 
-1. **`op.id === hlcToString(op.hlcTimestamp)` is now load-bearing for head
-   tracking.** `FileRegistry.adoptRemote` derives the new `headVersionId` as
-   `hlcToString(hlc)` — it only has the action's `hlc`, not the remote `Operation`,
-   and relies on this equality (holds for a plain remote write, a fast-forward, and
-   a conflict resolution, since `action.hlc` is the adopted op's `hlcTimestamp`). If
-   op-id derivation ever stops being `hlcToString(hlc)`, `adoptRemote` sets a wrong
-   head silently. The logger sets the head explicitly from `op.id` at each mint
-   site, so only `adoptRemote` carries this coupling. Step 4 (merge nodes) touches
-   this path — keep the invariant or pass the op-id explicitly.
+1. ✅ **DONE (4a).** ~~`op.id === hlcToString(op.hlcTimestamp)` is load-bearing for
+   `adoptRemote`'s head derivation.~~ Fixed: the `write_local` action now carries the
+   remote op's real `headVersionId` and `adoptRemote(…, headVersionId?)` records it
+   verbatim (falling back to `hlcToString(hlc)` only when absent). A peer
+   fast-forwarding onto a content-addressed merge node adopts the real `m-` id. **Any
+   NEW adoption path in Step 3 (delete restore, create-collision FF) MUST likewise
+   pass `re.headVersionId` — do not re-derive from hlc.**
 
-2. **Clean three-way merges mint a *synthetic* head not in the DAG** (the Step-3/4
-   ordering hazard above). Two devices merging the same pair compute the *same*
-   `hlcMax`, so they land on the same synthetic id string and the same content —
-   they converge — but neither has a DAG node. The next edit's base then resolves
-   via the **scalar ancestor fallback**. Step 4 fixes this by making clean merges
-   real two-parent DAG nodes; until then the scalar ancestor is load-bearing.
+2. ✅ **DONE (4a/4b).** ~~Clean merges mint a synthetic head not in the DAG.~~ Both
+   clean merges (4a) and content-conflict resolutions (4b) are now real two-parent
+   DAG nodes with deterministic content-addressed `m-` ids, pushed like resolutions.
+   The next edit off a merged/resolved file descends from a real node
+   (`merge-node-convergence.test.ts` pins it). The scalar-ancestor fallback is no
+   longer load-bearing for the content path — which is what unblocked Step 3.
 
 3. **The `localAtHead` guard is a data-safety invariant, not an optimisation.** In
    `resolveContentConflict`, the DAG fast-forward adopts a remote descendant only
@@ -231,16 +236,14 @@ Each will bite a continuation that doesn't know it.
    remote descendant, silently clobbering the edit (`concurrent-conflict-dataloss`
    test 1 pins this). Preserve it through any merge refactor.
 
-4. **`buildLocalState` stages only live content + the scalar `ancestorContentHash`
-   bytes — NOT arbitrary DAG LCA base bytes** (`network/vault-sync-host.ts`). When
-   the true LCA base is deeper than the local scalar ancestor (multi-round offline
-   divergence), its bytes aren't staged, so the merge sees a *known-but-missing
-   base* and correctly degrades to a conflict (never a silent union) — but that is
-   *more* conflicts than necessary. To let deep-LCA merges succeed, stage the DAG
-   base's bytes (`dag.contentHashOf(base)`) in `buildLocalState`, and retain them
-   in GC (Step 8). Also note: once the scalar ancestor is removed (Step 3), the
-   `resolved.ancestorContentHash` staging line disappears — replace it with
-   DAG-base staging or three-way merges lose their base bytes entirely.
+4. ✅ **DONE (af4a7a4).** ~~`buildLocalState` stages only live content + scalar
+   ancestor bytes, not DAG LCA base bytes.~~ It now also stages every
+   `dag.reachableContentHashes(headVersionId)` the content store holds, so a base
+   deeper than the last sync is available and deep-LCA merges succeed instead of
+   degrading to a conflict. **Still TODO in Step 3:** the OLD
+   `resolved.ancestorContentHash` staging line is still present (additive) — remove
+   it in the purge; the DAG-reachable staging replaces it. **GC retention of these
+   base bytes is Step 8** (`referencedHashes` doesn't see the DAG yet).
 
 5. **DAG persistence is a full rewrite per round, not the incremental append the
    decisions doc §3 corollary calls for.** `VersionDagStore.save` does
@@ -249,17 +252,45 @@ Each will bite a continuation that doesn't know it.
    op-id design set out to avoid. Deferred perf; make it append-only (one line per
    new edge) before the DAG grows large. Not required for correctness.
 
-6. **The delete / rename-vs-delete / binary branches still read the scalar
-   ancestor.** 2b only moved `resolveContentConflict`'s both-modified base+FF onto
-   the DAG. `isUnchangedSinceAncestor` (used by the one-sided-delete branches) and
-   the binary changed-since-base check still use `ancestorContentHash` /
-   `ancestorPath`. On the *remote* side these are now `null` (retired in
-   `reconstructRemoteState`), which is behaviour-preserving only because
-   `isUnchangedSinceAncestor(re)` was already always-false for a projected remote
-   entry (an op's content never equals its own parent's). Step 3 must reimplement
-   rename-vs-delete detection (spec says: op path-history / `lastSyncedPath`) AND
-   the "unchanged since the common base" test over the DAG, not just delete the
-   fields — the *local* side still genuinely relies on them today.
+6. ⏳ **THE Step 3 core (still open).** The delete / rename-vs-delete / binary /
+   create-collision branches still read the scalar ancestor + `supersedes`. 2b/4b
+   only moved the *both-modified content* path onto the DAG. The move-head prereq
+   (`0cf33b8`) now makes LCA work across a rename, so the DAG rewrite in §"Step 3
+   core" above is unblocked. Reimplement rename-vs-delete on `lastSyncedPath` and
+   "unchanged since the common base" via `dag.mergeBase`, gate resolution-adoption
+   on `dag.isMergeNode` — do not just delete the fields.
+
+### Primitives that already exist (built in 4a/4b + prereqs) — REUSE these in Step 3
+
+- `mergeVersionId(contentHash, parents)` (`core/operations.ts`, async) →
+  deterministic `m-<sha256>` id, parents sorted (commutative). Merge/resolution
+  nodes use it instead of `hlcToString(hlc)`.
+- `Ops.merge(fileId, path, contentHash, hlc, parents, id)` → an `update` merge node
+  (id precomputed by the caller). **Step 3 adds `Ops.mergeDelete(…)` (type `delete`)
+  by the same pattern.**
+- `OperationLogger.recordMergeOp(fileId, path, contentHash, hlc, parents, id)` →
+  records the pending merge op + `setHeadVersion`. **Step 3 adds `recordMergeDelete`.**
+- Applicator `write_merge` case and the `conflict` case's `action.parents` branch
+  are the TEMPLATE for minting a merge node: `hash` the bytes → `id =
+  mergeVersionId(hash, parents)` → `adoptRemote(…, id)` → return
+  `{ kind: 'merge', …, parents, id }` (recorded after `clearOps`). Delete/binary
+  resolutions copy this shape (keep_deleted uses the mergeDelete variant).
+- `PendingResolution` in `sync-applicator.ts` already has `kind: 'merge'` with
+  `parents`/`id`. **Step 3 adds `deleted?: boolean` to dispatch merge vs mergeDelete.**
+- `VersionDag.reachableContentHashes(v)` (base-bytes staging) exists.
+  `VersionDag.contentHashOf` / `isAncestor` / `mergeBase` (returns `MULTIPLE_BASES`
+  sentinel) exist. **Step 3 adds `VersionDag.isMergeNode(v)` = `parents.size >= 2`.**
+- `write_merge` MergeAction + `conflict.parents?` already in `types.ts`. **Step 3
+  adds `parents?` to `delete_conflict`/`binary_conflict` and removes `parentHashes`
+  + `supersedes` + `ancestorContentHash`/`ancestorPath`, adds
+  `FileEntry.lastSyncedPath?`.**
+- New test file `__tests__/merge-node-convergence.test.ts` (keep; it pins the whole
+  merge-node chain). `resolution-convergence.test.ts` strengthened to assert the
+  resolution is an `m-` two-parent node with no `supersedes`.
+
+Current green count: **209** (`npm run build && npx vitest run`). Branch
+`sync-robustness-fixes`, last commit `a544081` (this handoff) — Step 3 core not yet
+coded.
 
 ## Working rules
 
@@ -442,6 +473,14 @@ tracks the latest op.
 
 ## Step 3 — Retire `ancestor-policy` and `ancestorContentHash`
 
+> ⚠️ **SUPERSEDED / FOLDED.** This original Step 3 and the Step 4 below have been
+> merged into ONE atomic commit. Step 4a/4b (merge nodes for clean merges +
+> content-conflict resolutions) already shipped (`b1ef94e`, `2595d94`); the two
+> prerequisites shipped (`0cf33b8`, `af4a7a4`). The operative, worked-out plan for
+> the remaining atomic commit is **§"Step 3 core — the atomic removal: FULL
+> DESIGN"** near the top of this file. These two sections are kept only for the
+> original goal statements + commit-message seeds.
+
 **Goal:** delete the scalar ancestor and its policy entirely.
 
 **Changes**
@@ -458,6 +497,11 @@ tracks the latest op.
 **Commit:** `refactor(merge): remove the scalar ancestor and ancestor-policy (DAG is the base)`
 
 ## Step 4 — Two-parent merge nodes; retire `supersedes`
+
+> ⚠️ **PARTLY DONE / FOLDED.** Clean merges (4a, `b1ef94e`) and content-conflict
+> resolutions (4b, `2595d94`) are DONE. The remaining `supersedes` removal
+> (binary/delete/create-collision) is folded into the atomic Step 3 core — see
+> §"Step 3 core" near the top. Kept for the original goal statement.
 
 **Goal:** resolutions and clean merges are versions with `parents: [A, B]`.
 
