@@ -65,7 +65,7 @@ async function harness(opts: { summary?: SyncRoundSummary; roundError?: Error } 
 const contentAction = (fileId = 'f1', path = 'note.md'): Extract<MergeAction, { type: 'conflict' }> => ({
   type: 'conflict', fileId, localPath: path, remotePath: path,
   mergeResult: { merged: [], conflicts: [], hasConflicts: true },
-  localContent: 'L', remoteContent: 'R', parentHashes: ['h-local', 'h-remote'],
+  localContent: 'L', remoteContent: 'R', parents: ['v-local', 'v-remote'],
 });
 
 describe('SyncCoordinator', () => {
@@ -176,7 +176,7 @@ describe('SyncCoordinator', () => {
   test('auto delete conflict defers only for the ask strategy; a standing policy runs unattended', async () => {
     const h = await harness();
     h.coordinator.setSource('auto');
-    const action = { type: 'delete_conflict', fileId: 'f3', path: 'c.md', side: 'remote_deleted', content: new Uint8Array(), parentHashes: [] } as Extract<MergeAction, { type: 'delete_conflict' }>;
+    const action = { type: 'delete_conflict', fileId: 'f3', path: 'c.md', side: 'remote_deleted', content: new Uint8Array() } as Extract<MergeAction, { type: 'delete_conflict' }>;
 
     const deferred = await h.coordinator.decideDeleteConflict('ask', action, async () => 'restore');
     expect(deferred).toBe(DEFER_CONFLICT);

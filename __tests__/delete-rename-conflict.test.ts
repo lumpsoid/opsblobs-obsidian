@@ -7,14 +7,14 @@
 //    · B renames `my` → `my-1`.
 //    · A deletes `my`, syncs.  B syncs → `my-1` was silently DELETED on B.
 //
-//  Root cause: `isUnchangedSinceAncestor` compared only the content hash. A
-//  rename leaves content untouched, so B's `my-1` looked "unchanged since the
-//  ancestor" and A's delete propagated as a clean `delete_local` — B's rename
-//  (a deliberate keep) was discarded with no prompt.
+//  Root cause: the clean-delete check compared only content. A rename leaves
+//  content untouched, so B's `my-1` looked "unchanged since the base" and A's
+//  delete propagated as a clean `delete_local` — B's rename (a deliberate keep)
+//  was discarded with no prompt.
 //
-//  Fix: track the path at last sync (`ancestorPath`) and count a rename as a
-//  modification. A delete concurrent with a rename is now a delete/rename
-//  conflict, resolved by `deleteConflictStrategy` — exactly like delete-vs-edit.
+//  Fix (sync v2): track the path at last sync (`lastSyncedPath`) and count a rename
+//  as a modification in `isUnchangedSinceBase`. A delete concurrent with a rename is
+//  a delete/rename conflict, resolved by `deleteConflictStrategy` — like delete-vs-edit.
 
 import { describe, test, expect, beforeAll } from 'vitest';
 import { ServerSyncClient } from '../src/network/server-sync';
@@ -46,7 +46,7 @@ describe('concurrent delete vs rename', () => {
 
     const id = await A.seedFile('my', 'content\n', 1000);
     await client(A).runSync();     // real applicator records A's ancestor (hash + path 'my')
-    await client(B).runSync();     // B adopts `my` (adoptRemote sets ancestorPath = my)
+    await client(B).runSync();     // B adopts `my` (adoptRemote sets lastSyncedPath = my)
     expect(pathOf(B, id)).toBe('my');
 
     await B.renameFile('my', 'my-1', 2000);   // B renames
@@ -93,7 +93,7 @@ describe('concurrent delete vs rename', () => {
 
   test('keep_deleted replicates: resolver accepts deletion, peer adopts WITHOUT re-prompting', async () => {
     // Rename-first ordering so the *deleter* (A) surfaces the conflict and the
-    // *survivor* (B) later adopts the keep-deleted decision via `supersedes`.
+    // *survivor* (B) later fast-forwards onto the keep-deleted tombstone merge node.
     const api = new FakeSyncServer();
     const client = (d: TestDevice) =>
       new ServerSyncClient({ api, crypto: vc, host: d.host, hlc: d.hlc });

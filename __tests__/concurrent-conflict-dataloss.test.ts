@@ -109,10 +109,9 @@ describe('concurrent conflicting edits (reported data-loss bug)', () => {
   // to its un-acknowledged edit. Its later merge against the peer's concurrent
   // edit then used the wrong base and silently clobbered its own change.
   // Fix: exclude own ops from the remote projection (reconstructRemoteState) and
-  // never advance the ancestor on `send_remote` for a non-first sync
-  // (nextAncestorHash) — both now exercised through the REAL stack: own-op
-  // exclusion is shared production code, and the ancestor rule is the real
-  // ancestor policy, not a fake's approximation.
+  // derive the base from the op-id DAG (LCA), so syncing your own edit never
+  // corrupts the base a later concurrent merge compares against — both exercised
+  // through the REAL stack, not a fake's approximation.
   test('the device that syncs its edit first must not clobber its own change', async () => {
     const api = new FakeSyncServer();
     const client = (d: TestDevice) =>
@@ -131,8 +130,15 @@ describe('concurrent conflicting edits (reported data-loss bug)', () => {
     // ── A edits → "1\n2\n4\n5" and syncs FIRST (a normal logged edit). ───────
     await A.editFile(path, '1\n2\n4\n5\n', 2000);
     await client(A).runSync();
-    // Syncing its own edit must not corrupt A's ancestor to that edit…
-    expect(A.entry(id)!.ancestorContentHash).toBe(baseHash);
+    // Syncing its own edit must not corrupt A's base to that edit (sync v2: the base
+    // is the op-id DAG's LCA, not a scalar ancestor). A is genuinely at its own edit
+    // (its head's content IS the edit), and the ORIGINAL base "1\n2\n3" is still
+    // reachable as an ancestor — so a later merge against B's concurrent edit uses
+    // the true common base, not the un-acknowledged edit.
+    const dag = await A.versionDagStore.load();
+    const head = A.entry(id)!.headVersionId!;
+    expect(dag.contentHashOf(head)).toBe(A.entry(id)!.contentHash);
+    expect(dag.reachableContentHashes(head).has(baseHash)).toBe(true);
     expect(A.applied.some(a => a.type === 'write_local')).toBe(false);
 
     // ── B concurrently edits the same line → "1\n2\n999" and syncs. ──────────

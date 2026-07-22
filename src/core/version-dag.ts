@@ -65,6 +65,20 @@ export class VersionDag {
     return this.nodes.has(versionId);
   }
 
+  /**
+   * True when `versionId` is a *merge node* — a reconciliation of two (or more)
+   * heads, i.e. it has ≥2 causal parents. Distinguishes a user-resolved conflict
+   * (restore/keep-deleted/binary pick, or a clean/text merge) from a plain linear
+   * edit, so the delete/create-collision branches auto-adopt only genuine
+   * resolutions (a peer settled the conflict) rather than any descendant (sync v2,
+   * the structural replacement for the retired `supersedes` tag). An unknown
+   * version — present only as an as-yet-unrecorded parent reference — reads as not
+   * a merge node.
+   */
+  isMergeNode(versionId: string): boolean {
+    return (this.nodes.get(versionId)?.parents.size ?? 0) >= 2;
+  }
+
   /** The content hash (blob address) of a version, or `undefined` if unknown —
    *  the merge fetches the three-way base's bytes by this. A version present only
    *  as an as-yet-unrecorded parent reference has no content hash. */

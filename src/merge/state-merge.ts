@@ -79,7 +79,7 @@ function classifyAndResolve(
     const collidingLocalId = localLiveByPath.get(remoteEntry.path);
     if (collidingLocalId !== undefined && collidingLocalId !== fileId) {
       const le = local.fileEntries.get(collidingLocalId)!;
-      return resolveCreateCollision(le, remoteEntry, local, remote, /* selfIsRemote */ true);
+      return resolveCreateCollision(le, remoteEntry, local, remote, /* selfIsRemote */ true, dag);
     }
     const content = remote.contentStore.get(remoteEntry.contentHash);
     if (!content) return { type: 'no_op', fileId }; // can't write without content
@@ -104,7 +104,7 @@ function classifyAndResolve(
     const collidingRemoteId = remoteLiveByPath.get(localEntry.path);
     if (collidingRemoteId !== undefined && collidingRemoteId !== fileId) {
       const re = remote.fileEntries.get(collidingRemoteId)!;
-      return resolveCreateCollision(localEntry, re, local, remote, /* selfIsRemote */ false);
+      return resolveCreateCollision(localEntry, re, local, remote, /* selfIsRemote */ false, dag);
     }
     const content = local.contentStore.get(localEntry.contentHash);
     if (!content) return { type: 'no_op', fileId };
@@ -137,19 +137,23 @@ function classifyAndResolve(
 
   // ── One side deleted ─────────────────────────────────────────────────────
   // A *clean* one-sided delete: the surviving side has not touched the file
-  // since the last common sync (its content still matches the shared ancestor),
-  // so the deletion propagates without asking. If the surviving side changed
-  // the file, it's a genuine delete/modify conflict.
+  // since the last common base (its content still matches the DAG LCA and it was
+  // not renamed), so the deletion propagates without asking. If the surviving side
+  // changed or renamed the file, it's a genuine delete/modify(-or-rename) conflict.
+  // A two-parent merge node descending from our head is a *resolution* a peer
+  // already settled — adopt it (structural replacement for the retired `supersedes`).
   if (le.deleted && !re.deleted) {
-    // Remote holds a present file. If it is a *restore* resolution whose
-    // `supersedes` names our deleted side, a peer already settled this
-    // delete/modify conflict in favour of keeping the file — adopt it instead of
-    // re-prompting (mirrors the content-conflict shortcut in resolveContentConflict).
-    if (re.supersedes?.includes(le.contentHash)) {
+    // Remote holds a present file that is a restore *resolution* (merge node)
+    // descending from our deletion → a peer settled this in favour of keeping the
+    // file. Adopt it instead of re-prompting.
+    if (dag && le.headVersionId && re.headVersionId
+        && dag.isMergeNode(re.headVersionId) && dag.isAncestor(le.headVersionId, re.headVersionId)) {
       const content = remote.contentStore.get(re.contentHash) ?? local.contentStore.get(re.contentHash);
-      if (content) return { type: 'write_local', fileId, path: re.path, content, hlc: re.hlcTimestamp, headVersionId: re.headVersionId ?? undefined };
+      if (content) return { type: 'write_local', fileId, path: re.path, content, hlc: re.hlcTimestamp, headVersionId: re.headVersionId };
     }
-    if (isUnchangedSinceAncestor(re)) {
+    // Remote unchanged since the common base (same content, not renamed) → our
+    // deletion propagates cleanly.
+    if (isUnchangedSinceBase(re, le, dag)) {
       return { type: 'delete_remote', fileId, path: re.path };
     }
     // Content is hash-addressed: an unchanged-content rename's bytes are skipped
@@ -157,24 +161,28 @@ function classifyAndResolve(
     // local store before declining.
     const content = remote.contentStore.get(re.contentHash) ?? local.contentStore.get(re.contentHash);
     if (!content) return { type: 'no_op', fileId }; // surviving bytes unavailable — defer, don't restore empty
-    return { type: 'delete_conflict', fileId, path: re.path, side: 'local_deleted', content, parentHashes: [le.contentHash, re.contentHash] };
+    return { type: 'delete_conflict', fileId, path: re.path, side: 'local_deleted', content, parents: deleteParents(le, re) };
   }
 
   if (!le.deleted && re.deleted) {
-    // Remote is a delete. If it is a *keep_deleted* resolution whose `supersedes`
-    // names our present content, a peer already settled this conflict in favour
-    // of the deletion — accept it cleanly instead of re-prompting.
-    if (re.supersedes?.includes(le.contentHash)) {
+    // Remote is a *keep-deleted* resolution (tombstone merge node) descending from
+    // our present head → a peer settled this in favour of the deletion. Accept it
+    // cleanly (the resolution already accounts for our head, so a local rename is
+    // moot — it settled that too).
+    if (dag && le.headVersionId && re.headVersionId
+        && dag.isMergeNode(re.headVersionId) && dag.isAncestor(le.headVersionId, re.headVersionId)) {
       return { type: 'delete_local', fileId, path: le.path };
     }
-    if (isUnchangedSinceAncestor(le)) {
+    // Local unchanged since the common base (same content, not renamed) → the
+    // remote's deletion propagates cleanly.
+    if (isUnchangedSinceBase(le, re, dag)) {
       return { type: 'delete_local', fileId, path: le.path };
     }
     // Hash-addressed: fall back to the remote store in case the local copy was
     // GC'd but the same bytes are held remotely, before declining.
     const content = local.contentStore.get(le.contentHash) ?? remote.contentStore.get(le.contentHash);
     if (!content) return { type: 'no_op', fileId }; // surviving bytes unavailable — defer, don't restore empty
-    return { type: 'delete_conflict', fileId, path: le.path, side: 'remote_deleted', content, parentHashes: [le.contentHash, re.contentHash] };
+    return { type: 'delete_conflict', fileId, path: le.path, side: 'remote_deleted', content, parents: deleteParents(le, re) };
   }
 
   // ── Both modified (different content, neither deleted) ───────────────────
@@ -190,32 +198,10 @@ function resolveContentConflict(
   remote: VaultState,
   dag: VersionDag | undefined,
 ): MergeAction {
-  // ── Already-resolved conflict ────────────────────────────────────────────
-  // One side is a user-resolved conflict whose `supersedes` set names the exact
-  // content hashes the human chose between. If the *other* side still holds one
-  // of those superseded versions, the resolution already accounts for it —
-  // adopt it wholesale rather than re-running a three-way merge that would just
-  // re-surface the same conflict a peer already settled. Deterministic on both
-  // devices: only the resolution carries `supersedes`, so exactly one branch fires.
-  if (re.supersedes?.includes(le.contentHash)) {
-    // Content is hash-addressed: prefer the remote store, but fall back to the
-    // local one — an unchanged-content resolution (e.g. a rename) is skipped by
-    // fetchRemoteBlobs precisely because we already hold those bytes.
-    const content = remote.contentStore.get(re.contentHash) ?? local.contentStore.get(re.contentHash);
-    if (content) {
-      return { type: 'write_local', fileId, path: re.path, content, hlc: re.hlcTimestamp, headVersionId: re.headVersionId ?? undefined };
-    }
-  }
-  if (le.supersedes?.includes(re.contentHash)) {
-    // Our own content is the resolution and the remote holds a superseded side —
-    // keep ours and push it (send_remote), don't merge back toward the old version.
-    const content = local.contentStore.get(le.contentHash);
-    if (content) {
-      return { type: 'send_remote', fileId, path: le.path, content, hlc: le.hlcTimestamp };
-    }
-  }
-
-  // Retrieve file content
+  // A user-resolved conflict is now a two-parent merge node in the DAG, so the
+  // fast-forward below adopts it structurally (a peer holding either conflicting
+  // head descends into the resolution) — no `supersedes` content-hash shortcut is
+  // needed. Retrieve file content.
   const localContent = local.contentStore.get(le.contentHash);
   const remoteContent = remote.contentStore.get(re.contentHash);
 
@@ -259,14 +245,6 @@ function resolveContentConflict(
       // ours when it pulls. Nothing to do.
       return { type: 'no_op', fileId };
     }
-  } else if (re.ancestorContentHash != null && re.ancestorContentHash === le.contentHash) {
-    // Scalar fallback (no DAG — pure-VaultState unit tests): the remote's recorded
-    // base equals our current content, so it is a strict descendant. Adopt it.
-    const content = remoteContent ?? local.contentStore.get(re.contentHash);
-    if (content) {
-      return { type: 'write_local', fileId, path: re.path, content, hlc: re.hlcTimestamp, headVersionId: re.headVersionId ?? undefined };
-    }
-    return { type: 'no_op', fileId };
   }
 
   if (!localContent || !remoteContent) {
@@ -309,7 +287,6 @@ function resolveContentConflict(
     mergeResult: wholeFileConflict(localText, remoteText),
     localContent: localText,
     remoteContent: remoteText,
-    parentHashes: [le.contentHash, re.contentHash],
     parents: conflictParents,
   });
 
@@ -343,7 +320,7 @@ function resolveContentConflict(
       remoteContent,
       localHlc: le.hlcTimestamp,
       remoteHlc: re.hlcTimestamp,
-      parentHashes: [le.contentHash, re.contentHash],
+      parents: conflictParents,
     };
   }
 
@@ -408,9 +385,9 @@ function resolveContentConflict(
     };
   }
 
-  // True conflict — needs user resolution. Carry the two conflicting content
-  // hashes so the applicator can tag the resolution op with what it supersedes,
-  // letting peers that still hold either side adopt the resolution cleanly.
+  // True conflict — needs user resolution. Carry the two conflicting heads so the
+  // applicator re-emits the resolution as a two-parent merge node, letting peers
+  // that still hold either side fast-forward onto it cleanly.
   return {
     type: 'conflict',
     fileId,
@@ -419,7 +396,6 @@ function resolveContentConflict(
     mergeResult,
     localContent: localText,
     remoteContent: remoteText,
-    parentHashes: [le.contentHash, re.contentHash],
     parents: conflictParents,
   };
 }
@@ -452,6 +428,7 @@ function resolveCreateCollision(
   local: VaultState,
   remote: VaultState,
   selfIsRemote: boolean,
+  dag: VersionDag | undefined,
 ): MergeAction {
   const selfId = selfIsRemote ? re.id : le.id;
   const noOp: MergeAction = { type: 'no_op', fileId: selfId };
@@ -469,6 +446,18 @@ function resolveCreateCollision(
     return { type: 'write_local', fileId: re.id, path: re.path, content, hlc: re.hlcTimestamp, headVersionId: re.headVersionId ?? undefined };
   };
 
+  // ── Already-resolved by a peer (a two-parent merge node in the DAG). ─────────
+  // If one head descends from the other, a peer already reconciled this exact
+  // collision — fast-forward onto the resolution instead of re-prompting (the
+  // structural replacement for the retired `supersedes` shortcut). Checked before
+  // identical-content so a resolution is adopted by identity, not re-derived.
+  if (dag && le.headVersionId && re.headVersionId) {
+    // Remote descends from our head → it is the resolution; adopt its id + content.
+    if (dag.isAncestor(le.headVersionId, re.headVersionId)) return adoptRemoteId();
+    // Our head descends from remote's → we already hold the resolution; keep ours.
+    if (dag.isAncestor(re.headVersionId, le.headVersionId)) return noOp;
+  }
+
   // ── Identical content: the same file under two ids. Converge id, no conflict. ─
   if (le.contentHash === re.contentHash) {
     const winner = pickCollisionWinner(le, re);
@@ -476,17 +465,6 @@ function resolveCreateCollision(
     // duplicate); if it is the local id, keep it and let the remote-only branch
     // no-op. Either way the loser branch no-ops.
     return winner === re ? adoptRemoteId() : noOp;
-  }
-
-  // ── Already-resolved by a peer (supersedes names the other side's content). ──
-  if (re.supersedes?.includes(le.contentHash)) {
-    // Remote is a resolution superseding our content → adopt its id + content.
-    return adoptRemoteId();
-  }
-  if (le.supersedes?.includes(re.contentHash)) {
-    // Our content is the resolution superseding the remote side → keep local id,
-    // drop the remote duplicate (its branch no-ops; ours keeps the file as-is).
-    return noOp;
   }
 
   // ── Genuine create/create conflict (different, unrelated content). ──────────
@@ -509,7 +487,9 @@ function resolveCreateCollision(
     mergeResult: wholeFileConflict(localText, remoteText),
     localContent: localText,
     remoteContent: remoteText,
-    parentHashes: [le.contentHash, re.contentHash],
+    // The two colliding creates' heads → the resolution is a two-parent merge node
+    // peers fast-forward onto. Both are freshly-created files, so both heads exist.
+    parents: le.headVersionId && re.headVersionId ? [le.headVersionId, re.headVersionId] : undefined,
   };
 }
 
@@ -539,7 +519,8 @@ function pickCollisionWinner(le: FileEntry, re: FileEntry): FileEntry {
  *   · `baseHash === null` — no common base at all (may fall back to an empty
  *     ancestor, i.e. treat both as inserts) — but only when genuinely none exists.
  * A DAG that yields no common base (disconnected histories, e.g. a create/create
- * lineage) degrades to the scalar ancestor rather than forcing a decision.
+ * lineage) returns a `null` baseHash — genuinely no common base — which the caller
+ * may treat as an empty ancestor (both sides pure inserts).
  */
 function resolveThreeWayBase(
   le: FileEntry,
@@ -550,10 +531,17 @@ function resolveThreeWayBase(
     const mb = dag.mergeBase(le.headVersionId, re.headVersionId);
     if (mb === MULTIPLE_BASES) return { baseHash: null, ambiguous: true };
     if (mb !== null) return { baseHash: dag.contentHashOf(mb) ?? null, ambiguous: false };
-    // mb === null: the two heads share no ancestor in the DAG (disconnected) — fall
-    // through to the scalar ancestor so this rare case matches pre-DAG behaviour.
+    // mb === null: the two heads share no ancestor in the DAG (disconnected) — no
+    // common base, so the caller falls back to an empty ancestor.
   }
-  return { baseHash: le.ancestorContentHash ?? re.ancestorContentHash ?? null, ambiguous: false };
+  return { baseHash: null, ambiguous: false };
+}
+
+/** The two conflicting heads to carry on a delete/binary/content conflict action,
+ *  so the applicator re-emits the resolution as a two-parent merge node peers
+ *  fast-forward onto. Undefined when a head is unknown (pure-VaultState tests). */
+function deleteParents(le: FileEntry, re: FileEntry): string[] | undefined {
+  return le.headVersionId && re.headVersionId ? [le.headVersionId, re.headVersionId] : undefined;
 }
 
 /**
@@ -595,21 +583,30 @@ function resolveRenameConflict(fileId: string, le: FileEntry, re: FileEntry): Me
 }
 
 /**
- * Has this entry been left untouched since the last common sync? True only when
- * we have a recorded ancestor hash, the current content still equals it, *and*
- * the path is unchanged — the signal that the *other* side's deletion can be
- * applied cleanly rather than surfaced as a delete/modify(-or-rename) conflict.
- * A null content ancestor (never synced) is treated as "changed" so we err
- * toward asking. A renamed file (path differs from the ancestor path) counts as
- * touched: a concurrent delete of it is a delete/rename conflict, not a silent
- * removal. A legacy entry lacking an ancestor path is treated as un-renamed so
- * the migration doesn't manufacture false conflicts.
+ * Has the `survivor` been left untouched since the last common base — the signal
+ * that the `other` side's deletion can be applied cleanly rather than surfaced as a
+ * delete/modify(-or-rename) conflict? True only when the survivor was NOT renamed
+ * since the last sync AND its content still equals the common base (the LCA over the
+ * op-id DAG).
+ *
+ * Rename check: a rename since the last shared sync counts as "touched" (a
+ * concurrent delete of a renamed file is a delete/rename conflict). The synced path
+ * is recorded on whichever side still carries it — the local one; a projected remote
+ * has `lastSyncedPath == null` — so compare the survivor's current path against
+ * whichever side knows the synced path.
+ *
+ * Content check: over the DAG. No DAG, an unknown head, an ambiguous (criss-cross)
+ * base, or a base whose content is unknown all read as "changed", so we err toward
+ * asking rather than propagate a deletion over a possibly-edited file.
  */
-function isUnchangedSinceAncestor(entry: FileEntry): boolean {
-  const contentUnchanged =
-    entry.ancestorContentHash !== null && entry.contentHash === entry.ancestorContentHash;
-  const pathUnchanged = entry.ancestorPath == null || entry.path === entry.ancestorPath;
-  return contentUnchanged && pathUnchanged;
+function isUnchangedSinceBase(survivor: FileEntry, other: FileEntry, dag: VersionDag | undefined): boolean {
+  const syncedPath = survivor.lastSyncedPath ?? other.lastSyncedPath ?? null;
+  if (syncedPath != null && survivor.path !== syncedPath) return false; // renamed ⇒ touched
+  if (!dag || !survivor.headVersionId || !other.headVersionId) return false;
+  const base = dag.mergeBase(survivor.headVersionId, other.headVersionId);
+  if (base === null || base === MULTIPLE_BASES) return false;
+  const baseContent = dag.contentHashOf(base);
+  return baseContent !== undefined && survivor.contentHash === baseContent;
 }
 
 /** Number of leading bytes sniffed for a null byte when detecting binary content. */

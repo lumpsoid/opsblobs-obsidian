@@ -10,7 +10,6 @@ import { ContentStore, hashContent } from '../core/content-store';
 import { OperationLogger } from '../core/operation-logger';
 import { mergeVersionId } from '../core/operations';
 import { HybridLogicalClock } from '../core/hlc';
-import { nextAncestorHash } from '../merge/ancestor-policy';
 
 /**
  * A conflict handler may return this instead of a decision to *defer* the
@@ -27,23 +26,21 @@ export type ConflictHandler = (action: Extract<MergeAction, { type: 'conflict' }
 export type DeleteConflictHandler = (action: Extract<MergeAction, { type: 'delete_conflict' }>) => Promise<'keep_deleted' | 'restore' | DeferConflict>;
 export type BinaryConflictHandler = (action: Extract<MergeAction, { type: 'binary_conflict' }>) => Promise<'keep_local' | 'keep_remote' | DeferConflict>;
 
-/** A user-resolved conflict that must be re-emitted as an op so it replicates.
- *  `kind` is the op it becomes: an `update` (content conflict, or a delete
- *  conflict resolved by restoring the file) or a `delete` (delete conflict
- *  resolved by accepting the deletion). `supersedes` names the sides it settles
- *  so peers holding either adopt the decision instead of re-prompting. */
+/** A clean merge or user-resolved conflict that must be re-emitted as an op so it
+ *  replicates (sync v2). Every one is a two-parent MERGE NODE: `parents` are the two
+ *  reconciled version-ids and `id` is the precomputed deterministic merge id (the
+ *  applicator hashed the merged bytes to derive it). `deleted` picks the op type —
+ *  a tombstone merge node (keep-deleted resolution) when true, an `update` merge
+ *  node (content/restore/binary resolution, clean merge) otherwise — so a peer
+ *  holding either conflicting head fast-forwards onto the decision. */
 interface PendingResolution {
-  kind: 'update' | 'delete' | 'merge';
   fileId: string;
   path: string;
   contentHash: string;
   hlc: HLC;
-  // update/delete resolutions: the two conflicting sides the decision settles.
-  supersedes?: string[];
-  // merge nodes (sync v2): the two reconciled version-ids and the precomputed
-  // deterministic merge id (the applicator hashed the merged bytes to derive it).
-  parents?: string[];
-  id?: string;
+  parents: string[];
+  id: string;
+  deleted?: boolean;
 }
 
 export class SyncApplicator {
@@ -105,22 +102,21 @@ export class SyncApplicator {
       this.opLogger.startListening();
     }
 
-    // Update ancestor hashes for all synced files (but never for a deferred one:
-    // its destructive action was skipped, so advancing its ancestor to the
-    // remote content we didn't write would corrupt the next three-way merge).
-    await this.updateAncestorHashes(actions, localState, remoteState, deferred);
+    // Advance each synced file's last-synced path (but never for a deferred one:
+    // its destructive action was skipped, so its synced state must stay the
+    // pre-round base for next round's merge).
+    await this.updateSyncedPaths(actions, localState, deferred);
 
     // Persist the resolution ops now that the already-pushed pending log is
     // clear — they become pending for the next round and replicate the manual
-    // resolution to peers. The registry was already updated to the resolved
-    // hash during apply, so the resumed modify listener suppresses the echo.
+    // resolution to peers as two-parent merge nodes. The registry was already
+    // updated to the resolved hash during apply, so the resumed modify listener
+    // suppresses the echo. `deleted` picks the tombstone vs update merge variant.
     for (const r of resolutions) {
-      if (r.kind === 'merge') {
-        await this.opLogger.recordMergeOp(r.fileId, r.path, r.contentHash, r.hlc, r.parents!, r.id!);
-      } else if (r.kind === 'delete') {
-        await this.opLogger.recordResolvedDelete(r.fileId, r.path, r.contentHash, r.hlc, r.supersedes!);
+      if (r.deleted) {
+        await this.opLogger.recordMergeDelete(r.fileId, r.path, r.contentHash, r.hlc, r.parents, r.id);
       } else {
-        await this.opLogger.recordResolvedUpdate(r.fileId, r.path, r.contentHash, r.hlc, r.supersedes!);
+        await this.opLogger.recordMergeOp(r.fileId, r.path, r.contentHash, r.hlc, r.parents, r.id);
       }
     }
 
@@ -217,7 +213,7 @@ export class SyncApplicator {
         }
         converged.add(action.fileId);
         // Re-emit the merge node as a pending op (after clearOps) so it replicates.
-        return { kind: 'merge', fileId: action.fileId, path: action.path, contentHash: hash, hlc: hlcTs, parents: action.parents, id };
+        return { fileId: action.fileId, path: action.path, contentHash: hash, hlc: hlcTs, parents: action.parents, id };
       }
 
       case 'move_local':
@@ -266,23 +262,14 @@ export class SyncApplicator {
         await this.files.write(action.localPath, resolved);
         await this.contentStore.put(hash, resolved);
         converged.add(action.fileId);
-        // Sync v2: when the two conflicting heads are known, re-emit the resolution
-        // as a two-parent MERGE NODE — a peer holding either head fast-forwards onto
-        // it (its parents ARE those heads) instead of re-conflicting, the structural
-        // replacement for the `supersedes` shortcut. The merge id is content-
-        // addressed, so two devices that resolve to the same bytes dedup; two that
-        // resolve differently keep distinct heads and correctly re-surface.
-        if (action.parents && action.parents.length === 2) {
-          const id = await mergeVersionId(hash, action.parents);
-          await this.registry.adoptRemote(action.fileId, action.localPath, hash, hlcTs, id);
-          return { kind: 'merge', fileId: action.fileId, path: action.localPath, contentHash: hash, hlc: hlcTs, parents: action.parents, id };
-        }
-        // Fallback (create/create collision, or no heads): a `supersedes`-tagged
-        // resolution op. `adoptRemote` also drops any *different* live id already at
-        // this path so both devices settle on ONE id (F2); for an ordinary conflict
-        // the fileId already matches, reducing to update-content + set-ancestor.
-        await this.registry.adoptRemote(action.fileId, action.localPath, hash, hlcTs);
-        return { kind: 'update', fileId: action.fileId, path: action.localPath, contentHash: hash, hlc: hlcTs, supersedes: action.parentHashes };
+        // Sync v2: re-emit the resolution as a two-parent MERGE NODE — a peer holding
+        // either conflicting head fast-forwards onto it (its parents ARE those heads)
+        // instead of re-conflicting. The merge id is content-addressed, so two devices
+        // that resolve to the same bytes dedup; two that resolve differently keep
+        // distinct heads and correctly re-surface. `adoptRemote` also drops any
+        // *different* live id already at this path so both devices settle on ONE id
+        // (F2 — a create/create collision's resolution converges identity).
+        return this.mintMergeResolution(action.fileId, action.localPath, hash, hlcTs, action.parents);
       }
 
       case 'delete_conflict': {
@@ -291,35 +278,35 @@ export class SyncApplicator {
         if (decision === DEFER_CONFLICT) { deferred.add(action.fileId); return null; }
         // A real decision (restore or keep_deleted) settles the conflict below.
         converged.add(action.fileId);
-        // Timestamp the decision *now* so it dominates the delete/edit it
-        // supersedes (runSync already advanced the clock past the merged HLC),
-        // and tag it with both sides so a peer still holding either adopts the
-        // decision instead of independently re-prompting.
+        // Timestamp the decision *now* so it dominates the delete/edit it reconciles
+        // (runSync already advanced the clock past the merged HLC). It is re-emitted
+        // as a two-parent merge node so a peer holding either side fast-forwards
+        // onto the decision instead of independently re-prompting.
         const hlcTs = this.hlc.now();
         const hash = await hashContent(action.content);
         if (decision === 'restore') {
           // state-merge already declined (no_op) to raise a delete_conflict whose
           // surviving bytes are missing (F1), so `action.content` is real — an
           // empty payload is a genuinely-empty file to restore, not a truncation.
-          // Keep the file. Re-assert its presence (undeleting our own copy if we
-          // were the deleting side) and make the restored content the new ancestor.
+          // Keep the file: re-assert its presence (undeleting our own copy if we
+          // were the deleting side) as an `update` merge node.
           await this.files.write(action.path, action.content);
           await this.contentStore.put(hash, action.content);
-          await this.registry.adoptRemote(action.fileId, action.path, hash, hlcTs);
-          return { kind: 'update', fileId: action.fileId, path: action.path, contentHash: hash, hlc: hlcTs, supersedes: action.parentHashes };
+          return this.mintMergeResolution(action.fileId, action.path, hash, hlcTs, action.parents);
         }
         // 'keep_deleted' — accept the deletion: remove our copy (if present) and
-        // tombstone, then replicate the delete so the modified side converges.
+        // tombstone, then replicate the delete as a *tombstone* merge node so the
+        // modified side converges.
         await this.files.trash(action.path);
         await this.registry.markDeleted(action.path, hlcTs);
-        return { kind: 'delete', fileId: action.fileId, path: action.path, contentHash: hash, hlc: hlcTs, supersedes: action.parentHashes };
+        return this.mintMergeResolution(action.fileId, action.path, hash, hlcTs, action.parents, /* deleted */ true);
       }
 
       case 'binary_conflict': {
         // Binary files can't be merged; the user picked which whole version to
-        // keep. Write it, converge identity, and re-emit it as a resolution op —
-        // exactly like `delete_conflict`, so a peer still holding either side
-        // adopts the decision via `supersedes` instead of re-prompting.
+        // keep. Write it, converge identity, and re-emit it as a two-parent merge
+        // node — exactly like `delete_conflict`, so a peer still holding either side
+        // fast-forwards onto the decision instead of re-prompting.
         const decision = await this.onBinaryConflict(action);
         // Auto-sync deferral (S5): apply nothing, hold the cursor for next round.
         if (decision === DEFER_CONFLICT) { deferred.add(action.fileId); return null; }
@@ -327,7 +314,7 @@ export class SyncApplicator {
         const keepLocal = decision === 'keep_local';
         const content = keepLocal ? action.localContent : action.remoteContent;
         const path = keepLocal ? action.localPath : action.remotePath;
-        // Timestamp *now* so the decision dominates the version it supersedes
+        // Timestamp *now* so the decision dominates the version it reconciles
         // (runSync already advanced the clock past the merged HLC).
         const hlcTs = this.hlc.now();
         const hash = await hashContent(content);
@@ -335,8 +322,7 @@ export class SyncApplicator {
         // an empty payload is a legitimately-empty version to keep, not a truncation.
         await this.files.write(path, content);
         await this.contentStore.put(hash, content);
-        await this.registry.adoptRemote(action.fileId, path, hash, hlcTs);
-        return { kind: 'update', fileId: action.fileId, path, contentHash: hash, hlc: hlcTs, supersedes: action.parentHashes };
+        return this.mintMergeResolution(action.fileId, path, hash, hlcTs, action.parents);
       }
 
       case 'send_remote':
@@ -366,33 +352,51 @@ export class SyncApplicator {
     return (await hashContent(current)) !== snapshotHash;
   }
 
-  private async updateAncestorHashes(
+  /**
+   * Mint a two-parent merge node for a clean merge or user resolution (sync v2):
+   * derive its deterministic content-addressed id from the resolved bytes + parents,
+   * adopt the file's identity + head onto it (skipped for a tombstone, which the
+   * caller has already trashed + markDeleted), and return the PendingResolution the
+   * caller re-emits as a replicating op after `clearOps`. Two devices that resolve
+   * to the same bytes compute the same id and dedup on push.
+   */
+  private async mintMergeResolution(
+    fileId: string, path: string, contentHash: string, hlc: HLC, parents: string[] | undefined, deleted = false,
+  ): Promise<PendingResolution> {
+    const p = parents ?? [];
+    const id = await mergeVersionId(contentHash, p);
+    // A live resolution adopts the merge node as the file's identity + head; a
+    // tombstone has no live entry to adopt (recordMergeDelete sets its head).
+    if (!deleted) {
+      await this.registry.adoptRemote(fileId, path, contentHash, hlc, id);
+    }
+    return { fileId, path, contentHash, hlc, parents: p, id, deleted };
+  }
+
+  /**
+   * After a round, record each in-sync file's current path as its last-synced path
+   * (sync v2). A `write_local`/`write_merge`/resolution already did this via
+   * `adoptRemote`; this handles the non-writing outcomes:
+   *   · `no_op` — the file is already in sync at its current path.
+   *   · `send_remote` — we pushed our copy, so it is now synced at its path; but only
+   *     on the FIRST sync (no last-synced path yet). A later push is not a peer
+   *     acknowledgement, so advancing the synced path there could mask a concurrent
+   *     rename — mirrors the send_remote data-loss rule the old ancestor policy held.
+   * Never for a deferred file (its destructive action was skipped) or a deleted one.
+   */
+  private async updateSyncedPaths(
     actions: MergeAction[],
     local: VaultState,
-    remote: VaultState,
     deferred: Set<string>,
   ): Promise<void> {
-    // The advance *decision* (first-sync / action-type branching, and the
-    // send_remote-only-on-first-sync rule whose violation caused the reported
-    // data loss) lives in the pure `nextAncestorHash` domain policy. The shell
-    // only performs effects: `write_local` must hash freshly written bytes
-    // (async I/O the policy can't do), so its branch stays here; everything else
-    // asks the policy for the hash to set.
     for (const action of actions) {
-      // A deferred file's destructive action was skipped (F5): its ancestor must
-      // stay the pre-round base so next round's three-way merge is correct.
       if (deferred.has(action.fileId)) continue;
-      if (action.type === 'write_local' || action.type === 'write_merge') {
-        // Both write freshly-produced bytes to disk (a merge synthesizes them), so
-        // the just-written content becomes the synced ancestor. Hashing is async
-        // I/O the pure policy can't do, so this branch stays in the shell.
-        const hash = await hashContent(action.content);
-        await this.registry.setAncestorHash(action.fileId, hash);
-      } else {
-        const next = nextAncestorHash(action, local.fileEntries.get(action.fileId));
-        if (next !== null) {
-          await this.registry.setAncestorHash(action.fileId, next);
-        }
+      if (action.type !== 'no_op' && action.type !== 'send_remote') continue;
+      const entry = local.fileEntries.get(action.fileId);
+      if (!entry || entry.deleted) continue;
+      const isFirstSync = entry.lastSyncedPath == null;
+      if (action.type === 'no_op' || isFirstSync) {
+        await this.registry.setSyncedPath(action.fileId);
       }
     }
   }

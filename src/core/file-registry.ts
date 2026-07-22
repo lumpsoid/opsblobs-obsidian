@@ -71,9 +71,9 @@ export class FileRegistry {
       contentHash,
       hlcTimestamp: hlc,
       deleted: false,
-      ancestorContentHash: null,
-      // No synced version yet — the create op's id becomes the head via
-      // setHeadVersion once the OperationLogger has minted it.
+      // Not synced yet — no last-synced path, and the create op's id becomes the
+      // head via setHeadVersion once the OperationLogger has minted it.
+      lastSyncedPath: null,
       headVersionId: null,
     };
     this.entries.set(id, entry);
@@ -166,8 +166,11 @@ export class FileRegistry {
       contentHash,
       hlcTimestamp: hlc,
       deleted: false,
-      ancestorContentHash: contentHash,
-      ancestorPath: path,
+      // The path we just synced to becomes the last-synced path, so a later local
+      // rename reads as a change since the sync (delete-vs-rename detection). The
+      // content base is the op-id DAG's LCA, not a scalar hash, so no ancestor
+      // content is recorded here.
+      lastSyncedPath: path,
       // Adopting a remote version makes that version this file's head. For a plain
       // remote write / fast-forward / conflict resolution the adopted op's id is
       // `hlcToString(hlc)` (an op's id is the string form of its HLC), so the head
@@ -196,14 +199,15 @@ export class FileRegistry {
     await this.save();
   }
 
-  /** Set the ancestor (content hash + path) after a successful sync. The current
-   *  path *is* the synced path at this point, so it becomes the ancestor path —
-   *  a later local rename then reads as a change since the last sync. */
-  async setAncestorHash(fileId: string, hash: string): Promise<void> {
+  /** Record the file's current path as its last-synced path after a successful
+   *  sync (a no-op / send_remote that leaves it in sync). A later local rename then
+   *  reads as a change since the last sync, so a concurrent delete surfaces as a
+   *  delete/rename conflict. The content base lives in the op-id DAG (LCA), so no
+   *  content hash is recorded — only the path. */
+  async setSyncedPath(fileId: string): Promise<void> {
     const entry = this.entries.get(fileId);
     if (!entry) return;
-    entry.ancestorContentHash = hash;
-    entry.ancestorPath = entry.path;
+    entry.lastSyncedPath = entry.path;
     this.entries.set(fileId, entry);
     await this.save();
   }
@@ -229,7 +233,7 @@ export class FileRegistry {
           contentHash: '',   // will be filled in by operation logger
           hlcTimestamp: hlc,
           deleted: false,
-          ancestorContentHash: null,
+          lastSyncedPath: null,
           headVersionId: null,   // set once its first op is minted
         };
         this.entries.set(id, entry);
@@ -271,13 +275,15 @@ export class FileRegistry {
   /**
    * The content hashes still referenced by the registry — the keep-set for
    * garbage-collecting the content store. A live (non-deleted) entry keeps its
-   * current content; every entry with a synced ancestor keeps that ancestor.
+   * current content. Three-way merge *base* bytes are no longer pinned by a scalar
+   * ancestor here; retaining DAG-reachable bases is the GC's job (sync v2, Step 8),
+   * so a base that is GC'd degrades a deep merge to a conflict (safe), never data
+   * loss.
    */
   referencedHashes(): Set<string> {
     const keep = new Set<string>();
     for (const entry of this.entries.values()) {
       if (!entry.deleted && entry.contentHash) keep.add(entry.contentHash);
-      if (entry.ancestorContentHash) keep.add(entry.ancestorContentHash);
     }
     return keep;
   }

@@ -91,12 +91,11 @@ describe('empty files, truncation guard, and exclusions', () => {
   // ── Sequential edit fast-forward: empty ↔ content across two devices. ───────
   //  Reported: A creates an empty file, both sync; A adds text, both sync; then a
   //  device empties it, both sync — and the other device spuriously conflicted /
-  //  kept the stale text / duplicated the file. Root cause: the editing device's
-  //  own `ancestorContentHash` never advances when it pushes its edit (pushing
-  //  isn't a peer acknowledgement — ancestor-policy), so a later pull three-way-
-  //  merged against a STALE empty ancestor. Fix: ops carry their causal parent (the
-  //  content the edit derived from); the merge fast-forwards when the peer's base
-  //  equals our current content, adopting the descendant cleanly. These are
+  //  kept the stale text / duplicated the file. Root cause (pre-v2): a scalar
+  //  ancestor that never advanced when the editing device pushed, so a later pull
+  //  three-way-merged against a STALE empty ancestor. Fix: ops carry their causal
+  //  parent (version-id); the merge fast-forwards over the op-id DAG when one head
+  //  is an ancestor of the other, adopting the descendant cleanly. These are
   //  SEQUENTIAL edits (each device sees the other's before editing) — there is no
   //  real divergence, so no conflict may ever surface.
   test('empty → content → empty converges with NO conflict (sequential, FF)', async () => {
@@ -204,7 +203,6 @@ describe('empty files, truncation guard, and exclusions', () => {
       fileEntries: new Map([['f1', {
         id: 'f1', path: 'n.md', contentHash: 'local-nonempty',
         hlcTimestamp: clockLocal.now(), deleted: false,
-        ancestorContentHash: 'base', ancestorPath: 'n.md',
       }]]),
       contentStore: new Map([['local-nonempty', new TextEncoder().encode('content here\n')]]),
     };
@@ -215,7 +213,6 @@ describe('empty files, truncation guard, and exclusions', () => {
       fileEntries: new Map([['f1', {
         id: 'f1', path: 'n.md', contentHash: 'remote-missing',
         hlcTimestamp: clockRemote.now(), deleted: false,
-        ancestorContentHash: 'base', ancestorPath: 'n.md',
       }]]),
       contentStore: new Map(), // winner's bytes absent
     };

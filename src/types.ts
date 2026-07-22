@@ -14,17 +14,14 @@ export interface FileEntry {
   contentHash: string;                 // SHA-256 of current content
   hlcTimestamp: HLC;                   // hybrid logical clock at last modification
   deleted: boolean;                    // tombstone flag
-  ancestorContentHash: string | null;  // hash at last successful sync (for three-way merge)
   // Path at last successful sync. Lets the merge tell a *rename* since the last
   // sync from an untouched file: a concurrent delete of an untouched file
-  // propagates cleanly, but of a renamed one is a delete/rename conflict.
-  // Optional for migration — a legacy entry without it is treated as un-renamed.
-  ancestorPath?: string | null;
-  // Content hashes this entry's content resolved/superseded. Set only on a
-  // user-resolved conflict: the two conflicting sides the human chose between.
-  // A peer that still holds one of these hashes adopts this content cleanly
-  // instead of re-prompting — the decision already weighed its version.
-  supersedes?: string[];
+  // propagates cleanly, but of a renamed one is a delete/rename conflict. The
+  // three-way base is now the op-id DAG's LCA (not a scalar content ancestor), so
+  // only the *path* at last sync is still tracked here; content lineage lives in
+  // the DAG. Null until the file has synced once. Optional for migration — a
+  // legacy entry without it is treated as un-renamed.
+  lastSyncedPath?: string | null;
   // The version-id (op-id) of this file's current head — the content version a
   // new local edit descends from, recorded as that edit's `parents` (sync v2).
   // A version's identity is the op-id, NOT the content hash: content recurs
@@ -60,11 +57,6 @@ export interface Operation {
   // rather than relying on a locally-tracked scalar ancestor, which cannot
   // testify to what a peer's edit was based on. See docs/sync-v2-decisions.md.
   parents: string[];
-  // Set only on a resolution op (a user-resolved conflict re-emitted by the
-  // applicator): the content hashes of the two conflicting sides this
-  // resolution supersedes. A peer still holding one of them adopts the
-  // resolution instead of re-conflicting. See FileEntry.supersedes.
-  supersedes?: string[];
 }
 
 export interface VaultState {
@@ -119,22 +111,22 @@ export type MergeAction =
   | { type: 'delete_local'; fileId: string; path: string }
   | { type: 'delete_remote'; fileId: string; path: string }
   | { type: 'move_local'; fileId: string; fromPath: string; toPath: string }
-  // `parents`, when present, are the two conflicting heads' version-ids (sync v2):
-  // a user's resolution of this conflict is re-emitted as a two-parent MERGE NODE
-  // with these parents, so a peer holding either head fast-forwards onto the
-  // resolution instead of re-conflicting — the structural replacement for the
-  // `supersedes`/`parentHashes` shortcut. Absent (create/create collisions, binary
-  // resolutions, pure-VaultState tests with no heads) ⇒ the applicator falls back
-  // to a `supersedes`-tagged resolution op keyed by `parentHashes`.
-  | { type: 'conflict'; fileId: string; localPath: string; remotePath: string; mergeResult: ThreeWayMergeResult; localContent: string; remoteContent: string; parentHashes: string[]; parents?: string[] }
-  | { type: 'delete_conflict'; fileId: string; path: string; side: 'local_deleted' | 'remote_deleted'; content: Uint8Array; parentHashes: string[] }
+  // `parents` are the two conflicting heads' version-ids (sync v2): a user's
+  // resolution of this conflict is re-emitted as a two-parent MERGE NODE with these
+  // parents, so a peer holding either head fast-forwards onto the resolution instead
+  // of re-conflicting — the structural replacement for the retired `supersedes`
+  // shortcut. Set whenever both heads are known (always, for a real synced file);
+  // absent only in pure-VaultState unit tests that build entries with no head.
+  | { type: 'conflict'; fileId: string; localPath: string; remotePath: string; mergeResult: ThreeWayMergeResult; localContent: string; remoteContent: string; parents?: string[] }
+  | { type: 'delete_conflict'; fileId: string; path: string; side: 'local_deleted' | 'remote_deleted'; content: Uint8Array; parents?: string[] }
   // Two devices edited the same *binary* file concurrently. Binary content can't
   // be three-way merged, so rather than silently dropping one side by
   // last-writer-wins the user chooses which whole version to keep (presented by
   // filename + metadata — there is no meaningful content diff to show). Both
-  // versions are carried so the applicator can write the chosen one; parentHashes
-  // are the two sides the resolution supersedes (like `conflict`).
-  | { type: 'binary_conflict'; fileId: string; localPath: string; remotePath: string; localContent: Uint8Array; remoteContent: Uint8Array; localHlc: HLC; remoteHlc: HLC; parentHashes: string[] }
+  // versions are carried so the applicator can write the chosen one; `parents` are
+  // the two conflicting heads, so the resolution replicates as a merge node peers
+  // fast-forward onto (like `conflict`).
+  | { type: 'binary_conflict'; fileId: string; localPath: string; remotePath: string; localContent: Uint8Array; remoteContent: Uint8Array; localHlc: HLC; remoteHlc: HLC; parents?: string[] }
   | { type: 'no_op'; fileId: string };
 
 export interface StateMergeResult {

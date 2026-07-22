@@ -415,9 +415,8 @@ export function safeCursor(
  * reflects our own ops, so excluding them is both correct and what makes the
  * re-pull the intended no-op.
  *
- * Ancestor hashes are intentionally null: the shared ancestor for a three-way
- * merge is whatever the *local* side recorded at its last sync, which the merge
- * already prefers. The projection is partial (only files touched since the
+ * The three-way base is the op-id DAG's LCA of the two heads, not anything carried
+ * on this projection. The projection is partial (only files touched since the
  * cursor) — untouched files are simply absent, which the merge treats as
  * "already in sync", producing no local change.
  */
@@ -443,18 +442,15 @@ export function reconstructRemoteState(ops: Operation[], ownDeviceId?: string): 
       // The pulled op IS this remote version, so its op-id is the remote head the
       // merge reconstructs the DAG from (its parents are the parent version-ids,
       // carried on the op itself). The merge derives the true three-way base (LCA)
-      // and the fast-forward from `headVersionId` over the op-id DAG. The scalar
-      // ancestor is retired for remote entries — nothing reads it on the remote
-      // side anymore (the DAG replaces it); left null until Step 3 removes it.
-      ancestorContentHash: null,
-      ancestorPath: null,
+      // and the fast-forward from `headVersionId` over the op-id DAG. A projected
+      // remote entry has no last-synced path of its own (that is a *local* notion),
+      // so it is null — the delete-vs-rename check reads the local side's synced
+      // path instead.
+      lastSyncedPath: null,
       // A `move` is not a new content version: it carries no content of its own,
       // so its head is the content version it renamed (its parent), keeping the
       // renamed file connected in the DAG. Every other op IS its own version.
       headVersionId: op.type === 'move' ? (op.parents[0] ?? op.id) : op.id,
-      // Carry a resolution op's superseded sides so a peer still holding one of
-      // them adopts the resolution rather than re-conflicting (state-merge).
-      supersedes: op.supersedes,
     });
   }
 

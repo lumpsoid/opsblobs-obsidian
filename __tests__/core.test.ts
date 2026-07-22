@@ -6,6 +6,7 @@ import { describe, test, expect, vi } from 'vitest';
 import { HybridLogicalClock, hlcCompare, hlcToString, hlcFromString } from '../src/core/hlc';
 import { diffLines, threeWayMerge } from '../src/merge/diff3';
 import { mergeVaultStates } from '../src/merge/state-merge';
+import { VersionDag } from '../src/core/version-dag';
 import { VaultState, FileEntry } from '../src/types';
 
 // ─── HLC Tests ────────────────────────────────────────────────────────────────
@@ -230,7 +231,8 @@ function makeState(deviceId: string, files: Array<Partial<FileEntry> & { id: str
       contentHash: f.contentHash ?? `hash-${f.id}`,
       hlcTimestamp: f.hlcTimestamp ?? hlc,
       deleted: f.deleted ?? false,
-      ancestorContentHash: f.ancestorContentHash ?? null,
+      headVersionId: f.headVersionId ?? null,
+      lastSyncedPath: f.lastSyncedPath,
     };
     fileEntries.set(f.id, entry);
     if (!entry.deleted) {
@@ -239,6 +241,16 @@ function makeState(deviceId: string, files: Array<Partial<FileEntry> & { id: str
   }
 
   return { deviceId, hlc, fileEntries, pendingOps: [], contentStore };
+}
+
+/** Build a version DAG (sync v2) from `[versionId, parents, contentHash]` triples,
+ *  so a merge test can supply the true three-way base (LCA over op-ids) the merge
+ *  now derives from graph structure instead of a scalar ancestor. All nodes share
+ *  one fileId (`file1`) — the tests operate on a single file. */
+function dagOf(versions: Array<[string, string[], string]>): VersionDag {
+  const dag = new VersionDag();
+  for (const [id, parents, contentHash] of versions) dag.addVersion(id, parents, contentHash, 'file1');
+  return dag;
 }
 
 describe('mergeVaultStates', () => {
@@ -276,46 +288,52 @@ describe('mergeVaultStates', () => {
     expect(actions).toContainEqual(expect.objectContaining({ type: 'no_op', fileId: 'file1' }));
   });
 
-  test('local deleted, remote unchanged since ancestor → delete_remote', () => {
-    // Remote still holds the last-synced content (contentHash === ancestor),
-    // so local's deletion is clean and should propagate to remote.
+  test('local deleted, remote unchanged since base → delete_remote', () => {
+    // Remote still holds the common base content (its head IS the base), so local's
+    // deletion is clean over the DAG and should propagate to remote. Lineage:
+    // v-base ("shared") ← v-del (local's deletion). Remote head is v-base itself.
     const clockA = new HybridLogicalClock('A');
     const clockB = new HybridLogicalClock('B');
-    const local = makeState('A', [{ id: 'file1', deleted: true, hlcTimestamp: clockA.now() }]);
+    const dag = dagOf([['v-base', [], 'shared'], ['v-del', ['v-base'], 'shared']]);
+    const local = makeState('A', [{ id: 'file1', deleted: true, contentHash: 'shared', headVersionId: 'v-del', hlcTimestamp: clockA.now() }]);
     const remote = makeState('B', [
-      { id: 'file1', contentHash: 'shared', ancestorContentHash: 'shared', hlcTimestamp: clockB.now() },
+      { id: 'file1', contentHash: 'shared', headVersionId: 'v-base', hlcTimestamp: clockB.now() },
     ]);
 
-    const { actions } = mergeVaultStates(local, remote);
+    const { actions } = mergeVaultStates(local, remote, dag);
     expect(actions).toContainEqual(
       expect.objectContaining({ type: 'delete_remote', fileId: 'file1' }),
     );
   });
 
-  test('remote deleted, local unchanged since ancestor → delete_local', () => {
+  test('remote deleted, local unchanged since base → delete_local', () => {
     const clockA = new HybridLogicalClock('A');
     const clockB = new HybridLogicalClock('B');
+    const dag = dagOf([['v-base', [], 'shared'], ['v-del', ['v-base'], 'shared']]);
     const local = makeState('A', [
-      { id: 'file1', contentHash: 'shared', ancestorContentHash: 'shared', hlcTimestamp: clockA.now() },
+      { id: 'file1', contentHash: 'shared', headVersionId: 'v-base', hlcTimestamp: clockA.now() },
     ]);
-    const remote = makeState('B', [{ id: 'file1', deleted: true, hlcTimestamp: clockB.now() }]);
+    const remote = makeState('B', [{ id: 'file1', deleted: true, contentHash: 'shared', headVersionId: 'v-del', hlcTimestamp: clockB.now() }]);
 
-    const { actions } = mergeVaultStates(local, remote);
+    const { actions } = mergeVaultStates(local, remote, dag);
     expect(actions).toContainEqual(
       expect.objectContaining({ type: 'delete_local', fileId: 'file1' }),
     );
   });
 
-  test('remote deleted, local edited since ancestor → delete_conflict', () => {
-    // Local diverged from the ancestor, so the delete is not clean — must ask.
+  test('remote deleted, local edited since base → delete_conflict', () => {
+    // Local diverged from the base (its head is a distinct edit off v-base), so the
+    // delete is not clean — must ask. Lineage: v-base ("shared") ← v-edit ("edited")
+    // and v-base ← v-del (remote's deletion).
     const clockA = new HybridLogicalClock('A');
     const clockB = new HybridLogicalClock('B');
+    const dag = dagOf([['v-base', [], 'shared'], ['v-edit', ['v-base'], 'edited'], ['v-del', ['v-base'], 'shared']]);
     const local = makeState('A', [
-      { id: 'file1', contentHash: 'edited', ancestorContentHash: 'shared', hlcTimestamp: clockA.now() },
+      { id: 'file1', contentHash: 'edited', headVersionId: 'v-edit', hlcTimestamp: clockA.now() },
     ]);
-    const remote = makeState('B', [{ id: 'file1', deleted: true, hlcTimestamp: clockB.now() }]);
+    const remote = makeState('B', [{ id: 'file1', deleted: true, contentHash: 'shared', headVersionId: 'v-del', hlcTimestamp: clockB.now() }]);
 
-    const { actions } = mergeVaultStates(local, remote);
+    const { actions } = mergeVaultStates(local, remote, dag);
     expect(actions).toContainEqual(
       expect.objectContaining({ type: 'delete_conflict', fileId: 'file1', side: 'remote_deleted' }),
     );
@@ -324,10 +342,11 @@ describe('mergeVaultStates', () => {
   test('local deleted, remote modified → delete_conflict', () => {
     const clockA = new HybridLogicalClock('A');
     const clockB = new HybridLogicalClock('B');
-    const local = makeState('A', [{ id: 'file1', deleted: true, hlcTimestamp: clockA.now() }]);
-    const remote = makeState('B', [{ id: 'file1', contentHash: 'new-hash', hlcTimestamp: clockB.now() }]);
+    const dag = dagOf([['v-base', [], 'shared'], ['v-del', ['v-base'], 'shared'], ['v-mod', ['v-base'], 'new-hash']]);
+    const local = makeState('A', [{ id: 'file1', deleted: true, contentHash: 'shared', headVersionId: 'v-del', hlcTimestamp: clockA.now() }]);
+    const remote = makeState('B', [{ id: 'file1', contentHash: 'new-hash', headVersionId: 'v-mod', hlcTimestamp: clockB.now() }]);
 
-    const { actions } = mergeVaultStates(local, remote);
+    const { actions } = mergeVaultStates(local, remote, dag);
     expect(actions).toContainEqual(
       expect.objectContaining({ type: 'delete_conflict', fileId: 'file1', side: 'local_deleted' }),
     );
@@ -339,10 +358,10 @@ describe('mergeVaultStates', () => {
     // blob is transiently absent from its content store (e.g. fetchRemoteBlobs
     // skipped it). Writing must be declined, not fabricated as zero bytes.
     const local = makeState('A', [
-      { id: 'file1', contentHash: 'local-hash', ancestorContentHash: 'base', hlcTimestamp: { wallTime: 1000, counter: 0, deviceId: 'A' } },
+      { id: 'file1', contentHash: 'local-hash', hlcTimestamp: { wallTime: 1000, counter: 0, deviceId: 'A' } },
     ]);
     const remote = makeState('B', [
-      { id: 'file1', contentHash: 'remote-hash', ancestorContentHash: 'base', hlcTimestamp: { wallTime: 2000, counter: 0, deviceId: 'B' } },
+      { id: 'file1', contentHash: 'remote-hash', hlcTimestamp: { wallTime: 2000, counter: 0, deviceId: 'B' } },
     ]);
     remote.contentStore.delete('remote-hash'); // winning side's bytes unavailable
 
@@ -406,20 +425,23 @@ describe('mergeVaultStates', () => {
     // at the same gap — exactly the diff3 union trap for a known-but-missing base.
     const localText = '\nAAA local only line 1\nAAA local only line 2';
     const remoteText = '\nBBB remote only line 1\nBBB remote only line 2';
+    // The DAG names a real common base (v-base, content 'base') the two heads
+    // descend from — a *known* base — but its bytes are held by neither store.
+    const dag = dagOf([['v-base', [], 'base'], ['v-local', ['v-base'], 'local-hash'], ['v-remote', ['v-base'], 'remote-hash']]);
     const local = makeState('A', [
-      { id: 'file1', contentHash: 'local-hash', ancestorContentHash: 'base', hlcTimestamp: { wallTime: 1000, counter: 0, deviceId: 'A' } },
+      { id: 'file1', contentHash: 'local-hash', headVersionId: 'v-local', hlcTimestamp: { wallTime: 1000, counter: 0, deviceId: 'A' } },
     ]);
     const remote = makeState('B', [
-      { id: 'file1', contentHash: 'remote-hash', ancestorContentHash: 'base', hlcTimestamp: { wallTime: 2000, counter: 0, deviceId: 'B' } },
+      { id: 'file1', contentHash: 'remote-hash', headVersionId: 'v-remote', hlcTimestamp: { wallTime: 2000, counter: 0, deviceId: 'B' } },
     ]);
     // Distinct, present current content on each side...
     local.contentStore.set('local-hash', new TextEncoder().encode(localText));
     remote.contentStore.set('remote-hash', new TextEncoder().encode(remoteText));
-    // ...but the recorded ancestor's bytes are unavailable in both stores.
+    // ...but the known base's bytes are unavailable in both stores.
     expect(local.contentStore.has('base')).toBe(false);
     expect(remote.contentStore.has('base')).toBe(false);
 
-    const { actions } = mergeVaultStates(local, remote);
+    const { actions } = mergeVaultStates(local, remote, dag);
     const action = actions.find(a => a.fileId === 'file1')!;
     expect(action.type).toBe('conflict');
     // Must NOT emit a write_local whose merged content concatenates BOTH versions.

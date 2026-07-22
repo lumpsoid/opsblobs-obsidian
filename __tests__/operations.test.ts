@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'vitest';
-import { Ops } from '../src/core/operations';
+import { Ops, mergeVersionId } from '../src/core/operations';
 import { hlcToString } from '../src/core/hlc';
 import { HLC } from '../src/types';
 
@@ -45,15 +45,24 @@ describe('Ops — operation factories', () => {
     expect(Ops.move('f1', 'b.md', 'h1', hlc).parents).toEqual([]);             // unknown head ⇒ root
   });
 
-  test('resolveUpdate / resolveDelete carry supersedes and the right type', () => {
-    const parents = ['hLocal', 'hRemote'];
+  test('merge / mergeDelete are two-parent nodes carrying a content-addressed id (sync v2)', async () => {
+    const parents = ['vLocal', 'vRemote'];
 
-    const u = Ops.resolveUpdate('f1', 'a.md', 'hMerged', hlc, parents);
+    // A resolved content conflict / clean merge → an `update` merge node whose id is
+    // the deterministic content-addressed mergeVersionId and whose parents are the
+    // two reconciled heads (peers fast-forward onto it).
+    const id = await mergeVersionId('hMerged', parents);
+    const u = Ops.merge('f1', 'a.md', 'hMerged', hlc, parents, id);
     expect(u.type).toBe('update');
-    expect(u.supersedes).toEqual(parents);
+    expect(u.parents).toEqual(parents);
+    expect(u.id).toBe(id);
+    expect(id.startsWith('m-')).toBe(true);
 
-    const d = Ops.resolveDelete('f1', 'a.md', 'hOld', hlc, parents);
+    // A kept-deleted resolution → a `delete` (tombstone) merge node of the same shape.
+    const delId = await mergeVersionId('hOld', parents);
+    const d = Ops.mergeDelete('f1', 'a.md', 'hOld', hlc, parents, delId);
     expect(d.type).toBe('delete');
-    expect(d.supersedes).toEqual(parents);
+    expect(d.parents).toEqual(parents);
+    expect(d.id).toBe(delId);
   });
 });

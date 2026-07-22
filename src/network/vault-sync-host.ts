@@ -48,6 +48,14 @@ export class PluginVaultSyncHost implements VaultSyncHost {
     // pure merge — including one deeper than the last-synced version (a multi-round
     // offline divergence), which the scalar ancestor alone could not reach (#4).
     const dag = await this.versionDagStore.load();
+    // This round's own edits aren't in the *persisted* DAG yet (recordVersionEdges
+    // runs later in the round), so a fresh head can't reach its base for staging.
+    // Fold the pending ops' edges into this in-memory copy — not persisted here — so
+    // reachability from each head includes the base the merge will need.
+    for (const op of this.opLogger.getPendingOps()) {
+      if (op.type === 'move') continue;
+      dag.addVersion(op.id, op.parents, op.contentHash, op.fileId);
+    }
 
     for (const [id, entry] of this.registry.getAllEntries()) {
       let resolved = entry;
@@ -68,11 +76,6 @@ export class PluginVaultSyncHost implements VaultSyncHost {
       }
 
       fileEntries.set(id, resolved);
-
-      if (resolved.ancestorContentHash && !contentStore.has(resolved.ancestorContentHash)) {
-        const ancestor = await this.contentStore.get(resolved.ancestorContentHash);
-        if (ancestor) contentStore.set(resolved.ancestorContentHash, ancestor);
-      }
 
       // Stage the bytes of every base reachable from this file's head (its DAG
       // ancestors) that the content store still holds, so the merge can three-way

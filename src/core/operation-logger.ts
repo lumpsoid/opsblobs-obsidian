@@ -407,49 +407,33 @@ export class OperationLogger {
   }
 
   /**
-   * Record an `update` op for content produced by sync itself — specifically a
-   * user-resolved merge conflict. Ordinary edits are captured through vault
-   * events, but a conflict is resolved *while listeners are paused* and the
-   * pending log is then cleared, so the resolution would otherwise never become
-   * an op and never reach peers (they'd keep their own version and diverge).
-   *
-   * Call this *after* the applicator has cleared the already-pushed pending ops,
-   * so the resolution survives as a fresh pending op for the next round. The
-   * caller supplies an HLC that dominates the remote content being superseded,
-   * so the resolution wins last-writer-wins when peers pull it.
-   */
-  async recordResolvedUpdate(fileId: string, path: string, contentHash: string, hlcTs: HLC, supersedes: string[]): Promise<void> {
-    const op = Ops.resolveUpdate(fileId, path, contentHash, hlcTs, supersedes);
-    await this.recordOp(op);
-    await this.registry.setHeadVersion(fileId, op.id);
-  }
-
-  /**
-   * Record a `delete` op for a delete/modify conflict the user resolved by
-   * *accepting the deletion*. Like {@link recordResolvedUpdate}, this is produced
-   * while listeners are paused and after the pending log is cleared, so it must
-   * be re-emitted explicitly. `supersedes` names the two conflicting sides so a
-   * peer still holding the modified version adopts the deletion instead of
-   * re-prompting. `contentHash` is the superseded (now-deleted) content.
-   */
-  async recordResolvedDelete(fileId: string, path: string, contentHash: string, hlcTs: HLC, supersedes: string[]): Promise<void> {
-    const op = Ops.resolveDelete(fileId, path, contentHash, hlcTs, supersedes);
-    await this.recordOp(op);
-    await this.registry.setHeadVersion(fileId, op.id);
-  }
-
-  /**
-   * Record a clean-merge node as a pending op so it replicates (sync v2). Like the
-   * resolution recorders, a clean three-way merge is produced *while listeners are
-   * paused* and after the pending log is cleared, so it must be re-emitted here to
-   * survive as a pending op for the next round's push. `parents` are the two
-   * reconciled version-ids and `id` is the precomputed deterministic merge id
-   * (the applicator hashed the merged bytes to derive it, and already set the head
-   * to it via `adoptRemote`; setting it again here keeps this method self-contained
-   * and correct if called without that prior step).
+   * Record a clean-merge / resolution node as a pending op so it replicates (sync
+   * v2). A clean three-way merge or a user-resolved conflict is produced *while
+   * listeners are paused* and after the pending log is cleared, so it would
+   * otherwise never become an op and never reach peers (they'd keep their own
+   * version and diverge) — re-emit it here to survive as a pending op for the next
+   * round's push. `parents` are the two reconciled version-ids and `id` is the
+   * precomputed deterministic merge id (the applicator hashed the merged bytes to
+   * derive it, and already set the head to it via `adoptRemote`; setting it again
+   * here keeps this method self-contained and correct if called without that prior
+   * step). The caller supplies an HLC that dominates the remote content being
+   * reconciled, so the resolution wins last-writer-wins when peers pull it.
    */
   async recordMergeOp(fileId: string, path: string, contentHash: string, hlcTs: HLC, parents: string[], id: string): Promise<void> {
     const op = Ops.merge(fileId, path, contentHash, hlcTs, parents, id);
+    await this.recordOp(op);
+    await this.registry.setHeadVersion(fileId, id);
+  }
+
+  /**
+   * Record a *tombstone* merge node — a delete/modify conflict the user resolved by
+   * accepting the deletion (sync v2). The delete counterpart of {@link recordMergeOp}:
+   * a two-parent `delete` op peers fast-forward onto instead of re-prompting.
+   * Produced while listeners are paused and after the pending log is cleared, so it
+   * must be re-emitted explicitly. `contentHash` is the now-deleted content.
+   */
+  async recordMergeDelete(fileId: string, path: string, contentHash: string, hlcTs: HLC, parents: string[], id: string): Promise<void> {
+    const op = Ops.mergeDelete(fileId, path, contentHash, hlcTs, parents, id);
     await this.recordOp(op);
     await this.registry.setHeadVersion(fileId, id);
   }

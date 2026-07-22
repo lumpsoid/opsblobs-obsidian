@@ -74,7 +74,6 @@ describe('resolved conflict converges without re-prompting the peer', () => {
     const bRes = B.pendingOps.find(op => op.path === 'note.md')!;
     expect(bRes.id.startsWith('m-')).toBe(true);
     expect(bRes.parents.length).toBe(2);
-    expect(bRes.supersedes).toBeUndefined();
 
     // The resolution is recorded as a pending op for the *next* round, so B must
     // sync once more to push it to the server before any peer can see it.

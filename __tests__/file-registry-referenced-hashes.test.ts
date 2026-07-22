@@ -22,7 +22,6 @@ function entry(over: Partial<FileEntry>): FileEntry {
     contentHash: over.contentHash ?? '',
     hlcTimestamp: hlc,
     deleted: over.deleted ?? false,
-    ancestorContentHash: over.ancestorContentHash ?? null,
     ...over,
   };
 }
@@ -42,23 +41,26 @@ async function registryWith(entries: FileEntry[]): Promise<FileRegistry> {
 }
 
 describe('FileRegistry.referencedHashes', () => {
-  test('keeps live content hashes, drops deleted ones, and keeps every ancestor', async () => {
+  test('keeps live content hashes and drops deleted ones (base bytes are the GC/DAG job)', async () => {
+    // Sync v2: the scalar content ancestor is retired, so the keep-set is just live
+    // content. Retaining three-way merge *base* bytes is the GC's DAG-reachable job
+    // (Step 8) — a GC'd base degrades a deep merge to a conflict (safe), not loss.
     const reg = await registryWith([
-      // live with content + ancestor → both kept
-      entry({ id: 'a', contentHash: 'live-a', ancestorContentHash: 'anc-a' }),
-      // live, no ancestor → content kept
-      entry({ id: 'b', contentHash: 'live-b', ancestorContentHash: null }),
-      // deleted but with an ancestor → content dropped, ancestor kept
-      entry({ id: 'c', deleted: true, contentHash: 'live-c', ancestorContentHash: 'anc-c' }),
-      // deleted, no ancestor → nothing kept
-      entry({ id: 'd', deleted: true, contentHash: 'live-d', ancestorContentHash: null }),
+      // live with content → kept
+      entry({ id: 'a', contentHash: 'live-a' }),
+      // live → content kept
+      entry({ id: 'b', contentHash: 'live-b' }),
+      // deleted → content dropped
+      entry({ id: 'c', deleted: true, contentHash: 'live-c' }),
+      // deleted → nothing kept
+      entry({ id: 'd', deleted: true, contentHash: 'live-d' }),
       // live but empty content hash → not added (falsy)
-      entry({ id: 'e', contentHash: '', ancestorContentHash: 'anc-e' }),
+      entry({ id: 'e', contentHash: '' }),
     ]);
 
     const keep = reg.referencedHashes();
 
-    expect(keep).toEqual(new Set(['live-a', 'anc-a', 'live-b', 'anc-c', 'anc-e']));
+    expect(keep).toEqual(new Set(['live-a', 'live-b']));
     expect(keep.has('live-c')).toBe(false); // deleted entry's live content
     expect(keep.has('live-d')).toBe(false);
     expect(keep.has('')).toBe(false);       // falsy content hash never added
