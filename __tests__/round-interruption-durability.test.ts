@@ -55,6 +55,7 @@ class CrashOnFirstClearHost implements VaultSyncHost {
   loadCursor(): Promise<number> { return this.inner.loadCursor(); }
   saveCursor(c: number): Promise<void> { return this.inner.saveCursor(c); }
   recordVersionEdges(ops: Operation[]): Promise<VersionDag> { return this.inner.recordVersionEdges(ops); }
+  dagNeedsRebuild(): Promise<boolean> { return this.inner.dagNeedsRebuild(); }
 }
 
 /**

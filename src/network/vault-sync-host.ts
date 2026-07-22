@@ -121,6 +121,18 @@ export class PluginVaultSyncHost implements VaultSyncHost {
     return dag;
   }
 
+  async dagNeedsRebuild(): Promise<boolean> {
+    // A torn/deleted version-dag.json loads as an EMPTY graph (VersionDagStore maps
+    // any corruption to `new VersionDag()`). If we've consumed server ops before
+    // (cursor > 0) the DAG must have been populated by recordVersionEdges, so an
+    // empty graph now means it was lost — signal a rebuild-from-log. A fresh device
+    // (cursor 0) legitimately has an empty DAG and is not a loss. After a rebuild
+    // the DAG is non-empty, so this can't loop.
+    if (await this.cursor.load() === 0) return false;
+    const dag = await this.versionDagStore.load();
+    return dag.size() === 0;
+  }
+
   loadCursor(): Promise<number> {
     return this.cursor.load();
   }

@@ -65,6 +65,14 @@ export class VersionDag {
     return this.nodes.has(versionId);
   }
 
+  /** The number of recorded nodes. `0` means the graph is empty — which, on a
+   *  device that has already consumed server ops (cursor > 0), is the signature of
+   *  a lost/corrupt `version-dag.json` (which loads as an empty DAG), signalling a
+   *  rebuild-from-log rather than a fresh device. */
+  size(): number {
+    return this.nodes.size;
+  }
+
   /**
    * The open *leaves* of a file — the versions of `fileId` that no other node
    * descends from (nothing lists them as a parent). One leaf ⇒ converged; two or

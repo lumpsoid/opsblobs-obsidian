@@ -110,6 +110,13 @@ export interface VaultSyncHost {
    *  from it. Called with this round's local + pulled ops BEFORE the merge, so both
    *  heads are present when the merge reads the graph. */
   recordVersionEdges(ops: Operation[]): Promise<VersionDag>;
+  /** Whether the persisted version-DAG was lost (a torn write on an older build,
+   *  or a deleted metadata file) and must be rebuilt from the server op log. True
+   *  when this device has consumed server ops before (cursor > 0) yet the DAG loads
+   *  empty — the DAG is a derived cache of the log, so the round heals it by
+   *  rewinding the cursor and replaying (see runSync). Never true for a fresh
+   *  device (cursor 0), and false again once rebuilt, so it can't loop. */
+  dagNeedsRebuild(): Promise<boolean>;
 }
 
 export interface ServerSyncOptions {
@@ -178,6 +185,18 @@ export class ServerSyncClient {
    */
   async runSync(): Promise<SyncRoundSummary> {
     if (!this.crypto.isReady()) throw new Error('Vault key not derived');
+
+    // Self-heal a lost/corrupt version-DAG before reading the cursor. If the graph
+    // was torn away (an old build's non-atomic write, a deleted metadata file) but
+    // we've synced before, rewind the cursor so this round re-pulls the whole
+    // server log and `recordVersionEdges` rebuilds the DAG from the source of
+    // truth. The replay is idempotent — already-applied files merge to a no-op —
+    // the same self-healing `recheckConflicts` triggers by hand. Rebuilt DAG is
+    // non-empty, so the next round won't re-trigger.
+    if (await this.host.dagNeedsRebuild()) {
+      this.onProgress?.('Rebuilding sync history…');
+      await this.host.saveCursor(0);
+    }
 
     const local = await this.host.buildLocalState();
     const startCursor = await this.host.loadCursor();
