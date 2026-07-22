@@ -42,6 +42,12 @@ export class PluginVaultSyncHost implements VaultSyncHost {
   async buildLocalState(): Promise<VaultState> {
     const fileEntries = new Map<string, FileEntry>();
     const contentStore = new Map<string, Uint8Array>();
+    // The op-id DAG, so we can stage the bytes of every version reachable from each
+    // file's head (its ancestors). The three-way merge base LCA(localHead, peerHead)
+    // is always one of these, so pre-staging them makes any base available to the
+    // pure merge — including one deeper than the last-synced version (a multi-round
+    // offline divergence), which the scalar ancestor alone could not reach (#4).
+    const dag = await this.versionDagStore.load();
 
     for (const [id, entry] of this.registry.getAllEntries()) {
       let resolved = entry;
@@ -66,6 +72,18 @@ export class PluginVaultSyncHost implements VaultSyncHost {
       if (resolved.ancestorContentHash && !contentStore.has(resolved.ancestorContentHash)) {
         const ancestor = await this.contentStore.get(resolved.ancestorContentHash);
         if (ancestor) contentStore.set(resolved.ancestorContentHash, ancestor);
+      }
+
+      // Stage the bytes of every base reachable from this file's head (its DAG
+      // ancestors) that the content store still holds, so the merge can three-way
+      // against the true LCA even when it is deeper than the scalar ancestor.
+      if (resolved.headVersionId) {
+        for (const hash of dag.reachableContentHashes(resolved.headVersionId)) {
+          if (!contentStore.has(hash)) {
+            const bytes = await this.contentStore.get(hash);
+            if (bytes) contentStore.set(hash, bytes);
+          }
+        }
       }
     }
 

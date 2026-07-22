@@ -116,6 +116,23 @@ export class VersionDag {
     return maximal.length === 1 ? maximal[0]! : MULTIPLE_BASES;
   }
 
+  /**
+   * The content hashes of `versionId` and all its ancestors (blob addresses along
+   * this head's history). The three-way base for any merge of this head against a
+   * peer is `LCA(head, peerHead)`, which is always an ancestor of `head` — so
+   * staging the bytes of these hashes (those the content store still holds) makes
+   * every reachable base available to the pure merge without knowing the peer head
+   * in advance. Cycle-safe.
+   */
+  reachableContentHashes(versionId: string): Set<string> {
+    const out = new Set<string>();
+    for (const v of this.ancestors(versionId)) {
+      const ch = this.nodes.get(v)?.contentHash;
+      if (ch) out.add(ch);
+    }
+    return out;
+  }
+
   /** Every ancestor of `hash`, including `hash` itself. Cycle-safe. */
   private ancestors(hash: string): Set<string> {
     const seen = new Set<string>();

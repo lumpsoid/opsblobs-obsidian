@@ -33,6 +33,18 @@ describe('VersionDag (pure structure)', () => {
     expect(dag.contentHashOf('nope')).toBeUndefined();
   });
 
+  test('reachableContentHashes: every base along a head\'s history (for staging)', () => {
+    const dag = new VersionDag();
+    dag.addVersion('A', [], 'hA', 'f1');
+    dag.addVersion('B', ['A'], 'hB', 'f1');
+    dag.addVersion('C', ['B'], 'hC', 'f1');
+    // The head C reaches its own bytes and every ancestor's — so buildLocalState can
+    // stage a base (e.g. hA) that is deeper than the last-synced version.
+    expect(dag.reachableContentHashes('C')).toEqual(new Set(['hA', 'hB', 'hC']));
+    expect(dag.reachableContentHashes('B')).toEqual(new Set(['hA', 'hB'])); // not hC (a descendant)
+    expect(dag.reachableContentHashes('nope')).toEqual(new Set());
+  });
+
   test('fork: two children of one base → mergeBase is the base', () => {
     const dag = new VersionDag();
     dag.addVersion('O', [], 'hO', 'f1');
