@@ -336,6 +336,20 @@ test; the *classes* are what to watch for.
   missing → conflict". **Step 8's GC keeps DAG-reachable bases** (`referencedHashes(dag)`)
   precisely so this degradation is rare — but degrading is *safe* (a visible conflict),
   fabricating is not.
+- **Identical content ≠ causal convergence (concurrent-same-edit).** Two devices that
+  independently edit a file to the *same* bytes (canonically: both empty it) reach
+  identical content via **two distinct heads** off a common base. The old `state-merge`
+  "same content → `no_op`" shortcut observed the equal hash and stopped — leaving **both
+  heads open** in the DAG. A later edit off one head then diverged from the orphaned
+  other, and `LCA` rolled back *past* the shared value, resurrecting it as a spurious
+  three-way conflict base (`base="1", ours="", theirs="341"` → bogus conflict, even
+  though B had emptied and A merely edited). Fix: when the DAG shows the two heads
+  genuinely diverged, the same-content branch mints a **`write_merge` node** to unite
+  them (deterministic content-addressed id → both devices converge, no storm); when the
+  histories are linear it advances the head pointer; identical heads keep the cheap
+  `no_op`. Pinned by `concurrent-identical-edit-convergence.test.ts`. **Lesson — with an
+  op-id DAG, content equality is *not* head equality; a "nothing changed" shortcut keyed
+  on the content hash silently strands a divergence. Converge the heads, not the bytes.**
 - **Cold-start phantom delete (listing race).** `captureOfflineChanges` diffs the
   registry against `files.list()` (`app.vault.getFiles()`) and emits a `delete` for any
   tracked file not in the listing. Obsidian does **not** populate `getFiles()` during

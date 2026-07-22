@@ -132,6 +132,45 @@ function classifyAndResolve(
     if (le.path !== re.path) {
       return resolveRenameConflict(fileId, le, re);
     }
+    // Identical content does NOT imply causal convergence. Two devices can reach the
+    // same bytes by *concurrent* edits (both empty a file, both type the same value):
+    // that is two distinct heads off a common base, not one converged head. Stopping
+    // at `no_op` here leaves BOTH heads open in the DAG; a later edit off one of them
+    // then diverges from the orphaned other, and the LCA rolls back *past* the shared
+    // value — resurrecting it as a spurious three-way conflict base (the concurrent
+    // empty↔empty→edit bug). So when the DAG shows the heads genuinely diverged, unite
+    // them with a merge node; when the histories are linear, converge the head pointer.
+    // Identical heads (or no DAG / unknown heads) keep the cheap no_op fast path.
+    if (dag && le.headVersionId && re.headVersionId && le.headVersionId !== re.headVersionId) {
+      // Is local actually AT its head? An unlogged in-window edit (debounce race)
+      // leaves the head stale while `buildLocalState` corrects `le.contentHash` from
+      // disk; converging the head over that pending edit would mis-parent it. Only act
+      // when local's content matches its head — otherwise defer (no_op) to next round.
+      const localAtHead = dag.contentHashOf(le.headVersionId) === le.contentHash;
+      // Local is the descendant (we already hold the newer head) → keep ours; the peer
+      // fast-forwards to us when it pulls. Safe regardless of the in-window guard.
+      if (dag.isAncestor(re.headVersionId, le.headVersionId)) {
+        return { type: 'no_op', fileId };
+      }
+      if (localAtHead && dag.isAncestor(le.headVersionId, re.headVersionId)) {
+        // Remote is the strict descendant — adopt its head so ours advances. Content is
+        // identical, so this only moves the head pointer (idempotent re-write of bytes).
+        const content = local.contentStore.get(le.contentHash) ?? remote.contentStore.get(re.contentHash);
+        if (content) {
+          return { type: 'write_local', fileId, path: re.path, content, hlc: re.hlcTimestamp, headVersionId: re.headVersionId };
+        }
+      } else if (localAtHead) {
+        // Genuine divergence with identical content → unite the two heads into a merge
+        // node so the next edit descends from a single converged head. The id is the
+        // deterministic content-address of (bytes, parents), so both devices mint the
+        // identical node and fast-forward onto it — no merge storm (decisions §, §2).
+        const content = local.contentStore.get(le.contentHash) ?? remote.contentStore.get(re.contentHash);
+        if (content) {
+          return { type: 'write_merge', fileId, path: le.path, content, parents: [le.headVersionId, re.headVersionId] };
+        }
+      }
+      // Bytes unavailable, or local not at its head → fall through and defer.
+    }
     return { type: 'no_op', fileId };
   }
 
