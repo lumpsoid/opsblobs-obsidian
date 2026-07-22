@@ -30,6 +30,13 @@ one side should be mirrored here:
   sync-state) hold the durable state; in-memory device state does not.
   `TestDevice.reload()` rebuilds the stack over the same two fakes to model a
   plugin restart / crash-recovery.
+- **`MetadataStore.write` is atomic** — a reader never observes a torn/partial
+  file, even if the process is killed mid-write. `FakeMetadataStore` satisfies
+  this for free (a synchronous `Map.set`); `ObsidianMetadataStore` achieves it by
+  staging to a `${path}.tmp` sibling and renaming over the target, with `read`
+  falling back to the temp for the kill-window between remove and rename. Stores
+  that load a corrupt file as a safe default (empty DAG, cursor 0) rely on this so
+  the "corrupt" branch is reserved for genuine bugs, not routine interrupted writes.
 
 Full DOM/vault mocking of the real adapters is out of scope; the Go-server
 integration contract (`__tests__/integration/`) guards the wire, and real-adapter
