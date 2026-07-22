@@ -293,6 +293,14 @@ function resolveContentConflict(
   // conflict (decisions §6). A `null` baseHash means no common base at all.
   const { baseHash, ambiguous } = resolveThreeWayBase(le, re, dag);
 
+  // The two conflicting heads (sync v2): when both are known, the user's resolution
+  // is re-emitted as a two-parent merge node with these parents, so peers holding
+  // either head fast-forward onto it. Undefined without both heads (pure-VaultState
+  // tests / legacy) ⇒ the applicator falls back to a `supersedes` resolution.
+  const conflictParents = le.headVersionId && re.headVersionId
+    ? [le.headVersionId, re.headVersionId]
+    : undefined;
+
   const wholeConflict = (): MergeAction => ({
     type: 'conflict',
     fileId,
@@ -302,6 +310,7 @@ function resolveContentConflict(
     localContent: localText,
     remoteContent: remoteText,
     parentHashes: [le.contentHash, re.contentHash],
+    parents: conflictParents,
   });
 
   // Binary files can't be three-way merged. Deciding by "higher HLC wins" would
@@ -411,6 +420,7 @@ function resolveContentConflict(
     localContent: localText,
     remoteContent: remoteText,
     parentHashes: [le.contentHash, re.contentHash],
+    parents: conflictParents,
   };
 }
 

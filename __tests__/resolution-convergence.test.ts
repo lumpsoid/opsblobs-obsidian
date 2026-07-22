@@ -67,6 +67,15 @@ describe('resolved conflict converges without re-prompting the peer', () => {
     expect(B.applied.some(a => a.type === 'conflict')).toBe(true); // B was prompted (correct)
     expect(await onDisk(B)).toBe(RESOLVED);                        // and resolved
 
+    // Sync v2: the resolution is re-emitted as a two-parent MERGE NODE (a
+    // content-addressed `m-…` op whose parents are the two conflicting heads), NOT
+    // a `supersedes`-tagged update. Peers adopt it by fast-forward — the structural
+    // replacement for the old shortcut.
+    const bRes = B.pendingOps.find(op => op.path === 'note.md')!;
+    expect(bRes.id.startsWith('m-')).toBe(true);
+    expect(bRes.parents.length).toBe(2);
+    expect(bRes.supersedes).toBeUndefined();
+
     // The resolution is recorded as a pending op for the *next* round, so B must
     // sync once more to push it to the server before any peer can see it.
     await client(B).runSync();

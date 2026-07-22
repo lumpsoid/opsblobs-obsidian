@@ -119,7 +119,14 @@ export type MergeAction =
   | { type: 'delete_local'; fileId: string; path: string }
   | { type: 'delete_remote'; fileId: string; path: string }
   | { type: 'move_local'; fileId: string; fromPath: string; toPath: string }
-  | { type: 'conflict'; fileId: string; localPath: string; remotePath: string; mergeResult: ThreeWayMergeResult; localContent: string; remoteContent: string; parentHashes: string[] }
+  // `parents`, when present, are the two conflicting heads' version-ids (sync v2):
+  // a user's resolution of this conflict is re-emitted as a two-parent MERGE NODE
+  // with these parents, so a peer holding either head fast-forwards onto the
+  // resolution instead of re-conflicting — the structural replacement for the
+  // `supersedes`/`parentHashes` shortcut. Absent (create/create collisions, binary
+  // resolutions, pure-VaultState tests with no heads) ⇒ the applicator falls back
+  // to a `supersedes`-tagged resolution op keyed by `parentHashes`.
+  | { type: 'conflict'; fileId: string; localPath: string; remotePath: string; mergeResult: ThreeWayMergeResult; localContent: string; remoteContent: string; parentHashes: string[]; parents?: string[] }
   | { type: 'delete_conflict'; fileId: string; path: string; side: 'local_deleted' | 'remote_deleted'; content: Uint8Array; parentHashes: string[] }
   // Two devices edited the same *binary* file concurrently. Binary content can't
   // be three-way merged, so rather than silently dropping one side by
