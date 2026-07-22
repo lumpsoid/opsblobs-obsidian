@@ -388,7 +388,11 @@ export class OperationLogger {
       return;
     }
 
-    await this.recordOp(Ops.move(entry.id, path, entry.contentHash, hlcTs));
+    // Carry the current content head as the move's parent so a peer that projects
+    // this renamed-but-unedited file reads its head as that content version (not
+    // the move op id), keeping the DAG connected across the rename. The move does
+    // not advance the head (it is not a new content version), so no setHeadVersion.
+    await this.recordOp(Ops.move(entry.id, path, entry.contentHash, hlcTs, entry.headVersionId ?? undefined));
   }
 
   // ─── Op management ────────────────────────────────────────────────────────

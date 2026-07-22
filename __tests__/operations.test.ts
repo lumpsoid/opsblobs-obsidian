@@ -34,6 +34,17 @@ describe('Ops — operation factories', () => {
     expect(Ops.move('f1', 'b.md', 'h1', hlc).path).toBe('b.md');
   });
 
+  test('parent links: create is a root; update/delete/move carry the prior head', () => {
+    expect(Ops.create('f1', 'a.md', 'h1', hlc).parents).toEqual([]);           // a DAG root
+    expect(Ops.update('f1', 'a.md', 'h2', hlc, 'vHead').parents).toEqual(['vHead']);
+    expect(Ops.delete('f1', 'a.md', 'h3', hlc, 'vHead').parents).toEqual(['vHead']);
+    // A move is not a new content version but carries the content head it renamed,
+    // so a peer projects the renamed file's head as that version (keeping the DAG
+    // connected across a rename) rather than the move op's id.
+    expect(Ops.move('f1', 'b.md', 'h1', hlc, 'vHead').parents).toEqual(['vHead']);
+    expect(Ops.move('f1', 'b.md', 'h1', hlc).parents).toEqual([]);             // unknown head ⇒ root
+  });
+
   test('resolveUpdate / resolveDelete carry supersedes and the right type', () => {
     const parents = ['hLocal', 'hRemote'];
 

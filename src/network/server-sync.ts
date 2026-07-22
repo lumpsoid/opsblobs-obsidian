@@ -448,7 +448,10 @@ export function reconstructRemoteState(ops: Operation[], ownDeviceId?: string): 
       // side anymore (the DAG replaces it); left null until Step 3 removes it.
       ancestorContentHash: null,
       ancestorPath: null,
-      headVersionId: op.id,
+      // A `move` is not a new content version: it carries no content of its own,
+      // so its head is the content version it renamed (its parent), keeping the
+      // renamed file connected in the DAG. Every other op IS its own version.
+      headVersionId: op.type === 'move' ? (op.parents[0] ?? op.id) : op.id,
       // Carry a resolution op's superseded sides so a peer still holding one of
       // them adopts the resolution rather than re-conflicting (state-merge).
       supersedes: op.supersedes,

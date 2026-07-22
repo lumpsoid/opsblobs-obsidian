@@ -105,6 +105,27 @@ describe('reconstructRemoteState', () => {
     const state = reconstructRemoteState([]);
     expect(state.fileEntries.size).toBe(0);
   });
+
+  test('a renamed (moved) file projects its head as the content version it renamed, not the move op', () => {
+    // The move is the latest op, but it is not a new content version — so the
+    // projected head must be the content version it renamed (its parent), keeping
+    // the renamed file connected in the op-id DAG for LCA / fast-forward. Using the
+    // move op's own id would strand it as a parentless root.
+    const createOp: Operation = {
+      v: 1, id: 'v-create', hlcTimestamp: { wallTime: 100, counter: 0, deviceId: 'dev-x' },
+      fileId: 'f1', type: 'create', path: 'a.md', contentHash: 'h1', parents: [],
+    };
+    const moveOp: Operation = {
+      v: 1, id: 'op-move', hlcTimestamp: { wallTime: 200, counter: 0, deviceId: 'dev-x' },
+      fileId: 'f1', type: 'move', path: 'b.md', contentHash: 'h1', parents: ['v-create'],
+    };
+    const state = reconstructRemoteState([createOp, moveOp]);
+    const entry = state.fileEntries.get('f1')!;
+    expect(entry.path).toBe('b.md');               // the new path
+    expect(entry.contentHash).toBe('h1');          // content unchanged
+    expect(entry.headVersionId).toBe('v-create');  // head = the content version, NOT 'op-move'
+    expect(entry.deleted).toBe(false);
+  });
 });
 
 describe('FakeSyncServer', () => {
