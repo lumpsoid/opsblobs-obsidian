@@ -29,6 +29,17 @@ truth; each device's DAG is a derived cache).
 
 ### What is committed on `sync-robustness-fixes` (newest first)
 
+- `af4a7a4` feat(sync): stage DAG-reachable base bytes in buildLocalState —
+  **Step 3 prerequisite, DONE.** `buildLocalState` stages the bytes of every
+  version reachable from each file's head (`VersionDag.reachableContentHashes`),
+  so the merge base LCA(localHead, peerHead) — always an ancestor of the local
+  head — is available even when deeper than the last-synced version (#4).
+  Additive/behaviour-preserving.
+- `0cf33b8` fix(dag): keep a renamed file connected across the move — **Step 3
+  prerequisite, DONE.** `Ops.move` carries the content head it renamed as its
+  parent; `reconstructRemoteState` projects a move's head as that parent (not the
+  move op id). Without this, LCA/FF over a renamed remote head would strand once
+  the scalar ancestor is removed. Behaviour-preserving (scalar still masks it now).
 - `2595d94` feat(merge): content-conflict resolutions become two-parent merge
   nodes — **Step 4b, DONE.** A user-resolved content conflict is re-emitted as a
   two-parent merge node (parents = the two conflicting heads; content-addressed
@@ -102,6 +113,92 @@ same delete / create-collision / binary branches that Step 3 must move onto the 
 fall through to three-way); the phantom-delete / F5 / F3 guards.
 
 The Rework section below is now historical (done); Steps 5–8 remain unchanged.
+
+### Step 3 core — the atomic removal: FULL DESIGN (worked out, not yet coded)
+
+The two prerequisites (`0cf33b8`, `af4a7a4`) are in. What remains is ONE atomic
+commit: remove the scalar ancestor + `supersedes` together and move the
+delete/binary/create-collision branches onto the DAG. It cannot be split green
+(the `supersedes` producers and consumers must move together). The design:
+
+**New DAG helper.** `VersionDag.isMergeNode(v): boolean` = `(parents.size ?? 0) >= 2`
+— distinguishes a *resolution* (two-parent merge node) from a plain linear op, so
+the delete branches auto-adopt only genuine resolutions.
+
+**FileEntry.** Drop `ancestorContentHash` + `ancestorPath`. Add
+`lastSyncedPath?: string | null` (the path at last sync — a straight rename of
+`ancestorPath`, decoupled from content). Set it wherever `ancestorPath` was set
+(`adoptRemote`, and the old `setAncestorHash` → becomes `setSyncedPath(fileId)`
+recording `entry.path`). `reconstructRemoteState` leaves it null (a projected
+remote entry has no last-synced path — matches the old `ancestorPath == null`
+vacuous-path handling).
+
+**Unchanged-since-base (replaces `isUnchangedSinceAncestor`), over the DAG:**
+```
+isUnchangedSinceBase(survivor, other, dag):
+  if survivor.lastSyncedPath != null && survivor.path !== survivor.lastSyncedPath: return false  // renamed ⇒ touched
+  if !dag || !survivor.head || !other.head: return false
+  base = dag.mergeBase(survivor.head, other.head)
+  if base is null or MULTIPLE_BASES: return false
+  bc = dag.contentHashOf(base)
+  return bc !== undefined && survivor.contentHash === bc
+```
+
+**Delete branches (state-merge):**
+- `!le.deleted && re.deleted` (local present survivor, remote tombstone):
+  1. `dag.isMergeNode(re.head) && dag.isAncestor(le.head, re.head)` → a keep_deleted
+     resolution that already accounts for our head → `delete_local` (rename ignored;
+     the resolution settled it). *Replaces `re.supersedes?.includes` keep-deleted.*
+  2. `isUnchangedSinceBase(le, re, dag)` → clean one-sided delete → `delete_local`.
+  3. else → `delete_conflict` (side `remote_deleted`).
+- `le.deleted && !re.deleted` (local tombstone, remote present):
+  1. `dag.isMergeNode(re.head) && dag.isAncestor(le.head, re.head)` → a restore
+     resolution descending from our delete → `write_local` (restore). *Replaces the
+     restore `re.supersedes?.includes` branch.*
+  2. `isUnchangedSinceBase(re, le, dag)` → remote unchanged since base → our delete
+     propagates → `delete_remote`.
+  3. else → `delete_conflict` (side `local_deleted`).
+  NB: this direction currently ALWAYS conflicts (a projected remote entry's scalar
+  ancestor is null ⇒ old `isUnchangedSinceAncestor(re)` always false). The DAG makes
+  it symmetric/commutative — a behaviour change; verify no test wanted the asymmetry.
+
+**Delete/binary resolutions become merge nodes (drop `supersedes`):**
+- `delete_conflict` action carries `parents: [le.head, re.head]`. Applicator:
+  restore → an `update` merge node (`Ops.merge`, reuse the content-conflict path);
+  keep_deleted → a *tombstone* merge node — add `Ops.mergeDelete` (type `delete`,
+  content-addressed id) + `OperationLogger.recordMergeDelete`; PendingResolution
+  gains `deleted?: boolean` to dispatch merge vs merge-delete after clearOps.
+- `binary_conflict` action carries `parents`; applicator mints an `update` merge
+  node for the chosen side (FF-adopted by peers — version-based, content-agnostic).
+- Then DELETE `Ops.resolveUpdate`/`resolveDelete`, `recordResolvedUpdate`/`Delete`,
+  and the `supersedes` branches in `resolveContentConflict` (200/209 — binary now
+  FF-adopts) and `resolveCreateCollision` (replaced by a DAG-FF branch there).
+
+**Create-collision:** `resolveCreateCollision` gets a DAG-FF branch at the top —
+`isAncestor(le.head, re.head)` → adopt `re` (the resolution merge node descends from
+our create). Its `conflict` action now carries `parents: [le.head, re.head]` so the
+resolution is a merge node. Removes its two `supersedes` branches.
+
+**Purge:** delete `merge/ancestor-policy.ts` + `__tests__/ancestor-policy.test.ts`;
+remove `nextAncestorHash`/`setAncestorHash` and `updateAncestorHashes`' scalar
+writes (write_local/write_merge already `setSyncedPath`; no_op/send_remote no longer
+advance a content ancestor — the DAG is the base). Remove `Operation.supersedes`,
+`FileEntry.supersedes`, `reconstructRemoteState`'s `supersedes`/`ancestor*` fields,
+`resolveThreeWayBase`'s scalar fallback (DAG-only; null base ⇒ empty-ancestor only
+when genuinely no base), the scalar-FF branch (261), `buildLocalState`'s
+`ancestorContentHash` staging line, and `referencedHashes`' ancestor keep (GC now
+keeps DAG-reachable base bytes — coordinate with Step 8).
+
+**Test rewrites (same commit):** `core.test.ts` (8 `ancestorContentHash` refs — the
+pure-merge three-way tests must build a `VersionDag` + `headVersionId` instead of a
+scalar ancestor, then pass the dag to `mergeVaultStates`); delete
+`ancestor-policy.test.ts`; update `operations.test.ts` (drop resolveUpdate/Delete,
+add merge/mergeDelete); `delete-rename-conflict`, `create-create-collision`,
+`binary-conflict-dataloss`, `content-hash-sentinel`, `maintenance-under-concurrency`,
+`file-registry-referenced-hashes`, `sync-coordinator` (any `supersedes`/`ancestor`
+assertions → assert the same guarantee via merge-node/DAG state). The
+data-safety intent of each regression is preserved through the new mechanism, never
+deleted to go green.
 
 ### Findings from R1/R2/2b — load-bearing, read before Step 3+
 
