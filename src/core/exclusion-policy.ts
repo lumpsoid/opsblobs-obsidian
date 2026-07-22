@@ -11,6 +11,14 @@ import { SyncSettings } from '../types';
 // The plugin's own metadata dir. Always excluded — not user-configurable.
 const VAULT_SYNC_DIR = '.vault-sync/';
 
+// This plugin's own install dir under `.obsidian/plugins/`. ALWAYS excluded, even
+// when `syncObsidianConfig` opts the rest of `.obsidian/` in — its `data.json` holds
+// the vault passphrase and access token in cleartext, and syncing it would content-
+// address those secrets into the append-only (undeletable) server oplog. The id must
+// match `manifest.json`'s `id`. (The plugin binary here — main.js/manifest.json — is
+// also per-install and managed by Obsidian, so excluding the whole dir is correct.)
+const OWN_PLUGIN_DIR = '.obsidian/plugins/obsidian-vault-sync/';
+
 // Obsidian workspace-layout files are per-device and must never sync, even when
 // the rest of `.obsidian/` is opted in via `syncObsidianConfig`.
 const WORKSPACE_FILES = new Set([
@@ -25,9 +33,11 @@ const OBSIDIAN_DIR = '.obsidian/';
  *
  * Order of decisions:
  *  1. `.vault-sync/` — always excluded (invariant).
- *  2. `.obsidian/workspace.json` / `workspace-mobile.json` — always excluded.
- *  3. Other `.obsidian/` files — excluded unless `syncObsidianConfig` is true.
- *  4. `excludedPatterns` globs (`*`, `**`, `?`) — excluded on match.
+ *  2. This plugin's own `.obsidian/plugins/<id>/` dir — always excluded (holds the
+ *     cleartext passphrase + token; must never reach the server), even with config on.
+ *  3. `.obsidian/workspace.json` / `workspace-mobile.json` — always excluded.
+ *  4. Other `.obsidian/` files — excluded unless `syncObsidianConfig` is true.
+ *  5. `excludedPatterns` globs (`*`, `**`, `?`) — excluded on match.
  */
 export function isExcluded(
   path: string,
@@ -36,13 +46,17 @@ export function isExcluded(
   // (1) Plugin metadata — invariant.
   if (path.startsWith(VAULT_SYNC_DIR)) return true;
 
-  // (2) Workspace-layout files — invariant, even when syncing config.
+  // (2) This plugin's own install dir (secrets in data.json) — invariant, even when
+  // syncObsidianConfig opts the rest of `.obsidian/` in.
+  if (path.startsWith(OWN_PLUGIN_DIR)) return true;
+
+  // (3) Workspace-layout files — invariant, even when syncing config.
   if (WORKSPACE_FILES.has(path)) return true;
 
-  // (3) The rest of `.obsidian/` — only when the user hasn't opted in.
+  // (4) The rest of `.obsidian/` — only when the user hasn't opted in.
   if (path.startsWith(OBSIDIAN_DIR) && !settings.syncObsidianConfig) return true;
 
-  // (4) User-configured glob patterns.
+  // (5) User-configured glob patterns.
   for (const pattern of settings.excludedPatterns ?? []) {
     if (globToRegExp(pattern).test(path)) return true;
   }

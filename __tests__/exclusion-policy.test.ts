@@ -28,6 +28,17 @@ describe('exclusion-policy', () => {
     expect(isExcluded('.obsidian/foo.css', settings({ syncObsidianConfig: true }))).toBe(false);
   });
 
+  test("the plugin's own data dir is always excluded, even with config sync on (holds the cleartext passphrase + token)", () => {
+    const dataJson = '.obsidian/plugins/obsidian-vault-sync/data.json';
+    expect(isExcluded(dataJson, settings({ syncObsidianConfig: false }))).toBe(true);
+    expect(isExcluded(dataJson, settings({ syncObsidianConfig: true }))).toBe(true);
+    // The whole install dir (binary too), not just data.json.
+    expect(isExcluded('.obsidian/plugins/obsidian-vault-sync/main.js', settings({ syncObsidianConfig: true }))).toBe(true);
+    // A *different* plugin's dir is still governed by the ordinary config toggle.
+    expect(isExcluded('.obsidian/plugins/other-plugin/data.json', settings({ syncObsidianConfig: true }))).toBe(false);
+    expect(isExcluded('.obsidian/plugins/other-plugin/data.json', settings({ syncObsidianConfig: false }))).toBe(true);
+  });
+
   test('.obsidian/workspace.json excluded regardless of syncObsidianConfig', () => {
     expect(isExcluded('.obsidian/workspace.json', settings({ syncObsidianConfig: false }))).toBe(true);
     expect(isExcluded('.obsidian/workspace.json', settings({ syncObsidianConfig: true }))).toBe(true);
