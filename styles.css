@@ -42,3 +42,35 @@ textarea.vault-sync-exclusions {
 /* Sync status modal (S2) */
 .vault-sync-status-list { margin: 0.25rem 0 0.5rem 1rem; padding: 0; font-size: 0.85rem; color: var(--text-muted); max-height: 160px; overflow-y: auto; }
 .vault-sync-status-list li { overflow-wrap: anywhere; word-break: break-word; }
+
+/* Conflicts panel (conflicts-view.ts — sync v2 Step 6) */
+.vault-sync-conflicts-view { padding: 0.75rem; overflow-y: auto; }
+.vault-sync-conflicts-header h3 { margin: 0 0 0.25rem; }
+.vault-sync-conflicts-count { color: var(--text-muted); font-size: 0.85rem; margin-bottom: 1rem; }
+.vault-sync-conflicts-empty { display: flex; justify-content: center; padding: 1.5rem; color: var(--text-muted); }
+.vault-sync-conflict-card { border: 1px solid var(--background-modifier-border); border-radius: 8px; margin-bottom: 1rem; overflow: hidden; }
+.vault-sync-conflict-card-header { padding: 0.6rem 0.75rem; background: var(--background-secondary); }
+.vault-sync-conflict-path { display: flex; align-items: center; gap: 0.4rem; font-weight: 600; overflow-wrap: anywhere; word-break: break-word; }
+.vault-sync-conflict-path-icon { display: inline-flex; color: var(--text-muted); }
+.vault-sync-conflict-provenance { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.4rem; }
+.vault-sync-prov-chip { font-size: 0.72rem; padding: 0.1rem 0.45rem; border-radius: 10px; color: var(--text-on-accent, white); }
+.vault-sync-prov-chip.prov-ours { background: var(--color-green); }
+.vault-sync-prov-chip.prov-theirs { background: var(--color-blue); }
+.vault-sync-conflict-note { padding: 0.6rem 0.75rem; color: var(--text-muted); font-size: 0.85rem; }
+.vault-sync-conflict-global { display: flex; gap: 0.4rem; flex-wrap: wrap; padding: 0.5rem 0.75rem; }
+.vault-sync-conflict-hunks { display: flex; flex-direction: column; }
+.vault-sync-hunk { border-top: 1px solid var(--background-modifier-border); }
+.vault-sync-hunk-bar { padding: 0.4rem 0.75rem; }
+.vault-sync-hunk-index { font-size: 0.78rem; font-weight: 600; color: var(--text-muted); }
+.vault-sync-hunk-panes { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0; }
+.vault-sync-pane { padding: 0.4rem 0.6rem; border-top: 1px solid var(--background-modifier-border); border-right: 1px solid var(--background-modifier-border); min-width: 0; box-sizing: border-box; cursor: pointer; }
+.vault-sync-pane:last-child { border-right: none; }
+.vault-sync-pane.pane-ours { background: color-mix(in srgb, var(--color-green) 6%, transparent); }
+.vault-sync-pane.pane-theirs { background: color-mix(in srgb, var(--color-blue) 6%, transparent); }
+.vault-sync-pane.pane-base { background: var(--background-primary-alt); cursor: default; }
+.vault-sync-pane.is-chosen { outline: 2px solid var(--interactive-accent); outline-offset: -2px; }
+.vault-sync-pane-label { font-size: 0.72rem; font-weight: 600; color: var(--text-muted); margin-bottom: 0.2rem; }
+.vault-sync-pane-code { margin: 0; font-size: 0.78rem; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; max-height: 140px; overflow-y: auto; }
+.vault-sync-pane-code code { white-space: inherit; overflow-wrap: anywhere; word-break: break-word; }
+.vault-sync-hunk-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; padding: 0.4rem 0.75rem; }
+.vault-sync-conflict-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; padding: 0.6rem 0.75rem; background: var(--background-secondary); border-top: 1px solid var(--background-modifier-border); }

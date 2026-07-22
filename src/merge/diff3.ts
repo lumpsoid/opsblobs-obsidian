@@ -503,3 +503,108 @@ export function hasConflictMarkers(text: string): boolean {
   }
   return false;
 }
+
+// ─── Parsing marked text back into segments (sync v2 Step 6) ──────────────────
+//
+//  The conflicts panel (Step 6) is the legible counterpart to editing the raw
+//  markers by hand: it parses the on-disk marked file into a sequence of clean runs
+//  and conflict blocks, lets the user pick a side per block, then writes the
+//  resolved (marker-free) text — which is the ordinary Step-5 resolving save. Parsing
+//  the *file* (rather than re-deriving the 3-way from the DAG heads) means the panel
+//  always shows exactly what is on disk: it needs no retained base bytes, and it
+//  honours any hand-edit the user already made inside a block.
+
+/** One piece of a marked file: either a run of clean (non-conflicting) lines or a
+ *  single conflict block carrying its three sides (`ours`/`base`/`theirs`). A block
+ *  with no `|||||||` section (plain diff3, no base shown) has `base === []`. */
+export type ConflictMarkerSegment =
+  | { kind: 'clean'; lines: string[] }
+  | { kind: 'conflict'; ours: string[]; base: string[]; theirs: string[] };
+
+/**
+ * Parse text containing inline zdiff3 markers (as written by
+ * {@link renderMarkersFromResult}) into ordered {@link ConflictMarkerSegment}s. The
+ * inverse of the renderer: clean lines pass through verbatim and each
+ * `<<<<<<< … ||||||| … ======= … >>>>>>>` block becomes one `conflict` segment.
+ * Matching is by line *prefix* (the tokens carry `ours`/`base`/`theirs` labels), the
+ * same recognition {@link hasConflictMarkers} uses. Defensive against a truncated
+ * block (EOF reached mid-conflict): whatever sides were captured are emitted, so a
+ * half-deleted marker never swallows the tail of the file.
+ */
+export function parseConflictMarkers(text: string): ConflictMarkerSegment[] {
+  const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  const segments: ConflictMarkerSegment[] = [];
+  let clean: string[] = [];
+  const flushClean = () => {
+    if (clean.length > 0) { segments.push({ kind: 'clean', lines: clean }); clean = []; }
+  };
+
+  let state: 'clean' | 'ours' | 'base' | 'theirs' = 'clean';
+  let cur: { ours: string[]; base: string[]; theirs: string[] } | null = null;
+
+  for (const line of lines) {
+    if (state === 'clean') {
+      if (line.startsWith(CONFLICT_MARK_OURS)) {
+        flushClean();
+        cur = { ours: [], base: [], theirs: [] };
+        state = 'ours';
+      } else {
+        clean.push(line);
+      }
+      continue;
+    }
+    // Inside a conflict block — advance on the section markers, else collect.
+    if (line.startsWith(CONFLICT_MARK_BASE)) { state = 'base'; continue; }
+    if (line.startsWith(CONFLICT_MARK_SEP)) { state = 'theirs'; continue; }
+    if (line.startsWith(CONFLICT_MARK_THEIRS)) {
+      segments.push({ kind: 'conflict', ...cur! });
+      cur = null;
+      state = 'clean';
+      continue;
+    }
+    if (state === 'ours') cur!.ours.push(line);
+    else if (state === 'base') cur!.base.push(line);
+    else cur!.theirs.push(line);
+  }
+
+  // A block that never closed (truncated marker): emit what we captured.
+  if (cur) segments.push({ kind: 'conflict', ...cur });
+  else flushClean();
+  return segments;
+}
+
+/** The number of conflict blocks in marked text — how many decisions the panel asks
+ *  the user to make for this file. */
+export function countMarkerConflicts(text: string): number {
+  return parseConflictMarkers(text).filter(s => s.kind === 'conflict').length;
+}
+
+/**
+ * Resolve marked text to its final (marker-free) form given a decision per conflict
+ * block (`resolutions` keyed by the block's ordinal, 0-based; a missing entry
+ * defaults to keeping *ours*, matching the modal's old default). Clean runs pass
+ * through untouched and each block collapses to the lines its decision selects via
+ * the single {@link resolveConflictChunkLines} rule — so the panel, the modal, and
+ * the merge engine all agree on what "both"/"local"/"remote"/"custom" mean. The
+ * output is an ordinary save the Step-5 path turns into the two-parent merge node.
+ */
+export function resolveMarkedText(
+  text: string,
+  resolutions: Map<number, ConflictResolution>,
+): string {
+  const out: string[] = [];
+  let ci = 0;
+  for (const seg of parseConflictMarkers(text)) {
+    if (seg.kind === 'clean') {
+      out.push(...seg.lines);
+    } else {
+      const resolution = resolutions.get(ci) ?? { kind: 'local' };
+      out.push(...resolveConflictChunkLines(
+        { startLine: 0, endLine: 0, ancestor: seg.base, local: seg.ours, remote: seg.theirs },
+        resolution,
+      ));
+      ci++;
+    }
+  }
+  return out.join('\n');
+}

@@ -30,6 +30,8 @@ import { SyncSettingTab } from './ui/settings-tab';
 import { SyncCoordinator } from './network/sync-coordinator';
 import { ObsidianEditorSaver } from './network/obsidian-editor-saver';
 import { ObsidianNotifier } from './network/obsidian-notifier';
+import { ConflictsView, CONFLICTS_VIEW_TYPE, ConflictsViewHost } from './ui/conflicts-view';
+import { listTwoHeadedConflicts, ConflictListItem } from './core/conflict-inventory';
 
 // ─── Ribbon icon SVG ────────────────────────────────────────────────────────
 const SYNC_ICON_ID = 'vault-sync-icon';
@@ -55,11 +57,34 @@ export default class VaultSyncPlugin extends Plugin {
   private syncInProgress = false;
   private autoSyncHandle: number | null = null;
 
-  /** Conflicts the user has skipped/dismissed and not yet resolved — drives the
-   *  ribbon's "needs attention" state and the status modal. Read from the
-   *  persisted sync-state (via the coordinator) so it survives restarts. */
+  /** Subscribers (the conflicts panel) to notify when the two-headed set may have
+   *  changed — an op recorded/cleared, or a sync round finished. `opLogger.onChange`
+   *  allows only one listener, so the plugin fans out through this set. */
+  private conflictChangeListeners = new Set<() => void>();
+
+  /** Conflicts the user has skipped/dismissed and not yet resolved (delete/binary
+   *  defers) — read from the persisted sync-state (via the coordinator) so it
+   *  survives restarts. Text conflicts are the *two-headed* files (Step 5/6),
+   *  counted separately by {@link twoHeadedConflicts}. */
   private outstandingConflictCount(): number {
     return this.coordinator.outstandingConflictCount();
+  }
+
+  /** The two-headed files a text conflict left awaiting resolution (Step 6). A
+   *  derived query over the registry — no hand-maintained set (Step 7 removes the
+   *  badge bookkeeping the delete/binary path still uses). */
+  private twoHeadedConflicts(): ConflictListItem[] {
+    return listTwoHeadedConflicts(this.registry.getAllEntries().values());
+  }
+
+  /** Total conflicts needing the user: two-headed text files + skipped/deferred
+   *  delete/binary badges. Drives the ribbon "needs attention" state and status bar. */
+  private conflictCount(): number {
+    return this.twoHeadedConflicts().length + this.outstandingConflictCount();
+  }
+
+  private emitConflictChange(): void {
+    for (const cb of this.conflictChangeListeners) cb();
   }
 
   // ─── Lifecycle ────────────────────────────────────────────────────────────
@@ -176,19 +201,33 @@ export default class VaultSyncPlugin extends Plugin {
     await this.tryDeriveVaultKey();
 
     // ── UI ─────────────────────────────────────────────────────────────────
+    // The non-blocking conflicts panel (Step 6). Registered before the ribbon so a
+    // restored leaf of this type re-attaches to a live host.
+    this.registerView(CONFLICTS_VIEW_TYPE, leaf => new ConflictsView(leaf, this.conflictsHost()));
+
     this.ribbonIcon = this.addRibbonIcon(SYNC_ICON_ID, 'Vault Sync', () => {
       void this.triggerSync('manual');
     });
     // Reflect any conflicts left outstanding from a previous session immediately.
-    this.updateRibbonState(this.outstandingConflictCount() > 0 ? 'conflict' : 'idle');
+    this.updateRibbonState(this.conflictCount() > 0 ? 'conflict' : 'idle');
 
     this.statusBarItem = this.addStatusBarItem();
+    // The status item is clickable — a conflict badge opens the panel, otherwise it
+    // triggers a sync (the same as the ribbon).
+    this.statusBarItem.addClass('mod-clickable');
+    this.statusBarItem.addEventListener('click', () => {
+      if (this.conflictCount() > 0) void this.activateConflictsView();
+      else void this.triggerSync('manual');
+    });
     this.updateStatusBar();
     // Flip the badge to "changes to sync" the moment a (debounced) edit is
     // recorded, without polling. During a round the progress handler owns the
     // badge and the round's own `clearOps` fires this too, so defer to the
-    // post-round `updateStatusBar` and skip while a sync is in progress.
+    // post-round `updateStatusBar` and skip while a sync is in progress. Also fan out
+    // to the conflicts panel: a resolving save emits a merge op through here, so the
+    // panel drops the resolved card.
     this.opLogger.onChange(() => {
+      this.emitConflictChange();
       if (!this.syncInProgress) this.updateStatusBar();
     });
 
@@ -203,6 +242,12 @@ export default class VaultSyncPlugin extends Plugin {
       id: 'view-sync-status',
       name: 'View sync status',
       callback: () => this.openSyncStatus(),
+    });
+
+    this.addCommand({
+      id: 'open-conflicts-panel',
+      name: 'Open conflicts panel',
+      callback: () => { void this.activateConflictsView(); },
     });
 
     // ── Settings ───────────────────────────────────────────────────────────
@@ -337,10 +382,14 @@ export default class VaultSyncPlugin extends Plugin {
       // Land on the conflict state (not idle) if the round left conflicts the user
       // still needs to resolve, so the indicator doesn't silently go green.
       if (!outcome.ok) this.updateRibbonState('error');
-      else this.updateRibbonState(this.outstandingConflictCount() > 0 ? 'conflict' : 'idle');
+      else this.updateRibbonState(this.conflictCount() > 0 ? 'conflict' : 'idle');
     } finally {
       this.syncInProgress = false;
       this.updateStatusBar();
+      // A round can surface NEW two-headed files (the applicator writes markers) or
+      // clear them (a peer's resolution adopted) — neither goes through
+      // opLogger.onChange, so refresh the panel explicitly here.
+      this.emitConflictChange();
     }
   }
 
@@ -484,15 +533,57 @@ export default class VaultSyncPlugin extends Plugin {
   private updateStatusBar() {
     if (!this.statusBarItem) return;
 
-    // Outstanding conflicts take priority — they need the user, not just a sync.
+    // Outstanding conflicts take priority — they need the user, not just a sync. Show
+    // the count (Step 6) so a glance says how many files the panel has waiting.
+    const conflicts = this.conflictCount();
     const text =
-      this.outstandingConflictCount() > 0
-        ? '⚠ Conflict to resolve'
+      conflicts > 0
+        ? `⚠ ${conflicts} conflict${conflicts !== 1 ? 's' : ''}`
         : this.opLogger.getPendingOps().length > 0
           ? '⟳ Changes to sync'
           : '✓ Synced';
 
     this.setStatusBarText(text);
+  }
+
+  // ─── Conflicts panel (Step 6) ─────────────────────────────────────────────
+
+  /** The narrow surface the {@link ConflictsView} needs — all decision logic lives
+   *  in the obsidian-free helpers it calls; this is pure glue. */
+  private conflictsHost(): ConflictsViewHost {
+    return {
+      listConflicts: () => this.twoHeadedConflicts(),
+      readFile: async (path) => {
+        const bytes = await this.vaultFiles.read(path);
+        return bytes ? new TextDecoder().decode(bytes) : null;
+      },
+      // Writing the marker-free bytes IS the Step-5 resolving save: the vault write
+      // fires a modify event → the op-logger's two-headed branch mints the merge node
+      // and clears the conflict. The panel never bypasses that path.
+      resolveFile: async (path, text) => {
+        await this.vaultFiles.write(path, new TextEncoder().encode(text));
+      },
+      openFile: async (path) => {
+        await this.app.workspace.openLinkText(path, '', false);
+      },
+      describeDevice: (deviceId) =>
+        deviceId === this.settings.deviceId ? 'this device' : `device ${deviceId.slice(0, 6)}`,
+      onChange: (cb) => {
+        this.conflictChangeListeners.add(cb);
+        return () => this.conflictChangeListeners.delete(cb);
+      },
+    };
+  }
+
+  /** Reveal the conflicts panel, creating its leaf in the right sidebar if needed. */
+  async activateConflictsView(): Promise<void> {
+    const { workspace } = this.app;
+    let leaf = workspace.getLeavesOfType(CONFLICTS_VIEW_TYPE)[0] ?? null;
+    if (!leaf) {
+      leaf = workspace.getRightLeaf(false) ?? workspace.getLeaf(true);
+      await leaf.setViewState({ type: CONFLICTS_VIEW_TYPE, active: true });
+    }
+    void workspace.revealLeaf(leaf);
   }
 
   /** Single writer for the status bar. Called by every state-change event and
