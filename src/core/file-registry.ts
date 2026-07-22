@@ -199,6 +199,37 @@ export class FileRegistry {
     await this.save();
   }
 
+  /**
+   * Mark a file *two-headed*: a text conflict was surfaced as inline zdiff3 markers
+   * written to `path`, and both `parents` (the two conflicting head version-ids) stay
+   * open until the user resolves (sync v2 Step 5). Records the markers' hash as the
+   * entry's content (so a stray modify event for our own marker write is suppressed by
+   * the hash-equality guard) and stores the open heads. The head version is left
+   * unchanged — the markers are a local working copy, not a new pushed version; the
+   * resolving save mints the merge node that closes both heads. No-op if unknown.
+   */
+  async markConflicted(path: string, contentHash: string, hlc: HLC, parents: string[]): Promise<void> {
+    const id = this.pathIndex.get(path);
+    if (!id) return;
+    const entry = this.entries.get(id)!;
+    entry.contentHash = contentHash;
+    entry.hlcTimestamp = hlc;
+    entry.conflictParents = parents;
+    this.entries.set(id, entry);
+    await this.save();
+  }
+
+  /** Clear a file's two-headed (conflict-awaiting-resolution) marker — called when
+   *  the user's save removed the markers and the resolving merge node was minted, or
+   *  when a peer's resolution was adopted. No-op if unknown. */
+  async clearConflict(fileId: string): Promise<void> {
+    const entry = this.entries.get(fileId);
+    if (!entry || entry.conflictParents == null) return;
+    delete entry.conflictParents;
+    this.entries.set(fileId, entry);
+    await this.save();
+  }
+
   /** Record the file's current path as its last-synced path after a successful
    *  sync (a no-op / send_remote that leaves it in sync). A later local rename then
    *  reads as a change since the last sync, so a concurrent delete surfaces as a

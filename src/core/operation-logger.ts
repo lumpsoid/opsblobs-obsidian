@@ -10,13 +10,15 @@
 
 import { HLC, Operation, SyncSettings } from '../types';
 import { HybridLogicalClock } from './hlc';
-import { Ops } from './operations';
+import { Ops, mergeVersionId } from './operations';
 import { FileRegistry } from './file-registry';
 import { ContentStore, hashContent } from './content-store';
 import { isExcluded } from './exclusion-policy';
+import { hasConflictMarkers } from '../merge/diff3';
 import { VaultFiles } from '../ports/vault-files';
 import { VaultWatcher } from '../ports/vault-watcher';
 import { MetadataStore } from '../ports/metadata-store';
+import { Notifier } from '../ports/notifier';
 
 /** Minimal HLC persistence surface (satisfied by `network/HlcStore`). Typed
  *  structurally so `core/` needn't depend on `network/`. */
@@ -50,6 +52,10 @@ export class OperationLogger {
     // regression can't rewind below an emitted timestamp. Optional so tests /
     // callers that don't need persistence omit it.
     private hlcStore?: HlcPersister,
+    // Surfaces a non-blocking notice when a save on a two-headed (conflict-marked)
+    // file still contains conflict markers (sync v2 Step 5). Optional — omitted by
+    // callers that don't need it; the resolution logic works without it.
+    private notifier?: Notifier,
   ) {}
 
   /** Subscribe to pending-oplog changes. At most one listener; the latest wins.
@@ -325,6 +331,32 @@ export class OperationLogger {
 
     // Skip if content hasn't actually changed
     if (hash === entry.contentHash) return;
+
+    // ── Resolving a two-headed (conflict-marked) file (sync v2 Step 5) ──────────
+    // A text conflict was written to this path as inline zdiff3 markers, leaving the
+    // file two-headed (`conflictParents` = the two open heads). This save is the
+    // user's resolution attempt:
+    //   · still contains markers → not resolved yet; track the new bytes so we don't
+    //     reprocess, surface a non-blocking notice, and emit NO op (stay two-headed).
+    //   · markers gone → resolved; re-emit as a two-parent MERGE NODE whose parents
+    //     are exactly the two heads at conflict time, so peers holding either side
+    //     fast-forward onto it. Clears the two-headed marker.
+    if (entry.conflictParents && entry.conflictParents.length >= 2) {
+      const hlcTs = this.hlc.now();
+      await this.contentStore.put(hash, content);
+      await this.registry.updateContentHash(path, hash, hlcTs);
+      if (hasConflictMarkers(new TextDecoder().decode(content))) {
+        this.notifier?.info(`⚠️ ${path} still has conflict markers — resolve them and save to finish syncing`);
+        return;
+      }
+      const parents = entry.conflictParents;
+      const id = await mergeVersionId(hash, parents);
+      const op = Ops.merge(entry.id, path, hash, hlcTs, parents, id);
+      await this.recordOp(op);
+      await this.registry.setHeadVersion(entry.id, id);
+      await this.registry.clearConflict(entry.id);
+      return;
+    }
 
     // This update's causal parent is the file's current HEAD VERSION (op-id),
     // captured before setHeadVersion advances it — so a peer can reconstruct the

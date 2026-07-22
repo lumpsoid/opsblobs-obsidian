@@ -62,12 +62,6 @@ async function harness(opts: { summary?: SyncRoundSummary; roundError?: Error } 
   return { device, syncState, coordinator, order, editorSaver, notifier, runRound, persistHlc, markSynced, setClock: (n: number) => { clock = n; } };
 }
 
-const contentAction = (fileId = 'f1', path = 'note.md'): Extract<MergeAction, { type: 'conflict' }> => ({
-  type: 'conflict', fileId, localPath: path, remotePath: path,
-  mergeResult: { merged: [], conflicts: [], hasConflicts: true },
-  localContent: 'L', remoteContent: 'R', parents: ['v-local', 'v-remote'],
-});
-
 describe('SyncCoordinator', () => {
   test('sync runs the capture sequence in order, then the round', async () => {
     const h = await harness();
@@ -116,23 +110,6 @@ describe('SyncCoordinator', () => {
     expect(h.device.pendingOps.length).toBeGreaterThan(0); // un-pushed work survives
   });
 
-  test('manual content conflict: a skip is recorded outstanding; a resolution clears it', async () => {
-    const h = await harness();
-    h.coordinator.setSource('manual');
-
-    // Skip (interactive returns null) → recorded.
-    const skip = await h.coordinator.decideContentConflict(contentAction('f1', 'a.md'), async () => null);
-    expect(skip).toBeNull();
-    expect(h.syncState.get().outstandingConflicts).toEqual([
-      { fileId: 'f1', path: 'a.md', kind: 'content', firstSeen: 5000 },
-    ]);
-
-    // A real resolution for the same file clears the outstanding entry.
-    const resolved = await h.coordinator.decideContentConflict(contentAction('f1', 'a.md'), async () => new Uint8Array([1]));
-    expect(resolved).toEqual(new Uint8Array([1]));
-    expect(h.syncState.get().outstandingConflicts).toHaveLength(0);
-  });
-
   test('a round that reports a converged file clears its stale outstanding-conflict badge', async () => {
     // The reported bug: B skipped a conflict (recorded outstanding), then a later
     // round adopted the peer's resolution automatically (a clean write_local, never
@@ -157,20 +134,6 @@ describe('SyncCoordinator', () => {
 
     await h.coordinator.clearAllOutstandingConflicts();
     expect(h.syncState.get().outstandingConflicts).toHaveLength(0);
-  });
-
-  test('auto content conflict: defers without ever invoking the interactive resolver', async () => {
-    const h = await harness();
-    h.coordinator.setSource('auto');
-    const interactive = vi.fn(async () => new Uint8Array([9]));
-
-    const decision = await h.coordinator.decideContentConflict(contentAction('f2', 'b.md'), interactive);
-
-    expect(decision).toBe(DEFER_CONFLICT);
-    expect(interactive).not.toHaveBeenCalled();
-    expect(h.syncState.get().outstandingConflicts).toEqual([
-      { fileId: 'f2', path: 'b.md', kind: 'content', firstSeen: 5000 },
-    ]);
   });
 
   test('auto delete conflict defers only for the ask strategy; a standing policy runs unattended', async () => {

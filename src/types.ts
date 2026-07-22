@@ -32,6 +32,16 @@ export interface FileEntry {
   // docs/sync-v2-decisions.md §3. Optional for migration — a legacy entry
   // without it reads as null (no known head ⇒ the merge falls back).
   headVersionId?: string | null;
+  // The two open head version-ids `[A, B]` while this file is *two-headed* — a
+  // text conflict was surfaced as inline zdiff3 markers on disk and is awaiting
+  // resolution (sync v2 Step 5). Set by the applicator's `conflict` case (via
+  // `markConflicted`); the next ordinary save that removes the markers re-emits a
+  // two-parent merge node with exactly these `parents`, then clears this. While it
+  // is set the merge does NOT re-conflict (it would nest markers) — it holds or
+  // adopts a peer's resolution. `null`/absent means the file is not conflicted. A
+  // *projected remote* entry never carries it (a local-only working-copy notion,
+  // like `lastSyncedPath`).
+  conflictParents?: string[] | null;
 }
 
 export type OperationType = 'create' | 'update' | 'delete' | 'move';

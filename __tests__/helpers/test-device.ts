@@ -39,12 +39,6 @@ export interface TestDeviceOptions {
   wall?: number;
 }
 
-/** How a device resolves a text conflict surfaced during merge — returns the
- *  resolved bytes (a real user's modal choice), null to skip it, or DEFER_CONFLICT
- *  to defer it (what main.ts's auto-sync closure returns: hold the cursor, S5). */
-export type ConflictResolver =
-  (action: Extract<MergeAction, { type: 'conflict' }>) => Uint8Array | null | DeferConflict;
-
 /** How a device resolves a delete/modify(-or-rename) conflict. */
 export type DeleteConflictResolver =
   (action: Extract<MergeAction, { type: 'delete_conflict' }>) => 'keep_deleted' | 'restore' | DeferConflict;
@@ -81,9 +75,9 @@ export class TestDevice {
   /** The VaultSyncHost handed to a ServerSyncClient — the production wiring. */
   readonly host: PluginVaultSyncHost;
 
-  /** When set, `conflict` actions are resolved with these bytes (default: skip,
-   *  returning null) — a device's stand-in for the user's merge modal. */
-  resolveConflict?: ConflictResolver;
+  /** Non-blocking notices the op-logger surfaced (e.g. "still has conflict markers",
+   *  sync v2 Step 5) — captured so a test can assert the user was told. */
+  readonly notices: string[] = [];
 
   /** When set, `delete_conflict` actions use this decision (default:
    *  'keep_deleted') — a device's stand-in for the delete-conflict modal. */
@@ -122,6 +116,8 @@ export class TestDevice {
       getSettings,
       0, // debounceMs 0 — a modify's op is available right after flush()
       this.hlcStore, // persist HLC per-op so reload() can restore logical time
+      // Capture the non-blocking "still has conflict markers" notice (Step 5).
+      { info: (m: string) => this.notices.push(m), error: () => {} },
     );
     this.applicator = new SyncApplicator(
       this.files,
@@ -129,7 +125,6 @@ export class TestDevice {
       this.contentStore,
       this.opLogger,
       this.hlc,
-      async a => this.resolveConflict?.(a) ?? null,
       async a => this.resolveDeleteConflict?.(a) ?? 'keep_deleted',
       async a => this.resolveBinaryConflict?.(a) ?? 'keep_local',
     );

@@ -173,14 +173,11 @@ describe('round interruption & durability (C1–C4)', () => {
     // under the same id + ancestor, the merge is a pure no-op — NOT a spurious
     // conflict, NOT a re-write. This is the D1 CRDT-replay property the real
     // crash-before-saveCursor point relies on for safety.
-    let conflictInvoked = false;
-    B.resolveConflict = () => { conflictInvoked = true; return null; };
     const appliedBefore = B.applied.length;
 
     await client(server, B).runSync();
 
     const replay = B.applied.slice(appliedBefore);
-    expect(conflictInvoked).toBe(false);
     expect(replay.every(a => a.type === 'no_op')).toBe(true); // no write_local / conflict
     expect(await B.cursor()).toBe(1);                          // cursor re-advances
     expect(text(await B.files.read('note.md'))).toBe('body\n'); // content unchanged

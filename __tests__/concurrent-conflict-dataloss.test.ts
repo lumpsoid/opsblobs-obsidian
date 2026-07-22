@@ -36,6 +36,7 @@ import { describe, test, expect, beforeAll } from 'vitest';
 import { ServerSyncClient } from '../src/network/server-sync';
 import { VaultCrypto } from '../src/network/encryption';
 import { FakeSyncServer } from '../src/network/fake-server';
+import { hasConflictMarkers } from '../src/merge/diff3';
 import { TestDevice } from './helpers/test-device';
 
 const SALT = new Uint8Array([9, 9, 9, 9, 9, 9, 9, 9, 8, 8, 8, 8, 8, 8, 8, 8]);
@@ -95,11 +96,16 @@ describe('concurrent conflicting edits (reported data-loss bug)', () => {
 
     // ── With the fix: A's edit and B's edit touch the same line, so this is a
     //    genuine conflict — it must be surfaced, and A must keep its own edit
-    //    rather than silently adopting B's "1\n2\n999". ───────────────────────
+    //    rather than silently adopting B's "1\n2\n999". Sync v2 Step 5: the conflict
+    //    is surfaced as inline markers, with A's edit preserved in the "ours" side. ─
     expect(A.applied.some(a => a.type === 'conflict')).toBe(true);   // conflict surfaced
     expect(A.applied.some(a => a.type === 'write_local')).toBe(false); // NOT a silent overwrite
-    expect(await onDisk(A, path)).toBe('1\n2\n4\n5\n');              // A's edit preserved
-    expect(await onDisk(A, path)).not.toBe('1\n2\n999\n');           // and not clobbered
+    const marked = await onDisk(A, path);
+    expect(hasConflictMarkers(marked)).toBe(true);                  // inline conflict markers
+    expect(marked).toContain('4');                                  // A's edit preserved…
+    expect(marked).toContain('5');
+    expect(marked).toContain('999');                               // …alongside B's side
+    expect(marked).not.toBe('1\n2\n999\n');                        // and not silently clobbered
   });
 
   // A second, distinct data-loss path reported after the debounce fix landed:
@@ -155,7 +161,11 @@ describe('concurrent conflicting edits (reported data-loss bug)', () => {
     // edit — never silently adopt B's "1\n2\n999".
     expect(aActions).toContain('conflict');
     expect(aActions).not.toContain('write_local');
-    expect(await onDisk(A, path)).toBe('1\n2\n4\n5\n');
-    expect(await onDisk(A, path)).not.toBe('1\n2\n999\n');
+    const marked = await onDisk(A, path);
+    expect(hasConflictMarkers(marked)).toBe(true);   // surfaced as inline markers
+    expect(marked).toContain('4');                   // A's edit preserved…
+    expect(marked).toContain('5');
+    expect(marked).toContain('999');                 // …alongside B's concurrent edit
+    expect(marked).not.toBe('1\n2\n999\n');          // never silently adopted B's version
   });
 });

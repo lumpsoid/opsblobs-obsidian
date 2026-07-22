@@ -22,7 +22,6 @@ import { VersionDagStore } from './network/version-dag-store';
 import { HlcStore } from './network/hlc-store';
 import { SyncStateStore } from './network/sync-state-store';
 import { PluginVaultSyncHost } from './network/vault-sync-host';
-import { ConflictResolutionModal } from './ui/conflict-modal';
 import { DeleteConflictModal } from './ui/delete-conflict-modal';
 import { BinaryConflictModal } from './ui/binary-conflict-modal';
 import { SyncStatusModal } from './ui/sync-status-modal';
@@ -97,6 +96,7 @@ export default class VaultSyncPlugin extends Plugin {
       () => this.settings,
       this.settings.debounceMs,
       this.hlcStore, // persist the HLC after each op (F7)
+      new ObsidianNotifier(), // non-blocking notice when a save still has markers (Step 5)
     );
 
     this.applicator = new SyncApplicator(
@@ -105,17 +105,11 @@ export default class VaultSyncPlugin extends Plugin {
       this.contentStore,
       this.opLogger,
       this.hlc,
-      // Conflict handlers delegate the manual/auto branching + outstanding-conflict
-      // bookkeeping to the coordinator (S5); the plugin supplies only the Obsidian
-      // modal that a *manual* round opens to get the user's decision.
-      (action) =>
-        this.coordinator.decideContentConflict(action, a =>
-          new Promise<Uint8Array | null>(resolve => {
-            new ConflictResolutionModal(
-              this.app, a.localPath, a.mergeResult, a.localContent, a.remoteContent, resolve,
-            ).open();
-          }),
-        ),
+      // A text conflict is surfaced non-blockingly as inline markers by the
+      // applicator (sync v2 Step 5) — no handler. The remaining choice-based
+      // delete/binary conflicts still delegate the manual/auto branching +
+      // outstanding-conflict bookkeeping to the coordinator (S5); the plugin
+      // supplies only the Obsidian modal a *manual* round opens for the decision.
       (action) =>
         this.coordinator.decideDeleteConflict(
           resolveDeleteStrategy(this.settings.deleteConflictStrategy),

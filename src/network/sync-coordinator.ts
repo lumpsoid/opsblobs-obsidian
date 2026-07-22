@@ -37,9 +37,9 @@ export interface SyncOutcome {
 }
 
 /** Interactive resolvers — the plugin's modal wrappers. Only invoked on a manual
- *  round; an auto round defers before ever reaching them. */
-export type InteractiveContentResolver =
-  (action: Extract<MergeAction, { type: 'conflict' }>) => Promise<Uint8Array | null>;
+ *  round; an auto round defers before ever reaching them. A text `conflict` has no
+ *  resolver: it is surfaced non-blockingly as inline markers (sync v2 Step 5) and
+ *  resolved by the next ordinary save, never a modal. */
 export type InteractiveDeleteResolver =
   (action: Extract<MergeAction, { type: 'delete_conflict' }>) => Promise<'keep_deleted' | 'restore'>;
 export type InteractiveBinaryResolver =
@@ -190,28 +190,11 @@ export class SyncCoordinator {
   }
 
   // ─── Conflict decisions (manual: delegate to a modal · auto: defer) ──────────
-
-  /**
-   * Content conflict. Auto → record it outstanding and defer (hold the cursor, S5).
-   * Manual → run the interactive resolver; a skip (null) is recorded outstanding so
-   * it stays visible/re-openable, a real resolution clears any prior entry.
-   */
-  async decideContentConflict(
-    action: Extract<MergeAction, { type: 'conflict' }>,
-    interactive: InteractiveContentResolver,
-  ): Promise<Uint8Array | null | DeferConflict> {
-    if (this.currentSource === 'auto') {
-      await this.syncState.recordConflict({ fileId: action.fileId, path: action.localPath, kind: 'content', firstSeen: this.now() });
-      return DEFER_CONFLICT;
-    }
-    const resolved = await interactive(action);
-    if (resolved === null) {
-      await this.syncState.recordConflict({ fileId: action.fileId, path: action.localPath, kind: 'content', firstSeen: this.now() });
-    } else {
-      await this.syncState.clearConflict(action.fileId);
-    }
-    return resolved;
-  }
+  //
+  // A text `conflict` has no decision here — the applicator writes inline markers
+  // non-blockingly and the next ordinary save resolves it (sync v2 Step 5). Only the
+  // choice-based delete/binary conflicts still route through a modal (manual) or
+  // defer (auto).
 
   /**
    * Delete/modify conflict. A non-`ask` strategy is the user's standing policy and

@@ -22,6 +22,7 @@ import { describe, test, expect, beforeAll } from 'vitest';
 import { ServerSyncClient } from '../src/network/server-sync';
 import { VaultCrypto } from '../src/network/encryption';
 import { FakeSyncServer } from '../src/network/fake-server';
+import { hasConflictMarkers } from '../src/merge/diff3';
 import { TestDevice } from './helpers/test-device';
 
 const SALT = new Uint8Array([9, 9, 9, 9, 9, 9, 9, 9, 8, 8, 8, 8, 8, 8, 8, 8]);
@@ -53,20 +54,30 @@ describe('create/create path collision (F2)', () => {
     const idB = await B.seedFile(path, 'BBB\n', 2000); // B's HLC is higher → wins id
     expect(idA).not.toBe(idB);
 
-    // B does the human merge (unions both sides); A adopts whatever resolution
-    // reaches it (via the resolution's `supersedes`, without re-prompting).
-    const R = 'AAA\nBBB\n';
-    B.resolveConflict = () => new TextEncoder().encode(R);
-    A.resolveConflict = a => new TextEncoder().encode(a.remoteContent);
-
     // ── A syncs (pushes its create); B syncs (pulls A's create, pushes its own,
     //    and hits the create/create collision). ─────────────────────────────
     await client(A).runSync();
     await client(B).runSync();
 
     // A conflict is surfaced on B — NOT a silent write_local clobber of B's bytes.
+    // Sync v2 Step 5: it is surfaced as inline zdiff3 markers at the real path, and
+    // both sides are kept (B never silently became 'AAA'); B is now two-headed.
     expect(B.applied.some(x => x.type === 'conflict')).toBe(true);
-    // B kept both contents through the conflict: it never silently became 'AAA'.
+    const bMarked = await onDisk(B, path);
+    expect(hasConflictMarkers(bMarked)).toBe(true);
+    expect(bMarked).toContain('AAA');
+    expect(bMarked).toContain('BBB');
+    expect(B.entryByPath(path)!.conflictParents?.length).toBe(2);
+
+    // ── B's user resolves by editing the markers away to the union and saving.
+    //    The resolving save clears the two-headed marker and re-emits a two-parent
+    //    merge NODE (parents = the two colliding creates); A adopts it by identity. ──
+    const R = 'AAA\nBBB\n';
+    await B.editFile(path, R, 4000);
+    expect(B.entryByPath(path)!.conflictParents == null).toBe(true);
+    const bRes = B.pendingOps.find(op => op.path === path)!;
+    expect(bRes.id.startsWith('m-')).toBe(true);
+    expect(bRes.parents.length).toBe(2);
     expect(await onDisk(B, path)).toBe(R);
 
     // ── B pushes its resolution; A pulls it and adopts the winning identity. ──

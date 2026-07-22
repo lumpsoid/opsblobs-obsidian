@@ -9,6 +9,7 @@ import { FileRegistry } from '../core/file-registry';
 import { ContentStore, hashContent } from '../core/content-store';
 import { OperationLogger } from '../core/operation-logger';
 import { mergeVersionId } from '../core/operations';
+import { renderMarkersFromResult } from '../merge/diff3';
 import { HybridLogicalClock } from '../core/hlc';
 
 /**
@@ -22,7 +23,6 @@ import { HybridLogicalClock } from '../core/hlc';
 export const DEFER_CONFLICT = Symbol('defer-conflict');
 export type DeferConflict = typeof DEFER_CONFLICT;
 
-export type ConflictHandler = (action: Extract<MergeAction, { type: 'conflict' }>) => Promise<Uint8Array | null | DeferConflict>;
 export type DeleteConflictHandler = (action: Extract<MergeAction, { type: 'delete_conflict' }>) => Promise<'keep_deleted' | 'restore' | DeferConflict>;
 export type BinaryConflictHandler = (action: Extract<MergeAction, { type: 'binary_conflict' }>) => Promise<'keep_local' | 'keep_remote' | DeferConflict>;
 
@@ -50,7 +50,6 @@ export class SyncApplicator {
     private contentStore: ContentStore,
     private opLogger: OperationLogger,
     private hlc: HybridLogicalClock,
-    public onConflict: ConflictHandler,
     public onDeleteConflict: DeleteConflictHandler,
     public onBinaryConflict: BinaryConflictHandler,
   ) {}
@@ -63,8 +62,8 @@ export class SyncApplicator {
    *  · `converged` — a genuinely-converging local action was applied (write/move/
    *    delete, or a resolved conflict), so the file is now in sync. The plugin uses
    *    this to clear a stale "outstanding conflict" badge for a file that later
-   *    resolved automatically (e.g. adopting a peer's `supersedes` resolution via a
-   *    clean `write_local`, which never re-enters the conflict handler).
+   *    resolved automatically (e.g. fast-forwarding onto a peer's two-parent merge-node
+   *    resolution via a clean `write_local`, which never re-enters a conflict handler).
    */
   async applyActions(
     actions: MergeAction[],
@@ -248,28 +247,32 @@ export class SyncApplicator {
         return null;
 
       case 'conflict': {
-        const resolved = await this.onConflict(action);
-        // Auto-sync deferral (S5): apply nothing, hold the cursor. Checked before
-        // the null/skip branch because the sentinel is a truthy symbol.
-        if (resolved === DEFER_CONFLICT) { deferred.add(action.fileId); return null; }
-        if (!resolved) return null;
-        // The resolution is a fresh decision the CRDT replay can't reproduce, so
-        // it must become its own op. Timestamp it *now*: runSync has already
-        // advanced the clock past the merged HLC, so this dominates the remote
-        // content it supersedes and wins last-writer-wins on peers.
-        const hlcTs = this.hlc.now();
-        const hash = await hashContent(resolved);
-        await this.files.write(action.localPath, resolved);
-        await this.contentStore.put(hash, resolved);
-        converged.add(action.fileId);
-        // Sync v2: re-emit the resolution as a two-parent MERGE NODE — a peer holding
-        // either conflicting head fast-forwards onto it (its parents ARE those heads)
-        // instead of re-conflicting. The merge id is content-addressed, so two devices
-        // that resolve to the same bytes dedup; two that resolve differently keep
-        // distinct heads and correctly re-surface. `adoptRemote` also drops any
-        // *different* live id already at this path so both devices settle on ONE id
-        // (F2 — a create/create collision's resolution converges identity).
-        return this.mintMergeResolution(action.fileId, action.localPath, hash, hlcTs, action.parents);
+        // Sync v2 Step 5: a text conflict is surfaced NON-BLOCKINGLY as inline
+        // zdiff3 markers at the real path — no modal, no cursor hold. Both heads stay
+        // open (the file becomes *two-headed*); the next ordinary save that removes
+        // the markers becomes a two-parent merge node (parents = the two heads at
+        // conflict time), which peers fast-forward onto. See operation-logger's
+        // `flushModify` two-headed branch and state-merge's `resolveContentConflict`.
+        //
+        // Guard the same F5 drift the destructive actions do: if the file changed on
+        // disk during the sync window, don't overwrite that edit with markers — defer,
+        // hold the cursor, and re-merge next round against the re-captured edit.
+        const localEntry = local.fileEntries.get(action.fileId);
+        const currentPath = localEntry && !localEntry.deleted ? localEntry.path : action.localPath;
+        if (await this.driftedSinceSnapshot(action.fileId, currentPath, local)) {
+          deferred.add(action.fileId);
+          console.warn(`Vault Sync: deferring conflict markers for ${currentPath} — on-disk content changed during the sync window (F5)`);
+          return null;
+        }
+        const marked = new TextEncoder().encode(renderMarkersFromResult(action.mergeResult));
+        const hash = await hashContent(marked);
+        await this.files.write(action.localPath, marked);
+        await this.contentStore.put(hash, marked);
+        // Record the file two-headed: the markers' hash + the two conflicting heads,
+        // so the resolving save re-emits `parents: [A, B]`. Not `converged` — the
+        // conflict is open until the user resolves it.
+        await this.registry.markConflicted(action.localPath, hash, this.hlc.now(), action.parents ?? []);
+        return null;
       }
 
       case 'delete_conflict': {

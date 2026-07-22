@@ -95,18 +95,32 @@ flips `parents` **and** wires the DAG merge together (the DAG restores the FF th
 content-hash ancestor used to provide). This matches the spec's own note that "the
 reworked Step 2b is folded into R2's Done-when."
 
-### Immediate next action — Step 5 (conflicts as inline 3-way markers)
+### Immediate next action — Step 6 (conflicts panel + compare UX)
 
-> **➡ The folded Step 3 core is DONE (`b62e039`).** The scalar ancestor and
-> `supersedes` are fully removed; reconciliation is entirely DAG merge nodes. The
-> next step is **§"Step 5 — Conflicts as inline markers at the real path
-> (non-blocking)"** (below): stop blocking on the modal, write zdiff3-style 3-way
-> markers at the real path, and let the next ordinary save (a merge op whose
-> parents are the two heads at conflict time) resolve. Green gate:
-> `npm run build && npx vitest run` (**200 pass** now). Steps 6–8 follow unchanged.
+> **➡ Step 5 is DONE (inline conflict markers).** A text `conflict` is now surfaced
+> NON-BLOCKINGLY as inline zdiff3 markers at the real path — no modal, no cursor hold.
+> The file is recorded *two-headed* (`FileEntry.conflictParents = [A, B]` via
+> `registry.markConflicted`); the merge holds (never re-conflicts / nests markers) or
+> adopts a peer's resolution; the next ordinary save that removes the markers re-emits
+> a two-parent merge node (`op-logger.flushModify` two-headed branch → `Ops.merge`),
+> which peers fast-forward onto. New: `diff3.renderConflictMarkers`/
+> `renderMarkersFromResult`/`hasConflictMarkers`; state-merge `resolveContentConflict`
+> two-headed guard; applicator `conflict` case writes markers (F5-drift-guarded) instead
+> of calling a resolver — the `onConflict` handler + coordinator `decideContentConflict`
+> + main.ts `ConflictResolutionModal` wiring are REMOVED (delete/binary conflicts keep
+> their modal/defer handlers). `src/ui/conflict-modal.ts` is now dead code, retained as
+> the 3-way-compare reference for Step 6. Green gate: **206 pass**
+> (`npm run build && npx vitest run`). New tests: `conflict-markers.test.ts` (pure
+> render/detect), `inline-conflict-resolution.test.ts` (two-device e2e incl. the
+> still-has-markers notice + no-open-peer adoption). Rewrote the conflict assertions in
+> concurrent-conflict-dataloss / resolution-convergence / create-create-collision /
+> maintenance-under-concurrency / auto-sync-conflict-defer (re-targeted at a delete
+> conflict for the S5 defer) / contract-suite / sync-coordinator / round-interruption —
+> data-safety intent preserved through the marker mechanism.
 >
-> The §"Step 3 core — the atomic removal: FULL DESIGN" section below is now
-> historical (implemented as `b62e039`) — kept for provenance; do not re-implement.
+> The next step is **§"Step 6 — Conflicts panel + compare UX"** (below). Steps 7–8
+> follow unchanged. The §"Step 3 core — the atomic removal: FULL DESIGN" and §"Step 5"
+> sections below are historical/spec — kept for provenance.
 
 Everything is green (**200 tests** as of `b62e039`). The Step-3/4 ordering hazard was **resolved**:
 Step 4a/4b made clean merges AND content-conflict resolutions real two-parent DAG
@@ -565,6 +579,10 @@ tracks the latest op.
 **Commit:** `feat(merge): reconcile via two-parent merge nodes; remove supersedes`
 
 ## Step 5 — Conflicts as inline markers at the real path (non-blocking)
+
+> ✅ **DONE.** Shipped as described. See the status section at the top for the
+> as-built summary (fields, new diff3 helpers, the two-headed guard, removed modal
+> path, and the test rewrites). Kept below for the original goal/commit seed.
 
 **Goal:** stop blocking on a modal; write 3-way markers and keep both heads open.
 

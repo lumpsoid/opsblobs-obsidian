@@ -406,3 +406,100 @@ export function resolveConflictChunkLines(
     case 'custom': return resolution.text;
   }
 }
+
+// ─── Inline conflict markers (zdiff3-style, sync v2 Step 5) ───────────────────
+//
+//  A conflict is surfaced NON-BLOCKINGLY: instead of a modal, the conflicting
+//  bytes are written to the real path with in-context 3-way markers, clean outside
+//  the conflicting hunks. The user edits them away and the next ordinary save
+//  becomes the two-parent merge node that resolves it. These markers are a *local*
+//  working-copy presentation — they are never pushed to a peer.
+
+/** The seven-character conflict-marker tokens (git/zdiff3 convention). Line
+ *  prefixes, so `hasConflictMarkers` can recognise them and the renderer emit them. */
+export const CONFLICT_MARK_OURS = '<<<<<<<';
+export const CONFLICT_MARK_BASE = '|||||||';
+export const CONFLICT_MARK_SEP = '=======';
+export const CONFLICT_MARK_THEIRS = '>>>>>>>';
+
+/** Emit the marker block for one conflict chunk in zdiff3 form: ours / base /
+ *  theirs. The base section (`|||||||`) is what makes it *zdiff3* rather than plain
+ *  diff3 — it shows the common ancestor so the user can see what each side changed. */
+function renderMarkerBlock(chunk: ConflictChunk): string[] {
+  return [
+    `${CONFLICT_MARK_OURS} ours`,
+    ...chunk.local,
+    `${CONFLICT_MARK_BASE} base`,
+    ...chunk.ancestor,
+    CONFLICT_MARK_SEP,
+    ...chunk.remote,
+    `${CONFLICT_MARK_THEIRS} theirs`,
+  ];
+}
+
+/**
+ * Render a {@link ThreeWayMergeResult} to text with inline zdiff3 markers at each
+ * conflicting hunk and the auto-merged/clean lines verbatim everywhere else. The
+ * applicator uses this on the `conflict` action's already-computed `mergeResult`
+ * (which also covers the whole-file fallback where the base bytes were unavailable —
+ * a single chunk with an empty ancestor). A result with no conflicts renders to its
+ * clean merged text (no markers).
+ *
+ * `result.conflicts[i]` indexes into `result.merged` (its `local` lines sit at
+ * `[startLine, endLine]` as placeholders); we replace each such span with a marker
+ * block and pass every other merged line through, so nothing outside a conflicting
+ * hunk is disturbed. A zero-width conflict (empty local placeholder, e.g. at EOF)
+ * has `endLine < startLine` and consumes no merged line.
+ */
+export function renderMarkersFromResult(result: ThreeWayMergeResult): string {
+  const sorted = [...result.conflicts].sort((a, b) => a.startLine - b.startLine);
+  const out: string[] = [];
+  let i = 0;
+  let ci = 0;
+  while (i < result.merged.length || ci < sorted.length) {
+    const c = sorted[ci];
+    if (c && c.startLine === i) {
+      out.push(...renderMarkerBlock(c));
+      i += Math.max(0, c.endLine - c.startLine + 1);
+      ci++;
+      continue;
+    }
+    if (i < result.merged.length) {
+      out.push(result.merged[i]!);
+      i++;
+    } else {
+      break; // no more merged lines, but a stray conflict didn't anchor — bail safely
+    }
+  }
+  return out.join('\n');
+}
+
+/**
+ * Produce the conflict-marked text for two divergent versions against a common
+ * base (the spec's `renderConflictMarkers(base, ours, theirs)`): a thin wrapper that
+ * three-way-merges and renders. Clean (non-conflicting) changes are auto-merged; only
+ * genuinely overlapping edits get markers. Exported for direct testing; the applicator
+ * renders from the already-computed `mergeResult` via {@link renderMarkersFromResult}.
+ */
+export function renderConflictMarkers(base: string, ours: string, theirs: string): string {
+  return renderMarkersFromResult(threeWayMerge(base, ours, theirs));
+}
+
+/**
+ * Does this text still contain unresolved conflict markers? Used at save time to
+ * tell a genuine resolution (markers removed → emit the merge node) from a save that
+ * still has markers (a non-blocking notice, no merge yet). Requires BOTH the opening
+ * `<<<<<<<` and closing `>>>>>>>` marker lines so a note that merely mentions a run
+ * of `<` or `=` characters isn't mistaken for a conflict.
+ */
+export function hasConflictMarkers(text: string): boolean {
+  const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  let hasOurs = false;
+  let hasTheirs = false;
+  for (const line of lines) {
+    if (line.startsWith(CONFLICT_MARK_OURS)) hasOurs = true;
+    else if (line.startsWith(CONFLICT_MARK_THEIRS)) hasTheirs = true;
+    if (hasOurs && hasTheirs) return true;
+  }
+  return false;
+}

@@ -196,23 +196,22 @@ export function runContractSuite(label: string, newServer: () => ContractServer)
       await deviceA.editFile('note.md', 'shared A\n', 2000);
       await deviceB.editFile('note.md', 'shared B\n', 2000);
 
-      // B does the human merge (unions both edits); A accepts whatever resolution
-      // reaches it (picks the incoming remote — i.e. B's resolution).
       const R = 'shared A\nshared B\n';
-      deviceB.resolveConflict = () => new TextEncoder().encode(R);
-      deviceA.resolveConflict = a => new TextEncoder().encode(a.remoteContent);
 
-      // A pushes its edit; B pulls it, hits the conflict, resolves, then pushes
-      // the resolution as its own op.
+      // A pushes its edit; B pulls it, hits the conflict (surfaced as inline markers,
+      // sync v2 Step 5), then the user resolves by editing the markers away — that
+      // save re-emits the resolution as a two-parent merge node.
       await client(server.connect(vault), deviceA).runSync(); // push A's edit
-      await client(server.connect(vault), deviceB).runSync(); // pull → conflict → resolve
+      await client(server.connect(vault), deviceB).runSync(); // pull → conflict → markers
+      expect(deviceB.applied.some(a => a.type === 'conflict')).toBe(true);
+      await deviceB.editFile('note.md', R, 3000);             // user resolves the markers
       expect(await decode(deviceB)).toBe(R);
       expect(deviceB.pendingOps).toHaveLength(1); // the resolution, queued for next round
       await client(server.connect(vault), deviceB).runSync(); // push the resolution
 
-      // A pulls the resolution (higher HLC than either raw edit) and adopts it via
-      // `supersedes` rather than re-deriving its own answer; the trailing rounds
-      // are no-ops.
+      // A pulls the resolution (a merge node whose parents are the two raw edits) and
+      // adopts it by fast-forward rather than re-deriving its own answer; the trailing
+      // rounds are no-ops.
       await client(server.connect(vault), deviceA).runSync(); // pull → adopt R
       await client(server.connect(vault), deviceA).runSync(); // settle (no-op)
       await client(server.connect(vault), deviceB).runSync(); // settle (same content → no-op)

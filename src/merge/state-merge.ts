@@ -198,6 +198,30 @@ function resolveContentConflict(
   remote: VaultState,
   dag: VersionDag | undefined,
 ): MergeAction {
+  // ── Already two-headed: a conflict was surfaced as inline markers (Step 5) ──
+  // This file is awaiting local resolution — zdiff3 markers sit on disk and both
+  // heads (`le.conflictParents`) stay open. Re-running the three-way merge here would
+  // re-detect the conflict and write markers *over the markers*, nesting them every
+  // round. So while two-headed we never re-conflict:
+  //   · a peer already resolved (its head is a merge node descending from BOTH our
+  //     open heads) → adopt that resolution, clearing our markers. Safe: markers are
+  //     machine-generated working state, and `conflictParents` set ⇒ we haven't
+  //     resolved locally (the resolving save clears it). The write_local path's F5
+  //     drift guard still protects a resolution the user is mid-typing.
+  //   · otherwise → hold: no_op, leave the markers for the user. The remote head is
+  //     recorded in the DAG regardless, so nothing is lost.
+  if (le.conflictParents && le.conflictParents.length >= 2) {
+    if (dag && re.headVersionId
+        && dag.isMergeNode(re.headVersionId)
+        && le.conflictParents.every(h => dag.isAncestor(h, re.headVersionId!))) {
+      const content = remote.contentStore.get(re.contentHash) ?? local.contentStore.get(re.contentHash);
+      if (content) {
+        return { type: 'write_local', fileId, path: re.path, content, hlc: re.hlcTimestamp, headVersionId: re.headVersionId };
+      }
+    }
+    return { type: 'no_op', fileId };
+  }
+
   // A user-resolved conflict is now a two-parent merge node in the DAG, so the
   // fast-forward below adopts it structurally (a peer holding either conflicting
   // head descends into the resolution) — no `supersedes` content-hash shortcut is
