@@ -98,7 +98,23 @@ export interface ThreeWayMergeResult {
 }
 
 export type MergeAction =
-  | { type: 'write_local'; fileId: string; path: string; content: Uint8Array; hlc: HLC }
+  // Adopt a version onto the local file. `headVersionId`, when set, is the exact
+  // version-id (op-id) being adopted — the remote op's id — which the applicator
+  // records as the file's new head so the next local edit descends from it. It is
+  // carried explicitly because an op's id is NOT always `hlcToString(hlc)`: a clean
+  // merge node has a content-addressed id, so re-deriving the head from the HLC
+  // would name a version no DAG node carries and the next edit would lose its base
+  // (sync v2, finding #1). Absent (pure-VaultState unit tests / legacy entries with
+  // no head) ⇒ the applicator falls back to `hlcToString(hlc)` as before.
+  | { type: 'write_local'; fileId: string; path: string; content: Uint8Array; hlc: HLC; headVersionId?: string }
+  // A clean three-way merge of two divergent heads (sync v2): unlike `write_local`
+  // (which adopts an existing remote version), this synthesizes a NEW reconciled
+  // version, so the applicator mints a two-parent merge op — `parents` are the two
+  // reconciled heads (version-ids) — with a deterministic, content-addressed id so
+  // two devices merging the same pair produce the identical node (dedup on push).
+  // Recording it as a real DAG node is what lets the next edit off a merged file
+  // find its base in the graph instead of falling back to the scalar ancestor.
+  | { type: 'write_merge'; fileId: string; path: string; content: Uint8Array; parents: string[] }
   | { type: 'send_remote'; fileId: string; path: string; content: Uint8Array; hlc: HLC }
   | { type: 'delete_local'; fileId: string; path: string }
   | { type: 'delete_remote'; fileId: string; path: string }

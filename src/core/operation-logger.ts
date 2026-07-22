@@ -434,6 +434,22 @@ export class OperationLogger {
     await this.registry.setHeadVersion(fileId, op.id);
   }
 
+  /**
+   * Record a clean-merge node as a pending op so it replicates (sync v2). Like the
+   * resolution recorders, a clean three-way merge is produced *while listeners are
+   * paused* and after the pending log is cleared, so it must be re-emitted here to
+   * survive as a pending op for the next round's push. `parents` are the two
+   * reconciled version-ids and `id` is the precomputed deterministic merge id
+   * (the applicator hashed the merged bytes to derive it, and already set the head
+   * to it via `adoptRemote`; setting it again here keeps this method self-contained
+   * and correct if called without that prior step).
+   */
+  async recordMergeOp(fileId: string, path: string, contentHash: string, hlcTs: HLC, parents: string[], id: string): Promise<void> {
+    const op = Ops.merge(fileId, path, contentHash, hlcTs, parents, id);
+    await this.recordOp(op);
+    await this.registry.setHeadVersion(fileId, id);
+  }
+
   private async recordOp(op: Operation): Promise<void> {
     this.pendingOps.push(op);
     await this.saveOpLog();

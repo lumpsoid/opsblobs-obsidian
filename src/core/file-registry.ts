@@ -147,7 +147,7 @@ export class FileRegistry {
    * entry at this path under a *different* id is dropped as a divergent
    * duplicate. The just-written content becomes the new synced ancestor.
    */
-  async adoptRemote(id: string, path: string, contentHash: string, hlc: HLC): Promise<void> {
+  async adoptRemote(id: string, path: string, contentHash: string, hlc: HLC, headVersionId?: string): Promise<void> {
     const existingId = this.pathIndex.get(path);
     if (existingId && existingId !== id) {
       this.entries.delete(existingId);
@@ -168,11 +168,14 @@ export class FileRegistry {
       deleted: false,
       ancestorContentHash: contentHash,
       ancestorPath: path,
-      // Adopting a remote version makes that version this file's head. The
-      // adopted op's id is `hlcToString(hlc)` (an op's id is the string form of
-      // its HLC), so the head is derivable from the hlc the applicator passes —
-      // covering a plain remote write, a fast-forward, and a conflict resolution.
-      headVersionId: hlcToString(hlc),
+      // Adopting a remote version makes that version this file's head. For a plain
+      // remote write / fast-forward / conflict resolution the adopted op's id is
+      // `hlcToString(hlc)` (an op's id is the string form of its HLC), so the head
+      // is derivable from the hlc the applicator passes. A clean *merge* node has a
+      // content-addressed id that is NOT `hlcToString(hlc)`, so the applicator
+      // passes it explicitly (`headVersionId`) — otherwise the head would name a
+      // version-id no DAG node carries and the next edit would lose its base.
+      headVersionId: headVersionId ?? hlcToString(hlc),
     });
     this.pathIndex.set(path, id);
     await this.save();

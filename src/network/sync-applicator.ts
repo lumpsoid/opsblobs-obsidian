@@ -8,6 +8,7 @@ import { VaultFiles } from '../ports/vault-files';
 import { FileRegistry } from '../core/file-registry';
 import { ContentStore, hashContent } from '../core/content-store';
 import { OperationLogger } from '../core/operation-logger';
+import { mergeVersionId } from '../core/operations';
 import { HybridLogicalClock } from '../core/hlc';
 import { nextAncestorHash } from '../merge/ancestor-policy';
 
@@ -32,12 +33,17 @@ export type BinaryConflictHandler = (action: Extract<MergeAction, { type: 'binar
  *  resolved by accepting the deletion). `supersedes` names the sides it settles
  *  so peers holding either adopt the decision instead of re-prompting. */
 interface PendingResolution {
-  kind: 'update' | 'delete';
+  kind: 'update' | 'delete' | 'merge';
   fileId: string;
   path: string;
   contentHash: string;
   hlc: HLC;
-  supersedes: string[];
+  // update/delete resolutions: the two conflicting sides the decision settles.
+  supersedes?: string[];
+  // merge nodes (sync v2): the two reconciled version-ids and the precomputed
+  // deterministic merge id (the applicator hashed the merged bytes to derive it).
+  parents?: string[];
+  id?: string;
 }
 
 export class SyncApplicator {
@@ -109,10 +115,12 @@ export class SyncApplicator {
     // resolution to peers. The registry was already updated to the resolved
     // hash during apply, so the resumed modify listener suppresses the echo.
     for (const r of resolutions) {
-      if (r.kind === 'delete') {
-        await this.opLogger.recordResolvedDelete(r.fileId, r.path, r.contentHash, r.hlc, r.supersedes);
+      if (r.kind === 'merge') {
+        await this.opLogger.recordMergeOp(r.fileId, r.path, r.contentHash, r.hlc, r.parents!, r.id!);
+      } else if (r.kind === 'delete') {
+        await this.opLogger.recordResolvedDelete(r.fileId, r.path, r.contentHash, r.hlc, r.supersedes!);
       } else {
-        await this.opLogger.recordResolvedUpdate(r.fileId, r.path, r.contentHash, r.hlc, r.supersedes);
+        await this.opLogger.recordResolvedUpdate(r.fileId, r.path, r.contentHash, r.hlc, r.supersedes!);
       }
     }
 
@@ -165,7 +173,7 @@ export class SyncApplicator {
         // suppressed by flushModify's hash-equality guard, and (by registering
         // the id before the create event fires) stops that event from minting a
         // fresh duplicate id for the same path.
-        await this.registry.adoptRemote(action.fileId, action.path, hash, action.hlc);
+        await this.registry.adoptRemote(action.fileId, action.path, hash, action.hlc, action.headVersionId);
         // The file was renamed as part of this merge (H5): remove the now-stale
         // copy at its previous path so the rename isn't left as a duplicate. Guarded
         // on inequality (the common no-rename write never trashes) and tolerant of
@@ -175,6 +183,41 @@ export class SyncApplicator {
         }
         converged.add(action.fileId);
         return null;
+      }
+
+      case 'write_merge': {
+        // A clean three-way merge synthesizes a NEW reconciled version (sync v2).
+        // Same drift/rename handling as `write_local`, but instead of adopting an
+        // existing remote op we mint a two-parent merge node: a deterministic,
+        // content-addressed id so two devices merging the same pair produce the
+        // identical op (dedup on push), recorded as a pending op (pushed next round)
+        // and set as the file's head so the next local edit descends from it.
+        const localEntry = local.fileEntries.get(action.fileId);
+        const currentPath = localEntry && !localEntry.deleted ? localEntry.path : action.path;
+
+        if (await this.driftedSinceSnapshot(action.fileId, currentPath, local)) {
+          deferred.add(action.fileId);
+          console.warn(`Vault Sync: deferring write_merge for ${currentPath} — on-disk content changed during the sync window (F5)`);
+          return null;
+        }
+        const hash = await hashContent(action.content);
+        const id = await mergeVersionId(hash, action.parents);
+        // Timestamp *now* so the merge dominates both reconciled sides (runSync
+        // already advanced the clock past the merged HLC), matching the conflict-
+        // resolution path. The id is content-addressed, so it stays deterministic
+        // across devices regardless of this per-device timestamp.
+        const hlcTs = this.hlc.now();
+        await this.files.write(action.path, action.content);
+        await this.contentStore.put(hash, action.content);
+        // Adopt identity and set the head to the merge node explicitly (its id is
+        // NOT hlcToString(hlc), so adoptRemote can't derive it).
+        await this.registry.adoptRemote(action.fileId, action.path, hash, hlcTs, id);
+        if (currentPath !== action.path) {
+          await this.files.trash(currentPath);
+        }
+        converged.add(action.fileId);
+        // Re-emit the merge node as a pending op (after clearOps) so it replicates.
+        return { kind: 'merge', fileId: action.fileId, path: action.path, contentHash: hash, hlc: hlcTs, parents: action.parents, id };
       }
 
       case 'move_local':
@@ -333,7 +376,10 @@ export class SyncApplicator {
       // A deferred file's destructive action was skipped (F5): its ancestor must
       // stay the pre-round base so next round's three-way merge is correct.
       if (deferred.has(action.fileId)) continue;
-      if (action.type === 'write_local') {
+      if (action.type === 'write_local' || action.type === 'write_merge') {
+        // Both write freshly-produced bytes to disk (a merge synthesizes them), so
+        // the just-written content becomes the synced ancestor. Hashing is async
+        // I/O the pure policy can't do, so this branch stays in the shell.
         const hash = await hashContent(action.content);
         await this.registry.setAncestorHash(action.fileId, hash);
       } else {

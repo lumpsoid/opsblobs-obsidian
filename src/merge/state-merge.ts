@@ -89,6 +89,7 @@ function classifyAndResolve(
       path: remoteEntry.path,
       content,
       hlc: remoteEntry.hlcTimestamp,
+      headVersionId: remoteEntry.headVersionId ?? undefined,
     };
   }
 
@@ -146,7 +147,7 @@ function classifyAndResolve(
     // re-prompting (mirrors the content-conflict shortcut in resolveContentConflict).
     if (re.supersedes?.includes(le.contentHash)) {
       const content = remote.contentStore.get(re.contentHash) ?? local.contentStore.get(re.contentHash);
-      if (content) return { type: 'write_local', fileId, path: re.path, content, hlc: re.hlcTimestamp };
+      if (content) return { type: 'write_local', fileId, path: re.path, content, hlc: re.hlcTimestamp, headVersionId: re.headVersionId ?? undefined };
     }
     if (isUnchangedSinceAncestor(re)) {
       return { type: 'delete_remote', fileId, path: re.path };
@@ -202,7 +203,7 @@ function resolveContentConflict(
     // fetchRemoteBlobs precisely because we already hold those bytes.
     const content = remote.contentStore.get(re.contentHash) ?? local.contentStore.get(re.contentHash);
     if (content) {
-      return { type: 'write_local', fileId, path: re.path, content, hlc: re.hlcTimestamp };
+      return { type: 'write_local', fileId, path: re.path, content, hlc: re.hlcTimestamp, headVersionId: re.headVersionId ?? undefined };
     }
   }
   if (le.supersedes?.includes(re.contentHash)) {
@@ -247,7 +248,7 @@ function resolveContentConflict(
       // so they are absent from the *remote* store yet present locally.
       const content = remoteContent ?? local.contentStore.get(re.contentHash);
       if (content) {
-        return { type: 'write_local', fileId, path: re.path, content, hlc: re.hlcTimestamp };
+        return { type: 'write_local', fileId, path: re.path, content, hlc: re.hlcTimestamp, headVersionId: re.headVersionId ?? undefined };
       }
       // Descendant bytes unavailable anywhere — defer rather than fabricate/clobber (F1).
       return { type: 'no_op', fileId };
@@ -263,7 +264,7 @@ function resolveContentConflict(
     // base equals our current content, so it is a strict descendant. Adopt it.
     const content = remoteContent ?? local.contentStore.get(re.contentHash);
     if (content) {
-      return { type: 'write_local', fileId, path: re.path, content, hlc: re.hlcTimestamp };
+      return { type: 'write_local', fileId, path: re.path, content, hlc: re.hlcTimestamp, headVersionId: re.headVersionId ?? undefined };
     }
     return { type: 'no_op', fileId };
   }
@@ -280,7 +281,7 @@ function resolveContentConflict(
       // retried once the content appears.
       return { type: 'no_op', fileId };
     }
-    return { type: 'write_local', fileId, path: winner.path, content: winnerContent, hlc: winner.hlcTimestamp };
+    return { type: 'write_local', fileId, path: winner.path, content: winnerContent, hlc: winner.hlcTimestamp, headVersionId: winner.headVersionId ?? undefined };
   }
 
   const localText = new TextDecoder().decode(localContent);
@@ -315,7 +316,7 @@ function resolveContentConflict(
       const remoteChanged = re.contentHash !== baseHash;
       // Only the remote side changed → adopt it cleanly.
       if (remoteChanged && !localChanged) {
-        return { type: 'write_local', fileId, path: re.path, content: remoteContent, hlc: re.hlcTimestamp };
+        return { type: 'write_local', fileId, path: re.path, content: remoteContent, hlc: re.hlcTimestamp, headVersionId: re.headVersionId ?? undefined };
       }
       // Only the local side changed → keep ours; the local file already holds it.
       if (localChanged && !remoteChanged) {
@@ -373,6 +374,22 @@ function resolveContentConflict(
     // consistent with the `hlcMax` stamped below and with `resolveRenameConflict`.
     // For the common no-rename case both paths are equal, so this is a no-op.
     const pathWinner = hlcCompare(le.hlcTimestamp, re.hlcTimestamp) >= 0 ? le : re;
+    // Sync v2: when both heads are known (the DAG-backed path), this clean merge
+    // synthesizes a NEW reconciled version, so record it as a real two-parent merge
+    // NODE — otherwise the next edit off the merged file can't find its base in the
+    // DAG and falls back to the scalar ancestor. The applicator mints the merge op
+    // with a deterministic content-addressed id. Without both heads (pure-VaultState
+    // unit tests, or a legacy entry with no head) fall back to a plain `write_local`
+    // — behaviour-identical to before.
+    if (le.headVersionId && re.headVersionId) {
+      return {
+        type: 'write_merge',
+        fileId,
+        path: pathWinner.path,
+        content,
+        parents: [le.headVersionId, re.headVersionId],
+      };
+    }
     return {
       type: 'write_local',
       fileId,
@@ -439,7 +456,7 @@ function resolveCreateCollision(
     if (!selfIsRemote) return noOp;
     const content = remoteContent ?? localContent; // identical-content: local holds it
     if (!content) return noOp; // bytes unavailable — defer (F1)
-    return { type: 'write_local', fileId: re.id, path: re.path, content, hlc: re.hlcTimestamp };
+    return { type: 'write_local', fileId: re.id, path: re.path, content, hlc: re.hlcTimestamp, headVersionId: re.headVersionId ?? undefined };
   };
 
   // ── Identical content: the same file under two ids. Converge id, no conflict. ─
