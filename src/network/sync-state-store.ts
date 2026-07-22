@@ -6,9 +6,17 @@
 //  needs my attention?" — persisted at `.vault-sync/sync-state.json` so it
 //  survives restarts. Distinct from the *cursor* (how far we've consumed the
 //  server log): this records the things a normal round would otherwise swallow —
-//  a conflict the user skipped, a destructive action deferred because the file
-//  drifted mid-round (F5), an op stranded because its blob wasn't available (F3),
-//  the last error, and a one-line summary of the last round.
+//  a destructive action deferred because the file drifted mid-round (F5), a
+//  delete/binary conflict an unattended auto-round deferred (S5), an op stranded
+//  because its blob wasn't available (F3), the last error, and a one-line summary
+//  of the last round.
+//
+//  Note (sync v2 Step 7): "conflicts" is NO LONGER a hand-maintained set here.
+//  Text conflicts are the *derived* two-headed files (a query over the registry's
+//  `conflictParents`), and the remaining delete/binary auto-defers are just this
+//  round's `deferred` entries tagged `reason: 'conflict'` — replaced wholesale
+//  every round (the held cursor re-surfaces them, so no record/clear/self-heal
+//  bookkeeping is needed).
 //
 //  Obsidian-free (backed by a MetadataStore port) so it's directly unit-testable.
 //  It never reads the wall clock itself — callers pass `at`/`firstSeen` in — so
@@ -18,21 +26,17 @@ import { MetadataStore } from '../ports/metadata-store';
 
 const STATE_PATH = '.vault-sync/sync-state.json';
 
-/** A conflict the user hasn't settled: skipped, dismissed, or (S5) deferred by an
- *  unattended auto-sync. Keyed by fileId so it can be cleared on resolution. */
-export interface OutstandingConflict {
-  fileId: string;
-  path: string;
-  kind: 'content' | 'delete' | 'binary';
-  firstSeen: number; // wall ms, supplied by the caller
-}
-
-/** A destructive merge action skipped because the file changed on disk during the
- *  round (F5). Informational — the round already holds the cursor so it retries. */
+/** A merge action the round declined to apply this round, holding the cursor so it
+ *  re-pulls and re-merges. Two reasons, distinguished for the UI:
+ *   · `'drift'`    — the file changed on disk during the sync window (F5); it retries
+ *                    (and typically resolves) on the next sync, no user action needed.
+ *   · `'conflict'` — an unattended auto-round deferred a delete/binary conflict (S5);
+ *                    it needs a *manual* sync to open the resolution modal.
+ *  Derived fresh from the round summary each round (not an accumulating set). */
 export interface DeferredFile {
   fileId: string;
   path: string;
-  reason: 'drift';
+  reason: 'drift' | 'conflict';
   at: number;
 }
 
@@ -52,7 +56,6 @@ export interface SyncRoundSummaryRecord {
 
 /** Everything the status surface needs to explain the current sync state. */
 export interface SyncState {
-  outstandingConflicts: OutstandingConflict[];
   deferred: DeferredFile[];
   stranded: StrandedContent[];
   lastError: { message: string; at: number } | null;
@@ -60,7 +63,7 @@ export interface SyncState {
 }
 
 function emptyState(): SyncState {
-  return { outstandingConflicts: [], deferred: [], stranded: [], lastError: null, lastSync: null };
+  return { deferred: [], stranded: [], lastError: null, lastSync: null };
 }
 
 export class SyncStateStore {
@@ -85,7 +88,6 @@ export class SyncStateStore {
     try {
       const parsed = JSON.parse(raw) as Partial<SyncState>;
       this.state = {
-        outstandingConflicts: Array.isArray(parsed.outstandingConflicts) ? parsed.outstandingConflicts : [],
         deferred: Array.isArray(parsed.deferred) ? parsed.deferred : [],
         stranded: Array.isArray(parsed.stranded) ? parsed.stranded : [],
         lastError: parsed.lastError ?? null,
@@ -111,32 +113,6 @@ export class SyncStateStore {
   }
 
   // ─── Mutators ───────────────────────────────────────────────────────────────
-
-  /** Record an unresolved conflict, deduped by fileId (a re-skip of the same file
-   *  updates nothing rather than piling up duplicates). */
-  async recordConflict(entry: OutstandingConflict): Promise<void> {
-    if (!this.state.outstandingConflicts.some(c => c.fileId === entry.fileId)) {
-      this.state.outstandingConflicts.push(entry);
-      await this.persist();
-    }
-  }
-
-  /** Drop a conflict once the user has resolved it. No-op if not present. */
-  async clearConflict(fileId: string): Promise<void> {
-    const before = this.state.outstandingConflicts.length;
-    this.state.outstandingConflicts = this.state.outstandingConflicts.filter(c => c.fileId !== fileId);
-    if (this.state.outstandingConflicts.length !== before) await this.persist();
-  }
-
-  /** Drop every outstanding conflict. Used by "Re-check for conflicts", which
-   *  replays the whole server log — any still-genuine conflict is re-recorded
-   *  during that round, so wiping first self-heals badges left stuck by a file
-   *  that resolved automatically without re-entering the conflict handler. */
-  async clearAllConflicts(): Promise<void> {
-    if (this.state.outstandingConflicts.length === 0) return;
-    this.state.outstandingConflicts = [];
-    await this.persist();
-  }
 
   /** Replace the last-round summary and the transient per-round lists
    *  (deferred/stranded) with this round's outcome. */

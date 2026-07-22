@@ -62,25 +62,25 @@ export default class VaultSyncPlugin extends Plugin {
    *  allows only one listener, so the plugin fans out through this set. */
   private conflictChangeListeners = new Set<() => void>();
 
-  /** Conflicts the user has skipped/dismissed and not yet resolved (delete/binary
-   *  defers) — read from the persisted sync-state (via the coordinator) so it
-   *  survives restarts. Text conflicts are the *two-headed* files (Step 5/6),
-   *  counted separately by {@link twoHeadedConflicts}. */
-  private outstandingConflictCount(): number {
-    return this.coordinator.outstandingConflictCount();
+  /** Delete/binary conflicts an unattended auto-round deferred and that still need a
+   *  manual sync — a *derived* count over the last round's observable state (Step 7),
+   *  not a hand-maintained badge. Text conflicts are the two-headed files below. */
+  private deferredConflictCount(): number {
+    return this.coordinator.deferredConflictCount();
   }
 
   /** The two-headed files a text conflict left awaiting resolution (Step 6). A
-   *  derived query over the registry — no hand-maintained set (Step 7 removes the
-   *  badge bookkeeping the delete/binary path still uses). */
+   *  derived query over the registry — no hand-maintained set. */
   private twoHeadedConflicts(): ConflictListItem[] {
     return listTwoHeadedConflicts(this.registry.getAllEntries().values());
   }
 
-  /** Total conflicts needing the user: two-headed text files + skipped/deferred
-   *  delete/binary badges. Drives the ribbon "needs attention" state and status bar. */
+  /** Total conflicts needing the user: two-headed text files (derived from the
+   *  registry) + auto-deferred delete/binary conflicts (derived from the last
+   *  round). Both are derived queries now (Step 7) — no hand-maintained set. Drives
+   *  the ribbon "needs attention" state and the status bar. */
   private conflictCount(): number {
-    return this.twoHeadedConflicts().length + this.outstandingConflictCount();
+    return this.twoHeadedConflicts().length + this.deferredConflictCount();
   }
 
   private emitConflictChange(): void {
@@ -497,10 +497,10 @@ export default class VaultSyncPlugin extends Plugin {
    * no-op, so this is safe to run anytime. Then it runs a sync.
    */
   async recheckConflicts(): Promise<void> {
-    // Wipe the outstanding-conflict badges first: the replay below re-records any
-    // that are still genuine, so this also self-heals a badge left stuck by a file
-    // that resolved automatically (adopting a peer's resolution) in a prior round.
-    await this.coordinator.clearAllOutstandingConflicts();
+    // Rewind the cursor and replay the whole log. "Conflicts" are derived now
+    // (Step 7) — no badges to wipe/self-heal: a delete/binary conflict this replay
+    // re-encounters re-defers (and re-surfaces as reason 'conflict'); text conflicts
+    // stay two-headed in the registry regardless. Local content/ops are untouched.
     await new CursorStore(this.metadata).save(0);
     await this.triggerSync('manual');
   }

@@ -99,7 +99,7 @@ export class PluginVaultSyncHost implements VaultSyncHost {
     };
   }
 
-  async applyMerge(actions: MergeAction[], local: VaultState, remote: VaultState): Promise<{ deferred: Set<string>; converged: Set<string> }> {
+  async applyMerge(actions: MergeAction[], local: VaultState, remote: VaultState): Promise<{ deferred: Set<string>; deferredConflicts: Set<string> }> {
     return this.applicator.applyActions(actions, local, remote);
   }
 

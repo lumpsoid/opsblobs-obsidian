@@ -4,10 +4,12 @@
 //
 //  The inspectable "current state of sync" surface — replaces the transient
 //  8-second Notice. Shows the last round's result, still-pending changes, and
-//  anything that needs attention: conflicts the user skipped, files deferred for
-//  on-disk drift, content stranded waiting on a blob, and the last error. Each
-//  outstanding conflict gets a "Resolve now" action that re-pulls the history so
-//  the conflict is re-presented (via the host's recheckConflicts).
+//  anything that needs attention: delete/binary conflicts an auto-round deferred
+//  (reason 'conflict' — need a manual sync), files deferred for on-disk drift
+//  (reason 'drift' — retry automatically), content stranded waiting on a blob, and
+//  the last error. The conflict-deferred files get a "Resolve now" action that
+//  re-runs a manual sync so their resolution modal opens (via recheckConflicts).
+//  (Text conflicts live in the non-blocking Conflicts panel, not here.)
 
 import { App, Modal, Setting } from 'obsidian';
 import { SyncState } from '../network/sync-state-store';
@@ -57,21 +59,21 @@ export class SyncStatusModal extends Modal {
       this.pathList(this.snap.pendingPaths);
     }
 
-    // ── Outstanding conflicts ─────────────────────────────────────────────────
-    const conflicts = s.outstandingConflicts;
+    // ── Deferred conflicts (need a manual sync) ───────────────────────────────
+    const conflicts = s.deferred.filter(d => d.reason === 'conflict');
     contentEl.createEl('h3', { text: `Needs your attention (${conflicts.length})` });
     if (conflicts.length === 0) {
-      contentEl.createEl('p', { text: 'No skipped or unresolved conflicts.', cls: 'setting-item-description' });
+      contentEl.createEl('p', { text: 'No deferred conflicts.', cls: 'setting-item-description' });
     } else {
       contentEl.createEl('p', {
-        text: 'You skipped or dismissed these conflicts. Your current version is kept until you resolve them.',
+        text: 'An unattended sync deferred these delete/binary conflicts. Your current version is kept; run a manual sync to resolve each.',
         cls: 'setting-item-description',
       });
       for (const c of conflicts) {
-        contentEl.createEl('div', { text: `⚠️ ${c.path} (${c.kind}) — since ${this.rel(c.firstSeen)}`, cls: 'setting-item-description' });
+        contentEl.createEl('div', { text: `⚠️ ${c.path} — since ${this.rel(c.at)}`, cls: 'setting-item-description' });
       }
       new Setting(contentEl)
-        .setName('Resolve skipped conflicts')
+        .setName('Resolve deferred conflicts')
         .setDesc('Re-pull the full history and re-present each conflict for resolution.')
         .addButton(btn => {
           btn.setButtonText('Resolve now').setCta().onClick(() => {
@@ -82,13 +84,14 @@ export class SyncStatusModal extends Modal {
     }
 
     // ── Deferred (drift) ──────────────────────────────────────────────────────
-    if (s.deferred.length > 0) {
-      contentEl.createEl('h3', { text: `Deferred — changed during sync (${s.deferred.length})` });
+    const drift = s.deferred.filter(d => d.reason === 'drift');
+    if (drift.length > 0) {
+      contentEl.createEl('h3', { text: `Deferred — changed during sync (${drift.length})` });
       contentEl.createEl('p', {
         text: 'These files changed on disk while a sync was in flight, so their incoming update was held. They retry automatically on the next sync.',
         cls: 'setting-item-description',
       });
-      this.pathList(s.deferred.map(d => d.path));
+      this.pathList(drift.map(d => d.path));
     }
 
     // ── Stranded (missing content) ────────────────────────────────────────────

@@ -126,12 +126,10 @@ export class SyncCoordinator {
       const summary = await this.runRound();
 
       await this.persistHlc();
-      // Clear the outstanding-conflict badge for any file that converged this round
-      // — above all one that resolved AUTOMATICALLY (adopting a peer's `supersedes`
-      // resolution via a clean write_local), which never re-enters `decide*` and so
-      // would otherwise leave a stale "1 conflict to resolve" forever. Done before
-      // recordRoundOutcome so the round's `conflicts` count reflects the clear.
-      for (const fileId of summary.converged) await this.syncState.clearConflict(fileId);
+      // No badge to clear on convergence anymore (Step 7): "conflicts" is derived —
+      // text conflicts are the registry's two-headed files, and delete/binary
+      // auto-defers are just this round's `deferredConflicts`, replaced wholesale
+      // below. A conflict that resolved automatically simply stops appearing.
       await this.recordRoundOutcome(summary);
       await this.syncState.clearError();
       await this.markSynced();
@@ -147,17 +145,12 @@ export class SyncCoordinator {
     }
   }
 
-  /** Number of conflicts the user still needs to resolve — drives ribbon/status. */
-  outstandingConflictCount(): number {
-    return this.syncState.get().outstandingConflicts.length;
-  }
-
-  /** Wipe every outstanding-conflict badge. Called by "Re-check for conflicts"
-   *  before it replays the whole server log: a still-genuine conflict re-surfaces
-   *  and is re-recorded that round, while a badge left stuck by an automatic
-   *  resolution is cleared for good. */
-  async clearAllOutstandingConflicts(): Promise<void> {
-    await this.syncState.clearAllConflicts();
+  /** Delete/binary conflicts an unattended auto-round deferred and that still need a
+   *  manual sync — a *derived* count over the last round's observable state (no
+   *  hand-maintained set, Step 7). Text conflicts are the two-headed files, counted
+   *  separately by the plugin from the registry. */
+  deferredConflictCount(): number {
+    return this.syncState.get().deferred.filter(d => d.reason === 'conflict').length;
   }
 
   /**
@@ -196,37 +189,32 @@ export class SyncCoordinator {
   // choice-based delete/binary conflicts still route through a modal (manual) or
   // defer (auto).
 
+  //
+  // No badge bookkeeping here anymore (Step 7): an auto-defer is surfaced by the
+  // round's `deferredConflicts` (the applicator tags it), and a resolution simply
+  // stops the file re-appearing. These methods only decide defer-vs-resolve.
+
   /**
    * Delete/modify conflict. A non-`ask` strategy is the user's standing policy and
-   * runs unattended in either mode. `ask` under auto defers; `ask` under manual runs
-   * the modal. Either way a decision clears any outstanding entry.
+   * runs unattended in either mode. `ask` under auto defers (the applicator holds
+   * the cursor + tags it a conflict); `ask` under manual runs the modal.
    */
   async decideDeleteConflict(
     strategy: 'ask' | 'keep_deleted' | 'restore',
     action: Extract<MergeAction, { type: 'delete_conflict' }>,
     interactive: InteractiveDeleteResolver,
   ): Promise<'keep_deleted' | 'restore' | DeferConflict> {
-    if (strategy === 'ask' && this.currentSource === 'auto') {
-      await this.syncState.recordConflict({ fileId: action.fileId, path: action.path, kind: 'delete', firstSeen: this.now() });
-      return DEFER_CONFLICT;
-    }
-    const decision = strategy !== 'ask' ? strategy : await interactive(action);
-    await this.syncState.clearConflict(action.fileId);
-    return decision;
+    if (strategy === 'ask' && this.currentSource === 'auto') return DEFER_CONFLICT;
+    return strategy !== 'ask' ? strategy : interactive(action);
   }
 
-  /** Binary conflict. Auto → record + defer; manual → run the modal, then clear. */
+  /** Binary conflict. Auto → defer (cursor held, tagged a conflict); manual → modal. */
   async decideBinaryConflict(
     action: Extract<MergeAction, { type: 'binary_conflict' }>,
     interactive: InteractiveBinaryResolver,
   ): Promise<'keep_local' | 'keep_remote' | DeferConflict> {
-    if (this.currentSource === 'auto') {
-      await this.syncState.recordConflict({ fileId: action.fileId, path: action.localPath, kind: 'binary', firstSeen: this.now() });
-      return DEFER_CONFLICT;
-    }
-    const decision = await interactive(action);
-    await this.syncState.clearConflict(action.fileId);
-    return decision;
+    if (this.currentSource === 'auto') return DEFER_CONFLICT;
+    return interactive(action);
   }
 
   /** Fold a completed round's summary into the persisted sync-state (S2): the
@@ -234,15 +222,18 @@ export class SyncCoordinator {
    *  fileIds/hashes to vault paths for display. */
   private async recordRoundOutcome(summary: SyncRoundSummary): Promise<void> {
     const at = this.now();
+    // Tag each deferral drift-vs-conflict from the applicator's `deferredConflicts`
+    // subset, so the UI can label them and count only the conflicts (Step 7).
+    const conflictIds = new Set(summary.deferredConflicts);
     const deferred = summary.deferred.map(fileId => ({
       fileId,
       path: this.registry.getById(fileId)?.path ?? fileId,
-      reason: 'drift' as const,
+      reason: (conflictIds.has(fileId) ? 'conflict' : 'drift') as 'drift' | 'conflict',
       at,
     }));
     const stranded = summary.stranded.map(contentHash => ({ contentHash, at }));
     await this.syncState.setRound(
-      { at, pushed: summary.pushed, pulled: summary.pulled, conflicts: this.outstandingConflictCount() },
+      { at, pushed: summary.pushed, pulled: summary.pulled, conflicts: summary.deferredConflicts.length },
       deferred,
       stranded,
     );

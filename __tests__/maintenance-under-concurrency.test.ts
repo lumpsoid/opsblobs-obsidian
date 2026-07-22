@@ -170,13 +170,15 @@ describe('maintenance operations with a concurrent peer', () => {
     expect(A.entry(id)!.contentHash).toBe(B.entry(id)!.contentHash);
   });
 
-  // ── Auto-adopt reports convergence (the stuck-badge bug) ────────────────────
-  // A conflict can resolve without the resolving device ever re-entering a handler:
-  // a peer's resolution merge node is adopted by a clean write_local. TestDevice has
-  // no SyncStateStore, so we assert the signal the coordinator needs: the round's
-  // SyncRoundSummary.converged must include the file on the adopt round (so the plugin
-  // clears the badge) and must NOT include it on the round that only wrote markers.
-  test('a conflict that resolves automatically is reported in summary.converged', async () => {
+  // ── A conflict resolves automatically, with no badge to leave stuck (Step 7) ─
+  // A text conflict can resolve without the resolving device ever re-entering a
+  // handler: a peer's resolution merge node is adopted by a clean write_local. In
+  // v1 that stranded a hand-maintained "outstanding conflict" badge; Step 7 removed
+  // the badge — "in conflict" is now the *derived* two-headed state (`conflictParents`
+  // on the registry). This pins the derived signal: the file is two-headed while the
+  // markers are open, and stops being two-headed once the resolution is adopted — no
+  // bookkeeping to clear.
+  test('an automatically-resolved conflict clears the derived two-headed state', async () => {
     const api = new FakeSyncServer();
     const [A, B, id] = await sharedBase(api, 'note.md', 'shared\n');
 
@@ -185,21 +187,22 @@ describe('maintenance operations with a concurrent peer', () => {
 
     await client(api, A).runSync();            // A pushes AAA
 
-    // B pulls A's edit → conflict surfaced as markers. This round settles nothing for
-    // the file (it is open, awaiting resolution), so it must NOT report converged.
-    const markersRound = await client(api, B).runSync();
+    // B pulls A's edit → conflict surfaced as markers. The file is now two-headed
+    // (the derived "in conflict" state), awaiting resolution.
+    await client(api, B).runSync();
     expect(hasConflictMarkers(await text(B, 'note.md'))).toBe(true);
-    expect(markersRound.converged).not.toContain(id);
     expect(B.applied.filter(a => a.type === 'conflict')).toHaveLength(1);
+    expect(B.entry(id)!.conflictParents?.length).toBe(2); // two-headed while open
 
     // B resolves and pushes; A adopts it automatically (a write_local, no conflict).
-    // THIS round must report the file as converged — what lets the plugin clear the
-    // stale outstanding badge for a file that later resolved on its own.
+    // A was never two-headed (it authored the surviving side); after adoption neither
+    // device is two-headed — the derived conflict state simply disappears.
     await B.editFile('note.md', 'AAA\nBBB\n', 3000);
     await client(api, B).runSync();            // push resolution
-    const adoptRound = await client(api, A).runSync();
+    await client(api, A).runSync();
     expect(await text(A, 'note.md')).toBe('AAA\nBBB\n');   // converged to the resolution
     expect(A.applied.filter(a => a.type === 'conflict')).toHaveLength(0); // A never conflicted
-    expect(adoptRound.converged).toContain(id);
+    expect(A.entry(id)!.conflictParents == null).toBe(true);              // not two-headed
+    expect(B.entry(id)!.conflictParents == null).toBe(true);              // resolution cleared it
   });
 });

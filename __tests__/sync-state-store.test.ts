@@ -4,8 +4,9 @@
 //
 //  Round-trips through the fake MetadataStore (the same port prod uses), and
 //  covers the guarantees the status surface relies on: a corrupt file loads as
-//  empty (never throws), recordConflict dedupes by fileId, clearConflict removes,
-//  and setRound/setError/clearError persist.
+//  empty (never throws), and setRound/setError/clearError persist. There is no
+//  longer a hand-maintained conflict set here (Step 7 — "conflicts" is derived);
+//  the round's deferred entries carry `reason: 'drift' | 'conflict'`.
 
 import { describe, test, expect } from 'vitest';
 import { SyncStateStore } from '../src/network/sync-state-store';
@@ -17,7 +18,6 @@ describe('SyncStateStore', () => {
   test('absent file loads as empty state', async () => {
     const store = new SyncStateStore(new FakeMetadataStore());
     const state = await store.load();
-    expect(state.outstandingConflicts).toEqual([]);
     expect(state.deferred).toEqual([]);
     expect(state.stranded).toEqual([]);
     expect(state.lastError).toBeNull();
@@ -29,53 +29,28 @@ describe('SyncStateStore', () => {
     meta.set(STATE_PATH, '{ this is not valid json');
     const store = new SyncStateStore(meta);
     const state = await store.load();
-    expect(state.outstandingConflicts).toEqual([]);
+    expect(state.deferred).toEqual([]);
     expect(state.lastSync).toBeNull();
   });
 
-  test('recordConflict persists and dedupes by fileId', async () => {
-    const meta = new FakeMetadataStore();
-    const store = new SyncStateStore(meta);
-    await store.load();
-
-    await store.recordConflict({ fileId: 'f1', path: 'a.md', kind: 'content', firstSeen: 100 });
-    await store.recordConflict({ fileId: 'f1', path: 'a.md', kind: 'content', firstSeen: 200 }); // dup
-    await store.recordConflict({ fileId: 'f2', path: 'b.md', kind: 'binary', firstSeen: 300 });
-
-    expect(store.get().outstandingConflicts).toHaveLength(2);
-    // The first-seen time of f1 is not overwritten by the re-record.
-    expect(store.get().outstandingConflicts.find(c => c.fileId === 'f1')!.firstSeen).toBe(100);
-
-    // Survives a reload through the store (persisted).
-    const reloaded = await new SyncStateStore(meta).load();
-    expect(reloaded.outstandingConflicts).toHaveLength(2);
-  });
-
-  test('clearConflict removes only the named file', async () => {
-    const store = new SyncStateStore(new FakeMetadataStore());
-    await store.load();
-    await store.recordConflict({ fileId: 'f1', path: 'a.md', kind: 'content', firstSeen: 1 });
-    await store.recordConflict({ fileId: 'f2', path: 'b.md', kind: 'content', firstSeen: 2 });
-
-    await store.clearConflict('f1');
-    expect(store.get().outstandingConflicts.map(c => c.fileId)).toEqual(['f2']);
-    // Clearing an absent id is a harmless no-op.
-    await store.clearConflict('nope');
-    expect(store.get().outstandingConflicts).toHaveLength(1);
-  });
-
-  test('setRound records the summary and replaces deferred/stranded', async () => {
+  test('setRound records the summary and replaces deferred (drift + conflict) / stranded', async () => {
     const meta = new FakeMetadataStore();
     const store = new SyncStateStore(meta);
     await store.load();
 
     await store.setRound(
       { at: 5000, pushed: 3, pulled: 2, conflicts: 1 },
-      [{ fileId: 'f1', path: 'a.md', reason: 'drift', at: 5000 }],
+      [
+        { fileId: 'f1', path: 'a.md', reason: 'drift', at: 5000 },
+        { fileId: 'f2', path: 'b.png', reason: 'conflict', at: 5000 },
+      ],
       [{ contentHash: 'deadbeef', at: 5000 }],
     );
     expect(store.get().lastSync).toEqual({ at: 5000, pushed: 3, pulled: 2, conflicts: 1 });
-    expect(store.get().deferred).toHaveLength(1);
+    expect(store.get().deferred).toHaveLength(2);
+    // The reason tag is what the status surface uses to split "needs attention"
+    // (conflict) from "retries automatically" (drift).
+    expect(store.get().deferred.filter(d => d.reason === 'conflict').map(d => d.path)).toEqual(['b.png']);
     expect(store.get().stranded.map(s => s.contentHash)).toContain('deadbeef');
 
     // A subsequent round replaces (not appends) the transient lists.

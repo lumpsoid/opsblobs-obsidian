@@ -95,9 +95,10 @@ export interface VaultSyncHost {
   /** Apply merge actions to the real vault (writes/deletes/moves, conflict
    *  prompts). Returns `deferred` (fileIds whose destructive action was skipped for
    *  on-disk drift (F5) or an auto-deferred conflict — the caller holds the cursor
-   *  so their remote ops re-pull next round) and `converged` (fileIds a converging
-   *  action settled this round, so a stale outstanding-conflict badge can clear). */
-  applyMerge(actions: MergeAction[], local: VaultState, remote: VaultState): Promise<{ deferred: Set<string>; converged: Set<string> }>;
+   *  so their remote ops re-pull next round) and `deferredConflicts` (the subset of
+   *  `deferred` that is an auto-deferred delete/binary conflict, surfaced with
+   *  reason 'conflict' — Step 7's derived replacement for the outstanding badge). */
+  applyMerge(actions: MergeAction[], local: VaultState, remote: VaultState): Promise<{ deferred: Set<string>; deferredConflicts: Set<string> }>;
   /** Drop the pending ops once they are durably on the server. */
   clearPendingOps(): Promise<void>;
   loadCursor(): Promise<number>;
@@ -131,14 +132,16 @@ export interface SyncRoundSummary {
   pushed: number;
   /** Count of remote ops pulled this round. */
   pulled: number;
-  /** fileIds whose destructive action was deferred for on-disk drift (F5). */
+  /** fileIds whose action was deferred this round (F5 drift *or* an auto-deferred
+   *  delete/binary conflict); the cursor is held so they re-pull and re-merge. */
   deferred: string[];
   /** content hashes whose blob couldn't be fetched this round (F3). */
   stranded: string[];
-  /** fileIds a converging action settled this round — the plugin clears any stale
-   *  outstanding-conflict badge for these (a file that resolved automatically, e.g.
-   *  by adopting a peer's `supersedes` resolution, never re-enters the handler). */
-  converged: string[];
+  /** The subset of `deferred` that is an auto-deferred delete/binary *conflict*
+   *  (needs a manual sync), as opposed to F5 drift. The plugin tags these
+   *  `reason:'conflict'` in the observable state — the derived replacement for the
+   *  old hand-maintained outstanding-conflict set (sync v2 Step 7). */
+  deferredConflicts: string[];
 }
 
 export class ServerSyncClient {
@@ -214,7 +217,7 @@ export class ServerSyncClient {
     // rather than re-conflicting. Doing this after apply would let the
     // resolution be timestamped below the remote it resolves.
     this.hlc.setCurrent(merge.mergedHlc);
-    const { deferred, converged } = await this.host.applyMerge(merge.actions, local, remote);
+    const { deferred, deferredConflicts } = await this.host.applyMerge(merge.actions, local, remote);
 
     // ── 5. Advance the cursor past everything we consumed ────────────────────
     // Persist the *pull* cursor, not the append's headCursor: another device may
@@ -240,7 +243,7 @@ export class ServerSyncClient {
       pulled: pulled.length,
       deferred: [...deferred],
       stranded: [...missingContent],
-      converged: [...converged],
+      deferredConflicts: [...deferredConflicts],
     };
   }
 

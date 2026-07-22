@@ -17,7 +17,7 @@ import { DEFER_CONFLICT } from '../src/network/sync-applicator';
 import { SyncCoordinator } from '../src/network/sync-coordinator';
 import { TestDevice } from './helpers/test-device';
 
-const EMPTY_SUMMARY: SyncRoundSummary = { pushed: 0, pulled: 0, deferred: [], stranded: [], converged: [] };
+const EMPTY_SUMMARY: SyncRoundSummary = { pushed: 0, pulled: 0, deferred: [], stranded: [], deferredConflicts: [] };
 
 /** Build a coordinator over a real device stack with recording ports + a stubbed
  *  round. `order` captures the pre-sync capture sequence; `runRound` returns
@@ -74,7 +74,7 @@ describe('SyncCoordinator', () => {
 
   test('a happy round folds the summary into sync-state and clears any prior error', async () => {
     const id = 'fileX';
-    const h = await harness({ summary: { pushed: 2, pulled: 3, deferred: [id], stranded: ['hashY'], converged: [] } });
+    const h = await harness({ summary: { pushed: 2, pulled: 3, deferred: [id], stranded: ['hashY'], deferredConflicts: [] } });
     await h.syncState.setError('stale failure', 1); // a leftover error from a previous round
 
     await h.coordinator.sync('manual');
@@ -110,30 +110,29 @@ describe('SyncCoordinator', () => {
     expect(h.device.pendingOps.length).toBeGreaterThan(0); // un-pushed work survives
   });
 
-  test('a round that reports a converged file clears its stale outstanding-conflict badge', async () => {
-    // The reported bug: B skipped a conflict (recorded outstanding), then a later
-    // round adopted the peer's resolution automatically (a clean write_local, never
-    // re-entering decide*), leaving the badge stuck. The round now reports the file
-    // in `summary.converged`, and sync() clears it — while an unrelated skip stays.
-    const h = await harness({ summary: { pushed: 0, pulled: 1, deferred: [], stranded: [], converged: ['fResolved'] } });
-    await h.syncState.recordConflict({ fileId: 'fResolved', path: 'resolved.md', kind: 'content', firstSeen: 1 });
-    await h.syncState.recordConflict({ fileId: 'fOther', path: 'other.md', kind: 'content', firstSeen: 1 });
+  test('deferred conflicts are tagged reason:conflict and counted; drift is not (Step 7)', async () => {
+    // Step 7: no hand-maintained badge. A round's `deferredConflicts` (delete/binary
+    // auto-defers) are folded into the observable `deferred` list with reason
+    // 'conflict'; F5 drift lands as reason 'drift'. `deferredConflictCount()` — the
+    // derived count the plugin's badge reads — reflects only the conflicts, and a
+    // later round that no longer defers them clears the count with no clear/self-heal.
+    const h = await harness({
+      summary: { pushed: 0, pulled: 2, deferred: ['fConf', 'fDrift'], stranded: [], deferredConflicts: ['fConf'] },
+    });
 
     await h.coordinator.sync('manual');
 
-    const outstanding = h.syncState.get().outstandingConflicts;
-    expect(outstanding.map(c => c.fileId)).toEqual(['fOther']); // fResolved cleared, fOther kept
-    expect(h.syncState.get().lastSync?.conflicts).toBe(1);      // count reflects the clear
-  });
+    const deferred = h.syncState.get().deferred;
+    expect(deferred.find(d => d.fileId === 'fConf')!.reason).toBe('conflict');
+    expect(deferred.find(d => d.fileId === 'fDrift')!.reason).toBe('drift');
+    expect(h.coordinator.deferredConflictCount()).toBe(1);        // only the conflict
+    expect(h.syncState.get().lastSync?.conflicts).toBe(1);
 
-  test('clearAllOutstandingConflicts empties the badge set (Re-check self-heal)', async () => {
-    const h = await harness();
-    await h.syncState.recordConflict({ fileId: 'a', path: 'a.md', kind: 'content', firstSeen: 1 });
-    await h.syncState.recordConflict({ fileId: 'b', path: 'b.md', kind: 'content', firstSeen: 1 });
-    expect(h.syncState.get().outstandingConflicts).toHaveLength(2);
-
-    await h.coordinator.clearAllOutstandingConflicts();
-    expect(h.syncState.get().outstandingConflicts).toHaveLength(0);
+    // A subsequent round that defers nothing (the conflict resolved) replaces the
+    // list wholesale — the count drops to zero on its own, no bookkeeping.
+    h.runRound.mockResolvedValueOnce(EMPTY_SUMMARY);
+    await h.coordinator.sync('manual');
+    expect(h.coordinator.deferredConflictCount()).toBe(0);
   });
 
   test('auto delete conflict defers only for the ask strategy; a standing policy runs unattended', async () => {

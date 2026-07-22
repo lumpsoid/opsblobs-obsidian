@@ -59,17 +59,17 @@ export class SyncApplicator {
    *  · `deferred` — a destructive action was *skipped* because the file drifted on
    *    disk since the snapshot (F5) or an auto-round deferred a conflict (S5); the
    *    caller holds the cursor so those remote ops re-pull and re-merge next round.
-   *  · `converged` — a genuinely-converging local action was applied (write/move/
-   *    delete, or a resolved conflict), so the file is now in sync. The plugin uses
-   *    this to clear a stale "outstanding conflict" badge for a file that later
-   *    resolved automatically (e.g. fast-forwarding onto a peer's two-parent merge-node
-   *    resolution via a clean `write_local`, which never re-enters a conflict handler).
+   *  · `deferredConflicts` — the subset of `deferred` that is an auto-deferred
+   *    delete/binary *conflict* (needs a manual sync to resolve), as opposed to F5
+   *    drift (which retries automatically). The plugin tags these `reason:'conflict'`
+   *    in the observable state so the badge/status reflects them — the derived
+   *    replacement for the old hand-maintained outstanding-conflict set (Step 7).
    */
   async applyActions(
     actions: MergeAction[],
     localState: VaultState,
     remoteState: VaultState,
-  ): Promise<{ deferred: Set<string>; converged: Set<string> }> {
+  ): Promise<{ deferred: Set<string>; deferredConflicts: Set<string> }> {
     // Pause op logging while we apply sync changes (we don't want to re-log them)
     this.opLogger.stopListening();
 
@@ -81,12 +81,13 @@ export class SyncApplicator {
     // destructive action was skipped to keep the user's edit; recorded so we can
     // re-capture the edit as an op and hold the cursor for the skipped remote op.
     const deferred = new Set<string>();
-    // Files a converging action actually settled this round (see the doc above).
-    const converged = new Set<string>();
+    // The subset of `deferred` that is an auto-deferred delete/binary conflict
+    // (not F5 drift) — surfaced with reason 'conflict' by the plugin (Step 7).
+    const deferredConflicts = new Set<string>();
 
     try {
       for (const action of actions) {
-        const resolved = await this.applyAction(action, localState, remoteState, deferred, converged);
+        const resolved = await this.applyAction(action, localState, remoteState, deferred, deferredConflicts);
         if (resolved) resolutions.push(resolved);
       }
     } finally {
@@ -128,7 +129,7 @@ export class SyncApplicator {
       if (entry) await this.opLogger.recaptureLocalEdit(entry.path);
     }
 
-    return { deferred, converged };
+    return { deferred, deferredConflicts };
   }
 
   private async applyAction(
@@ -136,7 +137,7 @@ export class SyncApplicator {
     local: VaultState,
     remote: VaultState,
     deferred: Set<string>,
-    converged: Set<string>,
+    deferredConflicts: Set<string>,
   ): Promise<PendingResolution | null> {
     switch (action.type) {
       case 'write_local': {
@@ -176,7 +177,6 @@ export class SyncApplicator {
         if (currentPath !== action.path) {
           await this.files.trash(currentPath);
         }
-        converged.add(action.fileId);
         return null;
       }
 
@@ -210,7 +210,6 @@ export class SyncApplicator {
         if (currentPath !== action.path) {
           await this.files.trash(currentPath);
         }
-        converged.add(action.fileId);
         // Re-emit the merge node as a pending op (after clearOps) so it replicates.
         return { fileId: action.fileId, path: action.path, contentHash: hash, hlc: hlcTs, parents: action.parents, id };
       }
@@ -230,7 +229,6 @@ export class SyncApplicator {
         // stays stale after a synced rename, and the next reconcile reads it as a
         // delete of the old path + a create of the new one, losing file identity.
         await this.registry.updatePath(action.fromPath, action.toPath, this.hlc.now());
-        converged.add(action.fileId);
         return null;
 
       case 'delete_local':
@@ -243,7 +241,6 @@ export class SyncApplicator {
         // Tombstone in the registry so the propagated delete survives restarts
         // and isn't re-detected as a local creation on the next reconcile.
         await this.registry.markDeleted(action.path, this.hlc.now());
-        converged.add(action.fileId);
         return null;
 
       case 'conflict': {
@@ -269,18 +266,20 @@ export class SyncApplicator {
         await this.files.write(action.localPath, marked);
         await this.contentStore.put(hash, marked);
         // Record the file two-headed: the markers' hash + the two conflicting heads,
-        // so the resolving save re-emits `parents: [A, B]`. Not `converged` — the
-        // conflict is open until the user resolves it.
+        // so the resolving save re-emits `parents: [A, B]`. The file is now a derived
+        // two-headed conflict (Step 7) — the panel/badge pick it up from the registry;
+        // it is NOT deferred (the markers were written, the cursor advances).
         await this.registry.markConflicted(action.localPath, hash, this.hlc.now(), action.parents ?? []);
         return null;
       }
 
       case 'delete_conflict': {
         const decision = await this.onDeleteConflict(action);
-        // Auto-sync deferral (S5): apply nothing, hold the cursor for next round.
-        if (decision === DEFER_CONFLICT) { deferred.add(action.fileId); return null; }
+        // Auto-sync deferral (S5): apply nothing, hold the cursor for next round, and
+        // tag it a conflict so the plugin surfaces it (reason 'conflict') as needing a
+        // manual sync — the derived replacement for the old outstanding badge (Step 7).
+        if (decision === DEFER_CONFLICT) { deferred.add(action.fileId); deferredConflicts.add(action.fileId); return null; }
         // A real decision (restore or keep_deleted) settles the conflict below.
-        converged.add(action.fileId);
         // Timestamp the decision *now* so it dominates the delete/edit it reconciles
         // (runSync already advanced the clock past the merged HLC). It is re-emitted
         // as a two-parent merge node so a peer holding either side fast-forwards
@@ -311,9 +310,9 @@ export class SyncApplicator {
         // node — exactly like `delete_conflict`, so a peer still holding either side
         // fast-forwards onto the decision instead of re-prompting.
         const decision = await this.onBinaryConflict(action);
-        // Auto-sync deferral (S5): apply nothing, hold the cursor for next round.
-        if (decision === DEFER_CONFLICT) { deferred.add(action.fileId); return null; }
-        converged.add(action.fileId);
+        // Auto-sync deferral (S5): apply nothing, hold the cursor, tag it a conflict
+        // (reason 'conflict') so the plugin surfaces it as needing a manual sync (Step 7).
+        if (decision === DEFER_CONFLICT) { deferred.add(action.fileId); deferredConflicts.add(action.fileId); return null; }
         const keepLocal = decision === 'keep_local';
         const content = keepLocal ? action.localContent : action.remoteContent;
         const path = keepLocal ? action.localPath : action.remotePath;
