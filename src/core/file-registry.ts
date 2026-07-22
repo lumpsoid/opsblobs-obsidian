@@ -9,7 +9,7 @@
 import { FileEntry, HLC, SyncSettings } from '../types';
 import { MetadataStore } from '../ports/metadata-store';
 import { VaultFiles, VaultFileRef } from '../ports/vault-files';
-import { hlcCompare } from './hlc';
+import { hlcCompare, hlcToString } from './hlc';
 import { isExcluded } from './exclusion-policy';
 import { randomUuid } from './encoding';
 
@@ -72,6 +72,9 @@ export class FileRegistry {
       hlcTimestamp: hlc,
       deleted: false,
       ancestorContentHash: null,
+      // No synced version yet — the create op's id becomes the head via
+      // setHeadVersion once the OperationLogger has minted it.
+      headVersionId: null,
     };
     this.entries.set(id, entry);
     this.pathIndex.set(ref.path, id);
@@ -165,8 +168,28 @@ export class FileRegistry {
       deleted: false,
       ancestorContentHash: contentHash,
       ancestorPath: path,
+      // Adopting a remote version makes that version this file's head. The
+      // adopted op's id is `hlcToString(hlc)` (an op's id is the string form of
+      // its HLC), so the head is derivable from the hlc the applicator passes —
+      // covering a plain remote write, a fast-forward, and a conflict resolution.
+      headVersionId: hlcToString(hlc),
     });
     this.pathIndex.set(path, id);
+    await this.save();
+  }
+
+  /**
+   * Advance a file's head to `versionId` — the op-id of the content version it
+   * now points at (sync v2). Called by the OperationLogger right after it mints a
+   * content op (create/update/delete/resolution) with that op's id, so the next
+   * local edit descends from it. A `move` never calls this: a rename is not a new
+   * content version, so the head is unchanged. No-op if the file is unknown.
+   */
+  async setHeadVersion(fileId: string, versionId: string): Promise<void> {
+    const entry = this.entries.get(fileId);
+    if (!entry) return;
+    entry.headVersionId = versionId;
+    this.entries.set(fileId, entry);
     await this.save();
   }
 
@@ -204,6 +227,7 @@ export class FileRegistry {
           hlcTimestamp: hlc,
           deleted: false,
           ancestorContentHash: null,
+          headVersionId: null,   // set once its first op is minted
         };
         this.entries.set(id, entry);
         this.pathIndex.set(file.path, id);

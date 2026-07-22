@@ -25,6 +25,16 @@ export interface FileEntry {
   // A peer that still holds one of these hashes adopts this content cleanly
   // instead of re-prompting — the decision already weighed its version.
   supersedes?: string[];
+  // The version-id (op-id) of this file's current head — the content version a
+  // new local edit descends from, recorded as that edit's `parents` (sync v2).
+  // A version's identity is the op-id, NOT the content hash: content recurs
+  // (empty → "3" → empty), so a content-hash-keyed DAG cycles and breaks LCA;
+  // op-ids are HLC-unique so the DAG stays acyclic. Set whenever content changes
+  // (create/update/delete → the new op's id; adopting a remote version → that
+  // op's id). `null` until the file has a synced version. See
+  // docs/sync-v2-decisions.md §3. Optional for migration — a legacy entry
+  // without it reads as null (no known head ⇒ the merge falls back).
+  headVersionId?: string | null;
 }
 
 export type OperationType = 'create' | 'update' | 'delete' | 'move';

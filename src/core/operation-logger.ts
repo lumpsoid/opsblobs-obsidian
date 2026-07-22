@@ -102,7 +102,9 @@ export class OperationLogger {
 
       if (!entry) {
         const id = await this.registry.registerFile({ path }, hlcTs, hash);
-        this.pendingOps.push(Ops.create(id, path, hash, hlcTs));
+        const op = Ops.create(id, path, hash, hlcTs);
+        this.pendingOps.push(op);
+        await this.registry.setHeadVersion(id, op.id);
       } else {
         // A drifted hash means either a placeholder from an older op-less
         // reconcile ('') or an edit made while the plugin was off. Either way
@@ -112,11 +114,11 @@ export class OperationLogger {
         // both the placeholder sentinel and the update's causal base.
         const base = entry.contentHash;
         await this.registry.updateContentHash(path, hash, hlcTs);
-        this.pendingOps.push(
-          base === ''
-            ? Ops.create(entry.id, path, hash, hlcTs)
-            : Ops.update(entry.id, path, hash, hlcTs, base),
-        );
+        const op = base === ''
+          ? Ops.create(entry.id, path, hash, hlcTs)
+          : Ops.update(entry.id, path, hash, hlcTs, base);
+        this.pendingOps.push(op);
+        await this.registry.setHeadVersion(entry.id, op.id);
       }
       changed = true;
     }
@@ -153,7 +155,9 @@ export class OperationLogger {
         // its deletion is a local-only tombstone — emitting a delete op would leak
         // the '' sentinel and reference content no peer holds (audit G).
         if (entry.contentHash === '') continue;
-        this.pendingOps.push(Ops.delete(entry.id, entry.path, entry.contentHash, hlcTs, entry.contentHash));
+        const op = Ops.delete(entry.id, entry.path, entry.contentHash, hlcTs, entry.contentHash);
+        this.pendingOps.push(op);
+        await this.registry.setHeadVersion(entry.id, op.id);
         changed = true;
       }
     }
@@ -195,7 +199,9 @@ export class OperationLogger {
 
       if (!entry) {
         const id = await this.registry.registerFile({ path }, hlcTs, hash);
-        this.pendingOps.push(Ops.create(id, path, hash, hlcTs));
+        const op = Ops.create(id, path, hash, hlcTs);
+        this.pendingOps.push(op);
+        await this.registry.setHeadVersion(id, op.id);
       } else {
         // Capture whether this was a never-synced placeholder *before* correcting
         // the registry (updateContentHash mutates the entry object in place), so
@@ -206,11 +212,13 @@ export class OperationLogger {
         if (entry.contentHash !== hash) {
           await this.registry.updateContentHash(path, hash, hlcTs);
         }
-        this.pendingOps.push(
-          wasPlaceholder
-            ? Ops.create(entry.id, path, hash, hlcTs)
-            : Ops.update(entry.id, path, hash, hlcTs, base),
-        );
+        const op = wasPlaceholder
+          ? Ops.create(entry.id, path, hash, hlcTs)
+          : Ops.update(entry.id, path, hash, hlcTs, base);
+        this.pendingOps.push(op);
+        // A baseline re-asserts the head even when content was unchanged: the op
+        // is a fresh version and its id becomes this file's head.
+        await this.registry.setHeadVersion(entry.id, op.id);
       }
       changed = true;
     }
@@ -282,7 +290,9 @@ export class OperationLogger {
     const id = await this.registry.registerFile({ path }, hlcTs, hash);
     await this.contentStore.put(hash, content);
 
-    await this.recordOp(Ops.create(id, path, hash, hlcTs));
+    const op = Ops.create(id, path, hash, hlcTs);
+    await this.recordOp(op);
+    await this.registry.setHeadVersion(id, op.id);
   }
 
   private handleModify(path: string): void {
@@ -323,7 +333,9 @@ export class OperationLogger {
     await this.contentStore.put(hash, content);
     await this.registry.updateContentHash(path, hash, hlcTs);
 
-    await this.recordOp(Ops.update(entry.id, path, hash, hlcTs, base));
+    const op = Ops.update(entry.id, path, hash, hlcTs, base);
+    await this.recordOp(op);
+    await this.registry.setHeadVersion(entry.id, op.id);
   }
 
   private async handleDelete(path: string): Promise<void> {
@@ -348,7 +360,9 @@ export class OperationLogger {
       return;
     }
 
-    await this.recordOp(Ops.delete(entry.id, path, entry.contentHash, hlcTs, entry.contentHash));
+    const op = Ops.delete(entry.id, path, entry.contentHash, hlcTs, entry.contentHash);
+    await this.recordOp(op);
+    await this.registry.setHeadVersion(entry.id, op.id);
   }
 
   private async handleRename(path: string, oldPath: string): Promise<void> {
@@ -398,7 +412,9 @@ export class OperationLogger {
    * so the resolution wins last-writer-wins when peers pull it.
    */
   async recordResolvedUpdate(fileId: string, path: string, contentHash: string, hlcTs: HLC, supersedes: string[]): Promise<void> {
-    await this.recordOp(Ops.resolveUpdate(fileId, path, contentHash, hlcTs, supersedes));
+    const op = Ops.resolveUpdate(fileId, path, contentHash, hlcTs, supersedes);
+    await this.recordOp(op);
+    await this.registry.setHeadVersion(fileId, op.id);
   }
 
   /**
@@ -410,7 +426,9 @@ export class OperationLogger {
    * re-prompting. `contentHash` is the superseded (now-deleted) content.
    */
   async recordResolvedDelete(fileId: string, path: string, contentHash: string, hlcTs: HLC, supersedes: string[]): Promise<void> {
-    await this.recordOp(Ops.resolveDelete(fileId, path, contentHash, hlcTs, supersedes));
+    const op = Ops.resolveDelete(fileId, path, contentHash, hlcTs, supersedes);
+    await this.recordOp(op);
+    await this.registry.setHeadVersion(fileId, op.id);
   }
 
   private async recordOp(op: Operation): Promise<void> {
