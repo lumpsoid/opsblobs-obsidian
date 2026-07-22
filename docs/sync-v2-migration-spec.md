@@ -1,10 +1,67 @@
 # Sync v2 — Migration Spec
 
 Ordered, sequential steps to evolve the engine from the v1 scalar-ancestor model to
-the v2 content DAG described in `sync-v2-decisions.md`. Each step is a single
-coherent commit that leaves `npm run build` and `npx vitest run` **green** (tests
-may be intentionally updated within the step that changes their contract). No
-compatibility is preserved — there are no users and no 1.0.
+the **v2 commit DAG keyed by op-id** described in `sync-v2-decisions.md` (read that
+first — especially §3 "Version identity is the op-id, NOT the content hash"). Each
+step is a single coherent commit that leaves `npm run build` and `npx vitest run`
+**green** (tests may be intentionally updated within the step that changes their
+contract). No compatibility is preserved — there are no users and no 1.0.
+
+---
+
+## ⚑ Current status & context — READ THIS FIRST
+
+This section is the handoff for a fresh context. It states exactly what is on disk,
+what is sound, what needs rework, and the immediate next action.
+
+### The core decision (the pivot)
+
+A version's identity in the DAG is the **op-id** (`op.id`, an HLC string), NOT its
+content hash. Content recurs (`empty → "3" → empty`, undo, checkbox toggles), and a
+content-hash-keyed DAG then forms a **cycle** that breaks LCA and re-introduces the
+spurious-conflict bug we set out to kill. Op-ids are unique and HLC-monotonic, so
+the DAG is acyclic by construction (this is Git's `hash(tree+parents)` trick, using
+the op-id we already mint). **Content hash is kept only as the blob address.** See
+decisions §3 for the full rationale, the mobile argument (op-id keeps work
+`O(changes)`, not `O(vault)`), and why local pruning/collapsing is deferred and
+can never break a fresh device's convergence (the server op log is the source of
+truth; each device's DAG is a derived cache).
+
+### What is committed on `sync-robustness-fixes` (newest first)
+
+- `50dd790` feat: persist a content version-DAG — **Step 2a. Keyed by content hash
+  → must be reworked to op-id (see Rework R2 below).**
+- `b511e64` docs: refine Step 2 into 2a/2b.
+- `78de087` refactor: op `parents[]` replacing `baseContentHash` — **Step 1.
+  `parents` currently hold content hashes → must be reworked to version-ids (R1).**
+- `b6b3bed` docs: v2 decisions + this spec.
+- (earlier, unrelated to v2) `436ad7c` fast-forward sequential-edit fix (the
+  `baseContentHash`+FF shipped in v1; superseded by the DAG), `cca55a6` onload
+  gotcha, `628b5a7` cold-start phantom-delete fix.
+
+### What is sound vs. needs rework
+
+- **Sound / reusable as-is:** the `VersionDag` *structure* in `src/core/version-dag.ts`
+  (`addVersion` / `isAncestor` / `mergeBase` returning hash | `null` |
+  `MULTIPLE_BASES`) — it operates on opaque string keys, so it works unchanged over
+  op-ids. `src/network/version-dag-store.ts` persistence. The round-level
+  `recordVersionEdges` plumbing through `VaultSyncHost` / `PluginVaultSyncHost` /
+  `main.ts` / `TestDevice`.
+- **Needs rework (content-hash → op-id):** what gets fed into the DAG and the merge.
+  Today `Operation.parents` hold **content hashes** and `reconstructRemoteState`
+  maps `parents[0]` to the scalar `ancestorContentHash`. These must become
+  **version-ids** (op-ids), and the registry must gain a per-file `headVersionId`.
+
+### Immediate next actions (do these in order)
+
+1. **Rework R1** — make `parents` version-ids; add `headVersionId` to the registry.
+2. **Rework R2** — key the `VersionDag` population by version-id (op.id) not content
+   hash; carry `contentHash` as a node field for blob lookup.
+3. **Step 2b** — merge computes its base from the DAG (LCA over version-ids).
+4. Continue Steps 3–8 as written below.
+
+R1+R2 are detailed in "## Rework — op-id identity" immediately after Step 2. Do them
+before Step 2b. Everything is green today (198 tests); keep it green per step.
 
 ## Working rules
 
@@ -40,6 +97,9 @@ orchestrator:
 
 ## Step 1 — Op parent links (generalize `baseContentHash` → `parents`)
 
+> ✅ **Committed (`78de087`)** — but `parents` hold *content hashes*. **Reworked by
+> R1** to hold version-ids. Kept here for history; the live target is R1.
+
 **Goal:** every op carries its causal parents; no behavior change yet.
 
 **Changes**
@@ -70,6 +130,10 @@ and the behavior change (2b).
 
 ### Step 2a — Persisted version-DAG store (behavior-preserving)
 
+> ✅ **Committed (`50dd790`)** — but the DAG is keyed by *content hash*. **Reworked
+> by R2** to key by version-id (op-id) and carry `contentHash` as a node field. The
+> store/plumbing are reused as-is.
+
 **Changes**
 - New pure module `core/version-dag.ts`: an in-memory DAG of `contentHash →
   { parents: string[]; fileId: string }` with `addVersion(hash, parents, fileId)`
@@ -92,22 +156,87 @@ reload, and the full suite is still green. Nothing reads the DAG for merge yet.
 
 ### Step 2b — Merge computes the base from the DAG
 
+⚠️ Do the **Rework (R1, R2)** below *before* this — Step 2b as originally sketched
+merged over content-hash keys, which is unsound (see status section). The reworked
+Step 2b is folded into R2's "Done when".
+
+---
+
+## Rework — op-id identity (do BEFORE Step 2b)
+
+Steps 1 and 2a are committed but used **content-hash** as the version identity,
+which cycles on recurring content. Rework them to **op-id** identity. Keep the suite
+green (198 today) at each rework commit.
+
+### Rework R1 — `parents` are version-ids; registry tracks `headVersionId`
+
+**Concept.** A "version" is an op-id (`op.id`). An op's `parents` are the op-ids it
+descended from. Each file's registry entry records its current `headVersionId` — the
+version a new local edit will name as its parent.
+
 **Changes**
-- `merge/state-merge.ts`: `mergeVaultStates(local, remote, dag?)` — new optional
-  `dag` param (a `VersionDag`). In `resolveContentConflict`, when the DAG is present
-  use `dag.mergeBase(le.contentHash, re.contentHash)` for the three-way base and
-  `dag.isAncestor` for fast-forward (both directions). Fall back to the current
-  `ancestorContentHash`/single-parent behavior when the DAG is absent or lacks a
-  path (keeps old tests green until Step 3). A "multiple bases" sentinel → surface a
-  conflict (never guess).
-- Thread the DAG through the round: `server-sync.runSync` builds the union DAG (the
-  persisted store is already the union) and passes it to `mergeVaultStates`.
+- `core/file-registry.ts`: add `headVersionId: string | null` to `FileEntry`
+  (persisted). Set it whenever content changes: on create/update/delete the head
+  becomes the *new* op's id; on adopting a remote version (applicator `write_local`)
+  the head becomes the *remote* op's id; on a merge, the merge op's id. Add a
+  setter used by the logger + applicator.
+- `core/operations.ts` + `core/operation-logger.ts`: an op's `parents` become
+  `[entry.headVersionId]` (or `[]` if null / a create) — the *version-id* the edit
+  descended from, NOT the prior content hash. The pre-edit head is read from the
+  registry entry before the update mutates it.
+- `network/server-sync.ts` `reconstructRemoteState`: build each remote `FileEntry`
+  with `headVersionId = op.id` (the pulled op *is* that version) and keep
+  `op.parents` as its parent version-ids. (It currently maps `parents[0]` to
+  `ancestorContentHash` — that mapping is retired here; the scalar ancestor stays as
+  a dead field until Step 3, but nothing should read it after R2.)
+- Every op must be resolvable to its `contentHash` by id — the DAG node carries it
+  (R2), and `reconstructRemoteState` already has each op. The merge fetches bytes by
+  the base's `contentHash`.
 
-**Done when** FF and concurrent-conflict cases are driven by DAG
-reachability/LCA; `core.test.ts` and `concurrent-conflict-dataloss` pass via the
-DAG path. `ancestorContentHash` still exists but the merge no longer needs it.
+**Done when** ops carry parent *version-ids*, the registry persists `headVersionId`
+(survives `reload()`), and the suite is green. A focused test: author create→update,
+assert the update op's `parents === [createOpId]` and the entry's `headVersionId`
+tracks the latest op.
 
-**Commit:** `feat(merge): derive three-way base from the content DAG (LCA), not the scalar ancestor`
+**Commit:** `refactor(sync): version identity is the op-id; parents are version-ids`
+
+### Rework R2 — key the VersionDag by version-id (op-id)
+
+**Concept.** The DAG nodes are op-ids; each node stores its parents (op-ids), its
+`contentHash` (blob address), and `fileId`.
+
+**Changes**
+- `core/version-dag.ts`: node value becomes `{ parents: Set<string>; contentHash:
+  string; fileId: string }`. `addVersion(versionId, parents, contentHash, fileId)`.
+  Add `contentHashOf(versionId): string | undefined` (the merge needs the base's
+  bytes by hash). `isAncestor` / `mergeBase` are unchanged — they already treat keys
+  as opaque strings; they now range over version-ids. Update `version-dag.test.ts`
+  to use version-id keys + assert `contentHashOf`.
+- Populate from ops: `recordVersionEdges(ops)` records
+  `addVersion(op.id, op.parents, op.contentHash, op.fileId)`.
+- `network/version-dag-store.ts`: persist the extra `contentHash` field.
+- **Timing fix:** the round must record the current round's edges BEFORE the merge
+  (Step 2a records them after apply, which is fine while nothing reads the DAG; once
+  the merge reads it, `runSync` must call `recordVersionEdges([...local.pendingOps,
+  ...pulled])` *before* `mergeVaultStates` so this round's heads are in the DAG).
+
+**Done when (this also completes Step 2b):**
+- `merge/state-merge.ts`: `mergeVaultStates(local, remote, dag?)` takes the
+  `VersionDag`. In `resolveContentConflict`, use
+  `dag.mergeBase(le.headVersionId, re.headVersionId)` for the base and
+  `dag.isAncestor` for fast-forward (both directions); fetch base bytes via
+  `dag.contentHashOf(baseVersionId)` → the content store. `MULTIPLE_BASES` → surface
+  a conflict. Fall back to the old scalar path only when `dag` is absent (keeps
+  pure-`VaultState` unit tests in `core.test.ts` green until Step 3).
+- `runSync` passes the DAG to the merge (after recording this round's edges).
+- The reworked FF makes the reported `empty → "3" → empty` case converge with **no
+  conflict** via `id_3` being a clean ancestor of `id_empty2`; add/keep a two-device
+  test asserting it. `concurrent-conflict-dataloss` still surfaces a conflict (its
+  heads share an older base, not each other).
+
+**Commit:** `feat(merge): derive the three-way base from the op-id DAG (LCA)`
+
+---
 
 ## Step 3 — Retire `ancestor-policy` and `ancestorContentHash`
 

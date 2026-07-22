@@ -53,52 +53,126 @@ So a CRDT could only cover edits made inside an editor we instrument, and we'd
 **CRDT-for-content is the wrong tool for a sync plugin.** (Revisit only if we ever
 build real-time collaboration and are willing to own the editor for all edits.)
 
-## 3. The v2 model: a content-addressed commit DAG (a mini-Git for the vault)
+## 3. The v2 model: a commit DAG keyed by op-id (a mini-Git for the vault)
 
-Keep what already works — content addressing, an append-only op log, UUID file
-identity, an E2E-opaque server — and make the causal structure explicit.
+Keep what already works — an append-only op log, UUID file identity, content-
+addressed blobs, an E2E-opaque server — and make the causal structure explicit.
+
+### Version identity is the op-id, NOT the content hash (load-bearing)
+
+The one non-obvious decision, and the reason the first cut of Step 1/2a is being
+reworked. A causal DAG needs each version to have a **unique, stable identity**.
+The **content hash is the wrong identity** because content *recurs* — `empty → "3"
+→ empty` (your reported case), toggling a checkbox, an undo, reverting a line. Two
+edits that land on identical bytes share a content hash, so a content-hash-keyed
+DAG forms a **cycle**:
+
+```
+create ""      node ""  parents {}
+edit "" → "3"  node "3"  parents { "" }
+edit "3" → ""  node ""  parents { "3" }   ← "" gains a 2nd parent
+                ⇒  "" → "3" → "" …  a cycle → LCA breaks → spurious conflict
+```
+
+Git solved this: a commit's id is `hash(tree + parents)`, so the same tree at two
+points is two different commits and the graph is acyclic. We already have the
+primitive — **every op has a unique, HLC-ordered `id`** (`hlcToString(hlc)`). Use
+that as the version identity:
+
+- **Version node = op-id.** Globally unique; a parent always has a strictly lower
+  HLC than its child, so the DAG is **acyclic by construction** — no cycle-avoidance
+  hacks needed.
+- **`parents` = parent *version-ids* (op-ids)**, never content hashes.
+- **Content hash stays — but only as the blob address** (byte storage + dedup),
+  decoupled from causal identity. A DAG node carries its `contentHash` as a field;
+  the three-way merge fetches bytes by it.
+- **The registry tracks each file's current head version-id**, so a new edit's
+  parent is the head it descended from. Adopting a peer's version sets the head to
+  that peer's op-id; a merge sets it to the merge op-id.
+
+With op-ids the recurring-content case is `id_empty → id_3 → id_empty2` — three
+distinct nodes, `id_3` a clean ancestor of `id_empty2` → **fast-forward, no
+conflict**, and it generalizes to real multi-step LCA.
+
+Why op-id and not a git-style "commit at sync": op-id keeps all work **incremental
+and mobile-cheap** — one node per debounced edit (≈ one per "save"/button-click,
+never per keystroke), formed at edit time; sync just pushes ops that already exist.
+Cost is `O(changes since last sync)`, never `O(vault size)`. A commit-at-sync would
+hash the whole changeset at sync time — `O(vault)` work that would nag mobile on
+big vaults. (Corollary: persist the DAG **incrementally** — append edges — not by
+rewriting the whole file each round, so persistence stays `O(changes)` too.)
 
 ### The rules (this is the whole thing)
 
-1. **A version is its content hash.** (unchanged)
-2. **Every op names its parents** — the content hash(es) it was derived from:
+1. **A version = an op-id.** It carries a `contentHash` (blob address) and a
+   `fileId`.
+2. **Every op names its parents** — the version-id(s) it was derived from:
    - `create` → `parents: []` (a root)
-   - `update` (ordinary edit) → `parents: [prevHash]`
+   - `update` (ordinary edit) → `parents: [prevHeadVersionId]`
    - `merge` (auto or human-resolved) → `parents: [headA, headB]`
-   - `delete` → a tombstone version with `parents: [prevHash]`
-3. **The DAG is derived from the op log**, not separately persisted. Nodes =
-   content hashes, edges = parent links. Per `fileId`.
-4. **A "head" is a leaf** of that DAG (no child). One head = converged. Two heads
-   = divergence.
+   - `delete` → a tombstone version with `parents: [prevHeadVersionId]`
+3. **The DAG is persisted and accumulated** (per `fileId`): every op ever authored
+   or pulled contributes its `(versionId → parents, contentHash, fileId)` edge.
+   Version-ids/hashes are tiny, so it survives content GC.
+4. **A "head" is a leaf** (no child). One head = converged. Two heads = divergence.
+   The registry names the local head per file.
 5. **Merging two heads is pure and total:**
-   - `LCA(A, B)` over the parent DAG is the merge base `O`.
-   - `A` reachable from `B` (or vice versa) → **fast-forward**, take the
-     descendant. No new node.
-   - else three-way `(O, A, B)`:
-     - **clean** (no overlapping hunks) → deterministic merged bytes `M`; record a
-       merge version with `parents: [A, B]`.
+   - `LCA(A, B)` over the version-id DAG is the merge base `O`.
+   - `A` reachable from `B` (or vice versa) → **fast-forward**, take the descendant.
+   - else three-way over the *content* at `(O, A, B)`:
+     - **clean** (no overlapping hunks) → deterministic merged bytes; record a merge
+       version with `parents: [A, B]`.
      - **conflicting** → write diff3-marked bytes to the file (§5) and leave *both*
        heads open until a human save reconciles them.
+   - `LCA` returns **ambiguous (multiple incomparable bases)** → treat as a
+     conflict; never guess a base.
 
 Fast-forward, clean-merge, and conflict all **fall out of DAG topology**. There is
-no ancestor field and no advance policy to get wrong.
+no scalar ancestor field and no advance policy to get wrong.
 
 ### The one subtle rule: the determinism split
 
 For "convergence emerges without coordination" to hold:
 
-- **Clean merges are a deterministic function of `(O, A, B)`.** diff3 with stable
-  line-splitting and no overlapping hunks yields byte-identical output on every
-  device → identical hash → the *same* DAG node. Two devices that merge the same
-  pair concurrently produce the *same* content hash, so the merge node
-  **dedups by construction** — no proliferation, no merge-of-merges storm. Clean
-  merges need not even be shared; recording them is an optimization so late joiners
-  fast-forward instead of re-deriving.
+- **Clean merges are a deterministic function of `(O, A, B)` content.** diff3 with
+  stable line-splitting and no overlapping hunks yields byte-identical output on
+  every device → identical merged *content hash*. Recording the merge as a version
+  lets late joiners fast-forward instead of re-deriving. (Two devices that merge the
+  same pair mint different *op-ids* for the merge but identical *content*; they
+  reconcile on the next round by fast-forward, since each is a descendant of both
+  original heads — no storm.)
 - **Human conflict resolutions are NOT deterministic** and therefore **must be
   shared** — as a merge version with `parents: [A, B]`. Peers holding either head
   adopt it by plain fast-forward (it descends from both).
 
 This split is what v1 faked with `supersedes`. Making it structural is the point.
+
+### Convergence for a fresh device, and why pruning can't break it
+
+The **server op log is the source of truth**; each device's DAG is a *derived local
+cache*. A new device C (empty, or with its own untracked files) does **not** read
+any other device's DAG — it pulls the ops from the server and **builds its own DAG
+from what it pulled**, reconstructs the shared state, and its own files become
+`create` ops that merge in via create-collision handling. It lands in the same
+state as everyone else. This is exactly how onboarding works today; v2 keeps it.
+
+Therefore **local pruning/collapsing on one device is invisible to every other
+device** — it only trims that device's cache, never what the server serves.
+Consequently these are *optional space optimizations, deferred*, and correctness
+never depends on them:
+
+- **Default: keep the full local DAG.** No pruning, no collapsing, in the first cut.
+  Nodes are tiny; it is provably correct.
+- **Collapsing** (a burst of never-synced local edits points its parent straight at
+  the last *shared* version) is safe by construction — those intermediates never
+  reached the server, so no peer ever needed them. Add later.
+- **Pruning** old nodes must be gated on a **version-vector proving every device is
+  past the node** (causal stability), **never on wall-clock age** — age-based
+  pruning is what could strand a long-offline device. Add later, if measured.
+- The *only* thing that can break a late joiner is **server-side log compaction**
+  (dropping old ops/blobs). Keep the full server log for now; if we ever compact,
+  add periodic **snapshots/baselines** so C starts from a checkpoint + recent ops.
+  Deferred, off the critical path.
 
 ## 4. Conflict UX — the part that must not become a maintenance burden
 
@@ -139,7 +213,9 @@ resolution by the same editing the user already does.
 
 - `merge/ancestor-policy.ts` and its test — the merge base is computed, not tracked.
 - `FileEntry.ancestorContentHash` / `ancestorPath` — replaced by op parent links
-  (and a small path-history for rename-vs-delete).
+  (version-ids) plus a per-file **`headVersionId`** on the registry entry (the
+  current head the next edit descends from) and a small path-history for
+  rename-vs-delete.
 - `Operation.supersedes` and every `supersedes` shortcut in `state-merge` —
   replaced by two-parent merge nodes.
 - The outstanding-conflict lifecycle in `SyncStateStore` / `SyncCoordinator`
