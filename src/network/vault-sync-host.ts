@@ -18,6 +18,7 @@ import { SyncApplicator } from './sync-applicator';
 import { HybridLogicalClock } from '../core/hlc';
 import { CursorStore } from './cursor-store';
 import { VersionDagStore } from './version-dag-store';
+import { VersionDag } from '../core/version-dag';
 
 export class PluginVaultSyncHost implements VaultSyncHost {
   constructor(
@@ -85,11 +86,18 @@ export class PluginVaultSyncHost implements VaultSyncHost {
     await this.opLogger.clearOps();
   }
 
-  async recordVersionEdges(ops: Operation[]): Promise<void> {
-    if (ops.length === 0) return;
+  async recordVersionEdges(ops: Operation[]): Promise<VersionDag> {
     const dag = await this.versionDagStore.load();
-    for (const op of ops) dag.addVersion(op.contentHash, op.parents, op.fileId);
+    if (ops.length === 0) return dag;
+    // Key by op-id (the version identity), carrying the content hash as the blob
+    // address. A `move` carries no content parent and is not a new content version;
+    // recording it is harmless (a childless node) but adds nothing, so skip it.
+    for (const op of ops) {
+      if (op.type === 'move') continue;
+      dag.addVersion(op.id, op.parents, op.contentHash, op.fileId);
+    }
     await this.versionDagStore.save(dag);
+    return dag;
   }
 
   loadCursor(): Promise<number> {

@@ -151,6 +151,41 @@ describe('empty files, truncation guard, and exclusions', () => {
     expect(A.applied.some(a => a.type === 'conflict')).toBe(false);
   });
 
+  // ── Genuine concurrency (NOT fast-forward): the op-id DAG's LCA is the base. ─
+  //  Both devices edit DIFFERENT, non-overlapping lines of a shared base. Neither
+  //  head is an ancestor of the other, so this is a real three-way merge — its base
+  //  must be the common ancestor found by LCA over the op-id DAG, which yields a
+  //  clean union of the two disjoint edits (no conflict), converging both devices.
+  test('concurrent non-overlapping edits clean-merge via the DAG-derived base', async () => {
+    const api = new FakeSyncServer();
+    const [A, B] = await pair(api);
+
+    // Shared base "l1\nl2\nl3", both devices hold it.
+    await A.seedFile('doc.md', 'l1\nl2\nl3\n', 1000);
+    await client(api, A).runSync();
+    await client(api, B).runSync();
+    expect(await text(B, 'doc.md')).toBe('l1\nl2\nl3\n');
+
+    // A edits the first line; B concurrently edits the last line (disjoint hunks).
+    await A.editFile('doc.md', 'A1\nl2\nl3\n', 2000);
+    await client(api, A).runSync();
+
+    await B.editFile('doc.md', 'l1\nl2\nB3\n', 3000);
+    await client(api, B).runSync();
+
+    // A pulls B's concurrent edit: neither is a fast-forward, so the merge computes
+    // the base = LCA(A's head, B's head) = the shared "l1\nl2\nl3" and cleanly unions
+    // the two disjoint changes. No conflict; A's own edit is preserved.
+    A.applied.length = 0;
+    await client(api, A).runSync();
+    expect(A.applied.some(a => a.type === 'conflict')).toBe(false);
+    expect(await text(A, 'doc.md')).toBe('A1\nl2\nB3\n');
+
+    // B pulls A's edit and converges on the same clean merge (deterministic).
+    await client(api, B).runSync();
+    expect(await text(B, 'doc.md')).toBe('A1\nl2\nB3\n');
+  });
+
   // ── G12: the REAL truncation protection lives in state-merge, not a blanket
   //    applicator refusal. When the HLC-winning side's bytes are genuinely missing,
   //    the merge returns no_op — it NEVER emits a truncating empty write_local — so

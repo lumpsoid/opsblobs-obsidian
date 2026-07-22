@@ -18,6 +18,7 @@ import { VaultState, FileEntry, MergeAction, Operation, HLC } from '../types';
 import { HybridLogicalClock } from '../core/hlc';
 import { hlcCompare } from '../core/hlc';
 import { mergeVaultStates } from '../merge/state-merge';
+import { VersionDag } from '../core/version-dag';
 import { VaultCrypto } from './encryption';
 
 // ─── Wire records (server-facing; all ciphertext/hashes, no plaintext) ──────────
@@ -102,10 +103,12 @@ export interface VaultSyncHost {
   loadCursor(): Promise<number>;
   saveCursor(cursor: number): Promise<void>;
   /** Record the causal parent edges of these ops into the persisted version-DAG
-   *  (sync v2): each op contributes `contentHash → parents` under its `fileId`, so
-   *  a later round can compute LCA merge bases from structure. Behaviour-inert in
-   *  itself — nothing reads the DAG for merging yet (Step 2b). */
-  recordVersionEdges(ops: Operation[]): Promise<void>;
+   *  (sync v2): each op contributes `op.id → parents` (with its `contentHash` and
+   *  `fileId`), keyed by op-id. Returns the updated in-memory DAG so the round can
+   *  hand it to the merge, which derives the three-way base (LCA) and fast-forward
+   *  from it. Called with this round's local + pulled ops BEFORE the merge, so both
+   *  heads are present when the merge reads the graph. */
+  recordVersionEdges(ops: Operation[]): Promise<VersionDag>;
 }
 
 export interface ServerSyncOptions {
@@ -196,8 +199,15 @@ export class ServerSyncClient {
     }
 
     // ── 4. Merge remote into local and apply ─────────────────────────────────
+    // Record this round's causal edges into the op-id DAG FIRST — both our authored
+    // ops (the snapshot taken before clearPendingOps) and the ops we pulled — so the
+    // merge sees both this round's heads (local's and remote's) and can derive the
+    // three-way base (LCA) and fast-forward from graph structure. The returned DAG
+    // is handed to the merge.
+    const dag = await this.host.recordVersionEdges([...local.pendingOps, ...pulled.map(p => p.op)]);
+
     this.onProgress?.('Merging…');
-    const merge = mergeVaultStates(local, remote);
+    const merge = mergeVaultStates(local, remote, dag);
     // Advance the clock past the merged HLC *before* applying: a user-resolved
     // conflict mints an op inside applyMerge, and it must dominate the remote
     // content it supersedes so peers accept the resolution (last-writer-wins)
@@ -205,11 +215,6 @@ export class ServerSyncClient {
     // resolution be timestamped below the remote it resolves.
     this.hlc.setCurrent(merge.mergedHlc);
     const { deferred, converged } = await this.host.applyMerge(merge.actions, local, remote);
-
-    // Record causal edges for the content DAG (sync v2): both our authored ops
-    // (the snapshot taken before clearPendingOps) and the ops we pulled contribute
-    // `contentHash → parents`. Nothing reads the DAG for merging yet (Step 2b).
-    await this.host.recordVersionEdges([...local.pendingOps, ...pulled.map(p => p.op)]);
 
     // ── 5. Advance the cursor past everything we consumed ────────────────────
     // Persist the *pull* cursor, not the append's headCursor: another device may
@@ -435,14 +440,15 @@ export function reconstructRemoteState(ops: Operation[], ownDeviceId?: string): 
       contentHash: op.contentHash,
       hlcTimestamp: op.hlcTimestamp,
       deleted: op.type === 'delete',
-      // The op carries the content it was edited from as its causal parent(s);
-      // surface the sole parent as the remote entry's ancestor so the merge can
-      // reconstruct the true common base and fast-forward a sequential edit
-      // (state-merge) instead of three-way-merging against the local device's
-      // stale ancestor. A root op (no parents) leaves this null — the merge falls
-      // back to prior behaviour. (Step 2 will compute the base from the full DAG.)
-      ancestorContentHash: op.parents[0] ?? null,
+      // The pulled op IS this remote version, so its op-id is the remote head the
+      // merge reconstructs the DAG from (its parents are the parent version-ids,
+      // carried on the op itself). The merge derives the true three-way base (LCA)
+      // and the fast-forward from `headVersionId` over the op-id DAG. The scalar
+      // ancestor is retired for remote entries — nothing reads it on the remote
+      // side anymore (the DAG replaces it); left null until Step 3 removes it.
+      ancestorContentHash: null,
       ancestorPath: null,
+      headVersionId: op.id,
       // Carry a resolution op's superseded sides so a peer still holding one of
       // them adopts the resolution rather than re-conflicting (state-merge).
       supersedes: op.supersedes,

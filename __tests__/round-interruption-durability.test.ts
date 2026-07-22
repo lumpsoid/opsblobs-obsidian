@@ -29,6 +29,7 @@ import {
 import { FakeSyncServer } from '../src/network/fake-server';
 import { VaultCrypto } from '../src/network/encryption';
 import { VaultState, MergeAction, Operation } from '../src/types';
+import { VersionDag } from '../src/core/version-dag';
 import { TestDevice } from './helpers/test-device';
 
 const SALT = new Uint8Array([9, 9, 9, 9, 9, 9, 9, 9, 8, 8, 8, 8, 8, 8, 8, 8]);
@@ -53,7 +54,7 @@ class CrashOnFirstClearHost implements VaultSyncHost {
   }
   loadCursor(): Promise<number> { return this.inner.loadCursor(); }
   saveCursor(c: number): Promise<void> { return this.inner.saveCursor(c); }
-  recordVersionEdges(ops: Operation[]): Promise<void> { return this.inner.recordVersionEdges(ops); }
+  recordVersionEdges(ops: Operation[]): Promise<VersionDag> { return this.inner.recordVersionEdges(ops); }
 }
 
 /**

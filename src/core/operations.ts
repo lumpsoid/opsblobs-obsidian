@@ -32,32 +32,36 @@ function stamp(fields: Omit<Operation, 'v' | 'id'>): Operation {
 export const Ops = {
   /** A file first seen by sync. `contentHash` is the SHA-256 of the new bytes;
    *  its blob is uploaded alongside the op. A create is a DAG root, so it has no
-   *  parents. */
+   *  parents. This op's id becomes the file's first head version. */
   create(fileId: string, path: string, contentHash: string, hlc: HLC): Operation {
     return stamp({ hlcTimestamp: hlc, fileId, type: 'create', path, contentHash, parents: [] });
   },
 
-  /** An edit to a tracked file. `contentHash` is the post-edit content; `base` is
-   *  the content it was derived from (the pre-edit hash) and becomes the op's sole
-   *  parent, so a peer can reconstruct the content DAG and compute the true
-   *  three-way base. Omit only when the base is genuinely unknown (⇒ a root). */
-  update(fileId: string, path: string, contentHash: string, hlc: HLC, base?: string): Operation {
-    return stamp({ hlcTimestamp: hlc, fileId, type: 'update', path, contentHash, parents: base ? [base] : [] });
+  /** An edit to a tracked file. `contentHash` is the post-edit content;
+   *  `parentVersion` is the version-id (op-id) the edit descended from — the file's
+   *  head at edit time — and becomes the op's sole causal parent, so a peer can
+   *  reconstruct the op-id DAG and compute the true three-way base (LCA). Omit only
+   *  when the head is genuinely unknown (⇒ a root). NB: the parent is a version-id,
+   *  NOT the prior content hash — content recurs, so a content-hash DAG would cycle
+   *  (docs/sync-v2-decisions.md §3). */
+  update(fileId: string, path: string, contentHash: string, hlc: HLC, parentVersion?: string): Operation {
+    return stamp({ hlcTimestamp: hlc, fileId, type: 'update', path, contentHash, parents: parentVersion ? [parentVersion] : [] });
   },
 
   /** A tracked file removed. `contentHash` is the now-deleted content — no blob
    *  is uploaded for a delete; the hash only lets a peer match the tombstone to
-   *  bytes it may still hold. `base` (the content the deletion was made against)
-   *  becomes the tombstone version's parent, for the same DAG reason as
+   *  bytes it may still hold. `parentVersion` (the head the deletion was made
+   *  against) becomes the tombstone version's parent, for the same DAG reason as
    *  {@link update}. */
-  delete(fileId: string, path: string, contentHash: string, hlc: HLC, base?: string): Operation {
-    return stamp({ hlcTimestamp: hlc, fileId, type: 'delete', path, contentHash, parents: base ? [base] : [] });
+  delete(fileId: string, path: string, contentHash: string, hlc: HLC, parentVersion?: string): Operation {
+    return stamp({ hlcTimestamp: hlc, fileId, type: 'delete', path, contentHash, parents: parentVersion ? [parentVersion] : [] });
   },
 
   /** A rename. Content is unchanged, so `contentHash` is the same as before; the
    *  move is just a new `path` for the same `fileId` (identity is the UUID, so
    *  the projection needs no from-path). Content is unchanged, so the move carries
-   *  no content parent (it is not a new content version). */
+   *  no content parent (it is not a new content version) and never advances the
+   *  file's head. */
   move(fileId: string, path: string, contentHash: string, hlc: HLC): Operation {
     return stamp({ hlcTimestamp: hlc, fileId, type: 'move', path, contentHash, parents: [] });
   },

@@ -1,11 +1,12 @@
 // ─────────────────────────────────────────────
-//  Tests — Version DAG (sync v2, Step 2a)
+//  Tests — Version DAG (sync v2)
 // ─────────────────────────────────────────────
 //
-//  The pure content DAG (isAncestor / mergeBase / persistence), plus a round-level
-//  check that edges accumulate into the persisted store and survive a reload. The
-//  DAG is not yet read for merging (Step 2b), so these assert structure, not merge
-//  behaviour.
+//  The pure content DAG (isAncestor / mergeBase / contentHashOf / persistence),
+//  plus a round-level check that edges accumulate into the persisted store keyed
+//  by op-id and survive a reload. Nodes are keyed by VERSION-ID (op-id), not the
+//  content hash — content recurs, so a content-hash graph would cycle and break
+//  LCA. Each node carries its `contentHash` as the blob address for the merge.
 
 import { describe, test, expect, beforeAll } from 'vitest';
 import { VersionDag, MULTIPLE_BASES } from '../src/core/version-dag';
@@ -17,9 +18,9 @@ import { TestDevice } from './helpers/test-device';
 describe('VersionDag (pure structure)', () => {
   test('linear chain: isAncestor and mergeBase', () => {
     const dag = new VersionDag();
-    dag.addVersion('A', [], 'f1');
-    dag.addVersion('B', ['A'], 'f1');
-    dag.addVersion('C', ['B'], 'f1');
+    dag.addVersion('A', [], 'hA', 'f1');
+    dag.addVersion('B', ['A'], 'hB', 'f1');
+    dag.addVersion('C', ['B'], 'hC', 'f1');
 
     expect(dag.isAncestor('A', 'C')).toBe(true);
     expect(dag.isAncestor('C', 'A')).toBe(false);
@@ -27,31 +28,48 @@ describe('VersionDag (pure structure)', () => {
     // A head that IS an ancestor of the other → the ancestor is the base (FF).
     expect(dag.mergeBase('A', 'C')).toBe('A');
     expect(dag.mergeBase('C', 'A')).toBe('A');        // order-independent
+    // The node carries its content hash (the blob address the merge reads).
+    expect(dag.contentHashOf('B')).toBe('hB');
+    expect(dag.contentHashOf('nope')).toBeUndefined();
   });
 
   test('fork: two children of one base → mergeBase is the base', () => {
     const dag = new VersionDag();
-    dag.addVersion('O', [], 'f1');
-    dag.addVersion('X', ['O'], 'f1');   // device A edited O → X
-    dag.addVersion('Y', ['O'], 'f1');   // device B edited O → Y (concurrent)
+    dag.addVersion('O', [], 'hO', 'f1');
+    dag.addVersion('X', ['O'], 'hX', 'f1');   // device A edited O → X
+    dag.addVersion('Y', ['O'], 'hY', 'f1');   // device B edited O → Y (concurrent)
     expect(dag.mergeBase('X', 'Y')).toBe('O');
     expect(dag.isAncestor('X', 'Y')).toBe(false);
     expect(dag.isAncestor('Y', 'X')).toBe(false);
   });
 
+  test('recurring content does NOT cycle (op-id identity): empty → 3 → empty', () => {
+    // The reported case. Content recurs (hEmpty appears twice) but the op-ids are
+    // distinct, so id_e2 is a clean DESCENDANT of id_3 — a fast-forward, not a
+    // cycle. A content-hash-keyed DAG would instead make hEmpty its own ancestor.
+    const dag = new VersionDag();
+    dag.addVersion('id_e1', [], 'hEmpty', 'f1');
+    dag.addVersion('id_3', ['id_e1'], 'h3', 'f1');
+    dag.addVersion('id_e2', ['id_3'], 'hEmpty', 'f1');   // same bytes as id_e1
+    expect(dag.isAncestor('id_3', 'id_e2')).toBe(true);  // clean FF, no cycle
+    expect(dag.isAncestor('id_e2', 'id_3')).toBe(false);
+    expect(dag.mergeBase('id_3', 'id_e2')).toBe('id_3'); // FF base is id_3
+    expect(dag.contentHashOf('id_e2')).toBe('hEmpty');
+  });
+
   test('unrelated versions share no ancestor → null', () => {
     const dag = new VersionDag();
-    dag.addVersion('A', [], 'f1');
-    dag.addVersion('B', [], 'f2');
+    dag.addVersion('A', [], 'hA', 'f1');
+    dag.addVersion('B', [], 'hB', 'f2');
     expect(dag.mergeBase('A', 'B')).toBeNull();
   });
 
   test('diamond (merge node with two parents): reachability and base', () => {
     const dag = new VersionDag();
-    dag.addVersion('O', [], 'f1');
-    dag.addVersion('X', ['O'], 'f1');
-    dag.addVersion('Y', ['O'], 'f1');
-    dag.addVersion('M', ['X', 'Y'], 'f1');   // reconciled both heads
+    dag.addVersion('O', [], 'hO', 'f1');
+    dag.addVersion('X', ['O'], 'hX', 'f1');
+    dag.addVersion('Y', ['O'], 'hY', 'f1');
+    dag.addVersion('M', ['X', 'Y'], 'hM', 'f1');   // reconciled both heads
     expect(dag.isAncestor('X', 'M')).toBe(true);
     expect(dag.isAncestor('Y', 'M')).toBe(true);
     expect(dag.isAncestor('O', 'M')).toBe(true);
@@ -61,41 +79,51 @@ describe('VersionDag (pure structure)', () => {
 
   test('criss-cross: two incomparable common ancestors → MULTIPLE', () => {
     const dag = new VersionDag();
-    dag.addVersion('P', [], 'f1');
-    dag.addVersion('Q', [], 'f1');
+    dag.addVersion('P', [], 'hP', 'f1');
+    dag.addVersion('Q', [], 'hQ', 'f1');
     // Two heads that each descend from BOTH P and Q, with no single LCA.
-    dag.addVersion('L', ['P', 'Q'], 'f1');
-    dag.addVersion('R', ['P', 'Q'], 'f1');
+    dag.addVersion('L', ['P', 'Q'], 'hL', 'f1');
+    dag.addVersion('R', ['P', 'Q'], 'hR', 'f1');
     expect(dag.mergeBase('L', 'R')).toBe(MULTIPLE_BASES);
   });
 
   test('cycle-safety: a back-edge does not hang', () => {
     const dag = new VersionDag();
-    dag.addVersion('A', ['B'], 'f1');
-    dag.addVersion('B', ['A'], 'f1');   // pathological cycle
+    dag.addVersion('A', ['B'], 'hA', 'f1');
+    dag.addVersion('B', ['A'], 'hB', 'f1');   // pathological cycle
     expect(dag.isAncestor('A', 'B')).toBe(true);
     expect(() => dag.mergeBase('A', 'B')).not.toThrow();
   });
 
   test('addVersion is idempotent and unions parents; ignores self-parent', () => {
     const dag = new VersionDag();
-    dag.addVersion('M', ['X'], 'f1');
-    dag.addVersion('M', ['Y'], 'f1');   // second parent learned later
-    dag.addVersion('M', ['M'], 'f1');   // self-parent ignored
+    dag.addVersion('M', ['X'], 'hM', 'f1');
+    dag.addVersion('M', ['Y'], 'hM', 'f1');   // second parent learned later
+    dag.addVersion('M', ['M'], 'hM', 'f1');   // self-parent ignored
     expect(dag.isAncestor('X', 'M')).toBe(true);
     expect(dag.isAncestor('Y', 'M')).toBe(true);
     expect(dag.isAncestor('M', 'M')).toBe(true);
   });
 
-  test('JSON round-trip preserves the graph', () => {
+  test('a parent-only stub backfills its content hash when its own edge arrives', () => {
     const dag = new VersionDag();
-    dag.addVersion('O', [], 'f1');
-    dag.addVersion('X', ['O'], 'f1');
-    dag.addVersion('M', ['X', 'O'], 'f1');
+    dag.addVersion('child', ['parent'], 'hChild', 'f1'); // 'parent' referenced, no hash yet
+    expect(dag.contentHashOf('parent')).toBeUndefined();
+    dag.addVersion('parent', [], 'hParent', 'f1');       // its real edge arrives
+    expect(dag.contentHashOf('parent')).toBe('hParent');
+    expect(dag.isAncestor('parent', 'child')).toBe(true);
+  });
+
+  test('JSON round-trip preserves the graph and content hashes', () => {
+    const dag = new VersionDag();
+    dag.addVersion('O', [], 'hO', 'f1');
+    dag.addVersion('X', ['O'], 'hX', 'f1');
+    dag.addVersion('M', ['X', 'O'], 'hM', 'f1');
     const restored = VersionDag.fromJSON(JSON.parse(JSON.stringify(dag.toJSON())));
     expect(restored.isAncestor('O', 'M')).toBe(true);
     expect(restored.isAncestor('X', 'M')).toBe(true);
     expect(restored.mergeBase('X', 'O')).toBe('O');
+    expect(restored.contentHashOf('X')).toBe('hX');
   });
 
   test('fromJSON tolerates a malformed blob', () => {
@@ -105,7 +133,7 @@ describe('VersionDag (pure structure)', () => {
   });
 });
 
-describe('version-DAG accumulation across a round (Step 2a wiring)', () => {
+describe('version-DAG accumulation across a round (keyed by op-id)', () => {
   const SALT = new Uint8Array([9, 9, 9, 9, 9, 9, 9, 9, 8, 8, 8, 8, 8, 8, 8, 8]);
   let vc: VaultCrypto;
   beforeAll(async () => {
@@ -115,27 +143,33 @@ describe('version-DAG accumulation across a round (Step 2a wiring)', () => {
   const client = (api: FakeSyncServer, d: TestDevice) =>
     new ServerSyncClient({ api, crypto: vc, host: d.host, hlc: d.hlc });
 
-  test('a round records authored edges into the persisted DAG, surviving reload', async () => {
+  test('a round records authored edges keyed by op-id, surviving reload', async () => {
     const api = new FakeSyncServer();
     const A = await TestDevice.create('dev-a');
 
     const id = await A.seedFile('n.md', 'hello\n', 1000);
-    const created = A.entry(id)!.contentHash;
-    await client(api, A).runSync();                  // pushes create; records its edge
+    const createVersion = A.entry(id)!.headVersionId!;   // the create op's id
+    const createdHash = A.entry(id)!.contentHash;
+    await client(api, A).runSync();                       // pushes create; records its edge
 
-    // Edit → a real parent edge (newHash's parent is the created hash).
+    // Edit → a real parent edge (the update op's parent is the create op-id).
     await A.editFile('n.md', 'world\n', 2000);
-    const edited = A.entry(id)!.contentHash;
+    const editVersion = A.entry(id)!.headVersionId!;      // the update op's id
+    const editedHash = A.entry(id)!.contentHash;
     await client(api, A).runSync();
 
     const dag = await A.versionDagStore.load();
-    expect(dag.has(created)).toBe(true);
-    expect(dag.has(edited)).toBe(true);
-    expect(dag.isAncestor(created, edited)).toBe(true);   // the update recorded its base
+    expect(dag.has(createVersion)).toBe(true);
+    expect(dag.has(editVersion)).toBe(true);
+    expect(dag.isAncestor(createVersion, editVersion)).toBe(true);   // the update recorded its base
+    // Each node carries its content hash (the blob address the merge reads).
+    expect(dag.contentHashOf(createVersion)).toBe(createdHash);
+    expect(dag.contentHashOf(editVersion)).toBe(editedHash);
 
     // The graph is durable across a plugin restart.
     const A2 = await A.reload();
     const dag2 = await A2.versionDagStore.load();
-    expect(dag2.isAncestor(created, edited)).toBe(true);
+    expect(dag2.isAncestor(createVersion, editVersion)).toBe(true);
+    expect(dag2.contentHashOf(editVersion)).toBe(editedHash);
   });
 });

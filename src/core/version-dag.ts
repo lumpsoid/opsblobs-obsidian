@@ -3,14 +3,27 @@
 // ─────────────────────────────────────────────
 //
 //  Pure, obsidian-free. Records the causal parent links of every content version
-//  this device has authored or pulled (contentHash → parent content hashes, per
-//  fileId), so the merge can compute the true three-way base (LCA) from structure
-//  rather than a locally-tracked scalar ancestor — which cannot testify to what a
-//  peer's edit was based on. Parent links are tiny (hashes), so this graph is kept
-//  even after the content-store GCs the bytes. See docs/sync-v2-decisions.md.
+//  this device has authored or pulled (versionId → parent versionIds, per fileId),
+//  so the merge can compute the true three-way base (LCA) from structure rather
+//  than a locally-tracked scalar ancestor — which cannot testify to what a peer's
+//  edit was based on.
+//
+//  A version's identity is the OP-ID (`op.id`, an HLC string), NOT its content
+//  hash: content recurs (empty → "3" → empty, undo, a checkbox toggle), and a
+//  content-hash-keyed DAG then forms a CYCLE that breaks LCA and re-introduces the
+//  spurious-conflict bug. Op-ids are unique and HLC-monotonic (a parent's HLC is
+//  strictly below its child's), so the DAG is acyclic by construction — Git's
+//  hash(tree+parents) trick, using the op-id we already mint. The content hash is
+//  kept only as the blob address: each node carries its `contentHash` so the
+//  three-way merge can fetch the base's bytes. Nodes are tiny (ids + a hash), so
+//  the graph is retained even after the content-store GCs the bytes. See
+//  docs/sync-v2-decisions.md §3.
 
 export interface VersionNode {
   parents: Set<string>;
+  /** The blob address of this version's content — decoupled from causal identity
+   *  (which is the op-id key). The merge fetches the base's bytes by this. */
+  contentHash: string;
   fileId: string;
 }
 
@@ -24,24 +37,39 @@ export class VersionDag {
   private nodes = new Map<string, VersionNode>();
 
   /**
-   * Record a version and its causal parents. Idempotent — re-recording the same
-   * hash unions the parent set (so seeing an op twice, or a merge node's second
-   * parent later, never loses an edge). A self-parent (`parent === hash`) is
-   * ignored defensively so a malformed op can't create a 1-cycle.
+   * Record a version (keyed by its op-id `versionId`) and its causal parents (the
+   * parent version-ids). Idempotent — re-recording the same version unions the
+   * parent set (so seeing an op twice, or a merge node's second parent learned
+   * later, never loses an edge) and fills in a `contentHash`/`fileId` that a
+   * parent-only stub recorded earlier may still be missing. A self-parent
+   * (`parent === versionId`) is ignored defensively so a malformed op can't create
+   * a 1-cycle (though op-ids are HLC-monotonic, so this can't arise in practice).
    */
-  addVersion(hash: string, parents: string[], fileId: string): void {
-    let node = this.nodes.get(hash);
+  addVersion(versionId: string, parents: string[], contentHash: string, fileId: string): void {
+    let node = this.nodes.get(versionId);
     if (!node) {
-      node = { parents: new Set<string>(), fileId };
-      this.nodes.set(hash, node);
+      node = { parents: new Set<string>(), contentHash, fileId };
+      this.nodes.set(versionId, node);
+    } else {
+      // A node may have been created as a parent reference before its own edge was
+      // recorded; backfill its blob address / fileId once the real op arrives.
+      if (!node.contentHash && contentHash) node.contentHash = contentHash;
+      if (!node.fileId && fileId) node.fileId = fileId;
     }
     for (const p of parents) {
-      if (p !== hash) node.parents.add(p);
+      if (p !== versionId) node.parents.add(p);
     }
   }
 
-  has(hash: string): boolean {
-    return this.nodes.has(hash);
+  has(versionId: string): boolean {
+    return this.nodes.has(versionId);
+  }
+
+  /** The content hash (blob address) of a version, or `undefined` if unknown —
+   *  the merge fetches the three-way base's bytes by this. A version present only
+   *  as an as-yet-unrecorded parent reference has no content hash. */
+  contentHashOf(versionId: string): string | undefined {
+    return this.nodes.get(versionId)?.contentHash || undefined;
   }
 
   /**
@@ -103,10 +131,10 @@ export class VersionDag {
   }
 
   /** Serializable snapshot (Set → array) for persistence. */
-  toJSON(): Record<string, { parents: string[]; fileId: string }> {
-    const out: Record<string, { parents: string[]; fileId: string }> = {};
-    for (const [hash, node] of this.nodes) {
-      out[hash] = { parents: [...node.parents], fileId: node.fileId };
+  toJSON(): Record<string, { parents: string[]; contentHash: string; fileId: string }> {
+    const out: Record<string, { parents: string[]; contentHash: string; fileId: string }> = {};
+    for (const [versionId, node] of this.nodes) {
+      out[versionId] = { parents: [...node.parents], contentHash: node.contentHash, fileId: node.fileId };
     }
     return out;
   }
@@ -115,11 +143,12 @@ export class VersionDag {
   static fromJSON(obj: unknown): VersionDag {
     const dag = new VersionDag();
     if (obj && typeof obj === 'object') {
-      for (const [hash, raw] of Object.entries(obj as Record<string, unknown>)) {
-        const rec = (raw ?? {}) as { parents?: unknown; fileId?: unknown };
+      for (const [versionId, raw] of Object.entries(obj as Record<string, unknown>)) {
+        const rec = (raw ?? {}) as { parents?: unknown; contentHash?: unknown; fileId?: unknown };
         const parents = Array.isArray(rec.parents) ? rec.parents.filter((p): p is string => typeof p === 'string') : [];
+        const contentHash = typeof rec.contentHash === 'string' ? rec.contentHash : '';
         const fileId = typeof rec.fileId === 'string' ? rec.fileId : '';
-        dag.addVersion(hash, parents, fileId);
+        dag.addVersion(versionId, parents, contentHash, fileId);
       }
     }
     return dag;

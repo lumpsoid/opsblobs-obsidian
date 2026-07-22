@@ -10,8 +10,16 @@
 import { VaultState, FileEntry, MergeAction, StateMergeResult, ThreeWayMergeResult } from '../types';
 import { hlcCompare, hlcMax } from '../core/hlc';
 import { threeWayMerge } from './diff3';
+import { VersionDag, MULTIPLE_BASES } from '../core/version-dag';
 
-export function mergeVaultStates(local: VaultState, remote: VaultState): StateMergeResult {
+/**
+ * Pure state merge. When `dag` (the op-id version DAG, sync v2) is supplied, a
+ * both-modified content conflict derives its three-way base and fast-forward from
+ * graph structure — the true LCA over version-ids — instead of the scalar
+ * ancestor. When it is absent (pure-`VaultState` unit tests), it falls back to the
+ * scalar-ancestor path unchanged. Commutative: merge(A,B) ≡ merge(B,A).
+ */
+export function mergeVaultStates(local: VaultState, remote: VaultState, dag?: VersionDag): StateMergeResult {
   const actions: MergeAction[] = [];
   const mergedHlc = hlcMax(local.hlc, remote.hlc);
 
@@ -34,7 +42,7 @@ export function mergeVaultStates(local: VaultState, remote: VaultState): StateMe
     const remoteEntry = remote.fileEntries.get(fileId);
 
     const action = classifyAndResolve(
-      fileId, localEntry, remoteEntry, local, remote, localLiveByPath, remoteLiveByPath,
+      fileId, localEntry, remoteEntry, local, remote, localLiveByPath, remoteLiveByPath, dag,
     );
     actions.push(action);
   }
@@ -59,6 +67,7 @@ function classifyAndResolve(
   remote: VaultState,
   localLiveByPath: Map<string, string>,
   remoteLiveByPath: Map<string, string>,
+  dag: VersionDag | undefined,
 ): MergeAction {
 
   // ── Only one side knows about this file ─────────────────────────────────
@@ -169,7 +178,7 @@ function classifyAndResolve(
 
   // ── Both modified (different content, neither deleted) ───────────────────
   // This is the three-way merge case
-  return resolveContentConflict(fileId, le, re, local, remote);
+  return resolveContentConflict(fileId, le, re, local, remote, dag);
 }
 
 function resolveContentConflict(
@@ -178,6 +187,7 @@ function resolveContentConflict(
   re: FileEntry,
   local: VaultState,
   remote: VaultState,
+  dag: VersionDag | undefined,
 ): MergeAction {
   // ── Already-resolved conflict ────────────────────────────────────────────
   // One side is a user-resolved conflict whose `supersedes` set names the exact
@@ -208,33 +218,53 @@ function resolveContentConflict(
   const localContent = local.contentStore.get(le.contentHash);
   const remoteContent = remote.contentStore.get(re.contentHash);
 
-  // ── Fast-forward (linear history, not a divergence) ────────────────────────
-  // If the remote's causal base is EXACTLY our current content, the peer edited
-  // directly from what we hold — its version is a strict descendant, not a
-  // concurrent branch. Adopt it cleanly instead of three-way-merging against our
-  // OWN `ancestorContentHash`, which does not advance when we push our edit
-  // (pushing isn't a peer acknowledgement — see ancestor-policy), so it can be a
-  // stale pre-edit baseline. Merging against that stale base is what made a
-  // sequential empty↔content edit either union/duplicate the file (empty-ancestor
-  // diff3) or silently keep the older side. The op's causal parent (surfaced as
-  // `re.ancestorContentHash`) is the true common point.
-  //
-  // Safe under genuine concurrency: if the two really diverged, the remote's base
-  // is some older shared version, NOT our current content, so this never fires
-  // and the three-way conflict below still surfaces (concurrent-conflict-dataloss
-  // stays green). Content is hash-addressed, so identical hashes ⇒ identical
-  // bytes ⇒ adopting is exactly what a three-way against that base would yield.
-  if (re.ancestorContentHash != null && re.ancestorContentHash === le.contentHash) {
-    // Hash-addressed: prefer the remote store but fall back to the local one —
-    // fetchRemoteBlobs skips bytes this device already holds (e.g. the empty blob
-    // an emptied file resolves to), so they are absent from the *remote* store yet
-    // present locally. Without this fallback a fast-forward to already-held content
-    // would wrongly defer and the file would never converge.
+  // ── Fast-forward over the op-id DAG (linear history, not a divergence) ──────
+  // When one head is an ancestor of the other in the version DAG, the histories
+  // are linear — one side edited straight from the other's version — so there is
+  // no divergence to reconcile: adopt the descendant. This is what makes a
+  // sequential empty↔content edit converge (`empty → "3" → empty`: id_3 is a clean
+  // ancestor of id_empty2) instead of three-way-merging against a stale scalar
+  // ancestor and unioning/duplicating the file. Identity is the op-id, so recurring
+  // content never fools this (decisions §3). Both directions are handled:
+  //   · remote descends from local → take the remote (adopt the peer's newer edit).
+  //   · local descends from remote → keep ours (we already hold the newer version).
+  // Safe under genuine concurrency: if the two truly diverged, neither head is an
+  // ancestor of the other, so this never fires and the three-way path below runs.
+  if (dag && le.headVersionId && re.headVersionId) {
+    // Is local ACTUALLY at its head version? An edit made in the op-logger's
+    // debounce window reaches disk but isn't yet an op, so no version-id names it —
+    // `buildLocalState` re-hashes the disk bytes (correcting le.contentHash) but the
+    // head stays at the last logged version. In that state local is really an
+    // un-versioned CHILD of its head, so treating the head as representing local and
+    // adopting a remote descendant of it would silently clobber the in-window edit.
+    // Only fast-forward when local's content matches its head; otherwise fall through
+    // to a three-way merge (against the head as base), which surfaces the conflict.
+    const localAtHead = dag.contentHashOf(le.headVersionId) === le.contentHash;
+    if (localAtHead && dag.isAncestor(le.headVersionId, re.headVersionId)) {
+      // Remote is the strict descendant → adopt it. Hash-addressed: prefer the
+      // remote store but fall back to the local one — fetchRemoteBlobs skips bytes
+      // this device already holds (e.g. the empty blob an emptied file resolves to),
+      // so they are absent from the *remote* store yet present locally.
+      const content = remoteContent ?? local.contentStore.get(re.contentHash);
+      if (content) {
+        return { type: 'write_local', fileId, path: re.path, content, hlc: re.hlcTimestamp };
+      }
+      // Descendant bytes unavailable anywhere — defer rather than fabricate/clobber (F1).
+      return { type: 'no_op', fileId };
+    }
+    if (dag.isAncestor(re.headVersionId, le.headVersionId)) {
+      // Local is the strict descendant — we already hold the newer version (plus any
+      // in-window drift on top of it); the peer is behind and will fast-forward to
+      // ours when it pulls. Nothing to do.
+      return { type: 'no_op', fileId };
+    }
+  } else if (re.ancestorContentHash != null && re.ancestorContentHash === le.contentHash) {
+    // Scalar fallback (no DAG — pure-VaultState unit tests): the remote's recorded
+    // base equals our current content, so it is a strict descendant. Adopt it.
     const content = remoteContent ?? local.contentStore.get(re.contentHash);
     if (content) {
       return { type: 'write_local', fileId, path: re.path, content, hlc: re.hlcTimestamp };
     }
-    // Descendant bytes unavailable anywhere — defer rather than fabricate/clobber (F1).
     return { type: 'no_op', fileId };
   }
 
@@ -256,6 +286,23 @@ function resolveContentConflict(
   const localText = new TextDecoder().decode(localContent);
   const remoteText = new TextDecoder().decode(remoteContent);
 
+  // The three-way base: the LCA over the op-id DAG when available (the true causal
+  // common ancestor), else the scalar ancestor. `ambiguous` means the DAG found
+  // multiple incomparable bases (a criss-cross) — never guess one; surface a
+  // conflict (decisions §6). A `null` baseHash means no common base at all.
+  const { baseHash, ambiguous } = resolveThreeWayBase(le, re, dag);
+
+  const wholeConflict = (): MergeAction => ({
+    type: 'conflict',
+    fileId,
+    localPath: le.path,
+    remotePath: re.path,
+    mergeResult: wholeFileConflict(localText, remoteText),
+    localContent: localText,
+    remoteContent: remoteText,
+    parentHashes: [le.contentHash, re.contentHash],
+  });
+
   // Binary files can't be three-way merged. Deciding by "higher HLC wins" would
   // silently drop the losing side (data loss). Instead, take the sole edit when
   // only ONE side changed since the common ancestor — no conflict, no prompt —
@@ -263,10 +310,9 @@ function resolveContentConflict(
   // since-ancestor is a cheap *hash* comparison, so (unlike the text path) it
   // needs no ancestor bytes.
   if (isBinary(localContent) || isBinary(remoteContent)) {
-    const ancestorHash = le.ancestorContentHash ?? re.ancestorContentHash;
-    if (ancestorHash != null) {
-      const localChanged = le.contentHash !== ancestorHash;
-      const remoteChanged = re.contentHash !== ancestorHash;
+    if (!ambiguous && baseHash != null) {
+      const localChanged = le.contentHash !== baseHash;
+      const remoteChanged = re.contentHash !== baseHash;
       // Only the remote side changed → adopt it cleanly.
       if (remoteChanged && !localChanged) {
         return { type: 'write_local', fileId, path: re.path, content: remoteContent, hlc: re.hlcTimestamp };
@@ -276,8 +322,8 @@ function resolveContentConflict(
         return { type: 'no_op', fileId };
       }
     }
-    // Both sides diverged (or there is no common ancestor): a genuine conflict the
-    // user must resolve. Never silently overwrite.
+    // Both sides diverged (or there is no single common base): a genuine conflict
+    // the user must resolve. Never silently overwrite.
     return {
       type: 'binary_conflict',
       fileId,
@@ -291,32 +337,23 @@ function resolveContentConflict(
     };
   }
 
-  // Attempt three-way merge using ancestor
-  const ancestorHash = le.ancestorContentHash ?? re.ancestorContentHash;
-  const ancestorContent = ancestorHash != null
-    ? (local.contentStore.get(ancestorHash) ?? remote.contentStore.get(ancestorHash))
+  // Ambiguous DAG base (criss-cross): surface a conflict rather than pick a base.
+  if (ambiguous) return wholeConflict();
+
+  // Attempt three-way merge using the resolved base.
+  const ancestorContent = baseHash != null
+    ? (local.contentStore.get(baseHash) ?? remote.contentStore.get(baseHash))
     : undefined;
 
-  // A *known-but-missing* ancestor (a real hash was recorded but its bytes are
-  // held by neither store — GC'd or never fetched to this device) is NOT a valid
-  // three-way base. Falling back to an empty ancestor makes diff3 treat both full
-  // versions as inserts at the same gap and silently *unions* them, duplicating
-  // the whole file. Distinguish that from "no ancestor recorded at all"
-  // (ancestorHash == null — genuinely no common base): only the latter may fall
-  // back to an empty ancestor. When the ancestor is known but unavailable, surface
-  // a conflict so the user resolves it and nothing is silently concatenated.
-  if (ancestorHash != null && ancestorContent === undefined) {
-    const mergeResult = wholeFileConflict(localText, remoteText);
-    return {
-      type: 'conflict',
-      fileId,
-      localPath: le.path,
-      remotePath: re.path,
-      mergeResult,
-      localContent: localText,
-      remoteContent: remoteText,
-      parentHashes: [le.contentHash, re.contentHash],
-    };
+  // A *known-but-missing* base (a real hash was recorded but its bytes are held by
+  // neither store — GC'd or never fetched to this device) is NOT a valid three-way
+  // base. Falling back to an empty ancestor makes diff3 treat both full versions as
+  // inserts at the same gap and silently *unions* them, duplicating the whole file.
+  // Distinguish that from "no base recorded at all" (baseHash == null — genuinely no
+  // common base): only the latter may fall back to an empty ancestor. When the base
+  // is known but unavailable, surface a conflict so nothing is silently concatenated.
+  if (baseHash != null && ancestorContent === undefined) {
+    return wholeConflict();
   }
 
   const ancestorText = ancestorContent
@@ -461,6 +498,35 @@ function pickCollisionWinner(le: FileEntry, re: FileEntry): FileEntry {
   if (cmp > 0) return le;
   if (cmp < 0) return re;
   return le.id > re.id ? le : re;
+}
+
+/**
+ * Resolve the three-way base for two divergent heads. Prefers the LCA over the
+ * op-id version DAG (the true causal common ancestor over version-ids) when the
+ * DAG and both heads are known; otherwise falls back to the scalar ancestor so
+ * pure-`VaultState` unit tests (no DAG) behave as before.
+ *
+ * Returns `{ baseHash, ambiguous }`:
+ *   · `ambiguous` — the DAG found multiple incomparable bases (a criss-cross); the
+ *     caller must surface a conflict, never guess a base (decisions §6).
+ *   · `baseHash === null` — no common base at all (may fall back to an empty
+ *     ancestor, i.e. treat both as inserts) — but only when genuinely none exists.
+ * A DAG that yields no common base (disconnected histories, e.g. a create/create
+ * lineage) degrades to the scalar ancestor rather than forcing a decision.
+ */
+function resolveThreeWayBase(
+  le: FileEntry,
+  re: FileEntry,
+  dag: VersionDag | undefined,
+): { baseHash: string | null; ambiguous: boolean } {
+  if (dag && le.headVersionId && re.headVersionId) {
+    const mb = dag.mergeBase(le.headVersionId, re.headVersionId);
+    if (mb === MULTIPLE_BASES) return { baseHash: null, ambiguous: true };
+    if (mb !== null) return { baseHash: dag.contentHashOf(mb) ?? null, ambiguous: false };
+    // mb === null: the two heads share no ancestor in the DAG (disconnected) — fall
+    // through to the scalar ancestor so this rare case matches pre-DAG behaviour.
+  }
+  return { baseHash: le.ancestorContentHash ?? re.ancestorContentHash ?? null, ambiguous: false };
 }
 
 /**
