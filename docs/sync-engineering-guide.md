@@ -143,7 +143,7 @@ relevant `core`/`merge` unit) with a port for the Obsidian bit.
 | Module | Role |
 |--------|------|
 | `core/hlc.ts` | Hybrid Logical Clock — total ordering of events across devices; persisted (F7) so logical time never regresses across a wall-clock jump. Also mints each op's id (`hlcToString`). |
-| `core/version-dag.ts` | **The v2 causal graph.** Pure, in-memory DAG of `versionId (op-id) → { parents, contentHash, fileId }`. `isAncestor` / `mergeBase` (LCA, returns `MULTIPLE_BASES` on a criss-cross) / `isMergeNode` (≥2 parents) / `contentHashOf` / `reachableContentHashes` (base-bytes staging + GC keep-set). Acyclic by construction (op-id keys). |
+| `core/version-dag.ts` | **The v2 causal graph.** Pure, in-memory DAG of `versionId (op-id) → { parents, contentHash, fileId }`. `isAncestor` / `mergeBase` (LCA, returns `MULTIPLE_BASES` on a criss-cross) / `isMergeNode` (≥2 parents) / `contentHashOf` / `leaves(fileId)` (open heads — 1 = converged, ≥2 = un-reconciled divergence) / `reachableContentHashes` (base-bytes staging + GC keep-set). Acyclic by construction (op-id keys). |
 | `core/file-registry.ts` | The source of truth for file **identity**: UUID → `{path, contentHash, headVersionId, lastSyncedPath, deleted, conflictParents}`. `adoptRemote` converges identity across devices and records the adopted head. `referencedHashes(dag?)` is the content-GC keep-set (live content + DAG-reachable merge bases). |
 | `core/content-store.ts` | Hash → bytes cache (`.vault-sync/content/`). Age-aware GC (`gc(keep, retentionMs, now)`); the keep-set now sees the DAG so reachable merge bases survive (Step 8). |
 | `core/operation-logger.ts` | Watches vault events, debounces edits into ops (each carrying `parents: [prevHead]`), persists the pending oplog, advances `headVersionId`. Cold-start capture (`captureOfflineChanges`), force-push baseline (`captureAllAsBaseline`), and the two-headed → merge-node resolution branch (`flushModify` emits `Ops.merge` when a save removes conflict markers). |
@@ -153,7 +153,7 @@ relevant `core`/`merge` unit) with a port for the Obsidian bit.
 | `core/exclusion-policy.ts` | Glob-based path exclusion (`.obsidian`, `.vault-sync`, user patterns). |
 | `merge/state-merge.ts` | **The heart.** Pure `mergeVaultStates(local, remote, dag?) → actions`. Commutative & deterministic. Fast-forward / LCA-base / clean-merge / conflict per file, all from DAG topology (`isUnchangedSinceBase`, `resolveContentConflict`, `resolveCreateCollision`). |
 | `merge/diff3.ts` | Three-way line merge + `resolveConflictChunkLines`; the marker helpers `renderConflictMarkers` / `renderMarkersFromResult` / `hasConflictMarkers` / `parseConflictMarkers` / `resolveMarkedText` / `countMarkerConflicts` (the in-context conflict UX + the panel's compare). |
-| `network/server-sync.ts` | `ServerSyncClient.runSync()` — orchestrates one round (build→pull→fetch→push→**record DAG edges**→merge→apply→cursor). Obsidian-free; driven by fakes in tests. Also `reconstructRemoteState` and `safeCursor`. |
+| `network/server-sync.ts` | `ServerSyncClient.runSync()` — orchestrates one round (build→pull→fetch→push→**record DAG edges**→merge→apply→**reconcile concurrent heads**→cursor). Obsidian-free; driven by fakes in tests. Also `reconstructRemoteState`, `reconcileConcurrentHeads` (the multi-head sweep — see `docs/multi-head-reconciliation.md`), and `safeCursor`. |
 | `network/sync-applicator.ts` | Applies merge actions to the real vault (writes/moves/trashes, writes conflict markers, mints merge nodes via `mintMergeResolution`). Reports `deferred` + `deferredConflicts` fileIds back to the round. |
 | `network/vault-sync-host.ts` | `PluginVaultSyncHost` — bridges the obsidian-free round to the live stores; stages each head's DAG-reachable base bytes for the three-way merge. |
 | `network/version-dag-store.ts` | Persists the `VersionDag` (`.vault-sync/version-dag.json`) with a defensive `load()`. |
@@ -189,7 +189,16 @@ relevant `core`/`merge` unit) with a port for the Obsidian bit.
    reads. Then **merge + apply** — `mergeVaultStates(local, remote, dag)`, advance the HLC
    past the merged time *before* applying (so a merge node minted during apply dominates
    what it supersedes), then `applicator.applyActions`.
-6. **Save the cursor** via `safeCursor(...)`, which **holds the cursor back** when a blob
+6. **Reconcile concurrent heads pulled together** (`reconcileConcurrentHeads`, "step 4b").
+   `reconstructRemoteState` collapses the pulled ops to one entry per fileId (HLC-max), so a
+   round that pulled ≥2 concurrent heads for one file reconciled our head against only that
+   one and left the rest as un-reconciled DAG leaves. This sweep folds every extra concurrent
+   leaf into the local head via the ordinary pairwise `mergeVaultStates`, so the puller
+   converges by itself instead of waiting on whichever peer already merged them. Skips
+   deferred files (F5) and disconnected/tombstone leaves; a missing leaf blob holds the cursor
+   (F3). Full rationale + the 3+-head convergence analysis in
+   `docs/multi-head-reconciliation.md`.
+7. **Save the cursor** via `safeCursor(...)`, which **holds the cursor back** when a blob
    was unavailable (F3) or a destructive action was deferred (F5/auto-defer), so those
    ops re-pull next round instead of being stranded.
 
@@ -359,6 +368,23 @@ test; the *classes* are what to watch for.
   `workspace.onLayoutReady`, and `captureOfflineChanges` **skips the delete pass when the
   listing is empty while active entries remain**. **Lesson:** never derive a *destructive*
   op from a single enumeration that a host populates lazily; confirm the source is ready.
+- **Concurrent remote heads collapsed by the projection (multi-head).** `reconstructRemoteState`
+  keeps one entry per fileId (HLC-max), so when a device pulled ≥2 concurrent heads for a file
+  (3+ devices editing it before anyone merged) the merge reconciled against only the HLC-max
+  and left the rest as stranded DAG leaves — the puller showed a partial view until a peer that
+  already merged re-synced (no data loss; the ops are durable, just unreconciled). Fix: the
+  round's `reconcileConcurrentHeads` sweep folds every extra leaf into the local head via the
+  ordinary pairwise merge, so the puller converges itself. **Lesson:** a per-fileId "one remote
+  head" projection is a proxy that lies under 3-way concurrency; when the DAG shows extra open
+  leaves, reconcile them — don't trust the collapse. Full analysis: `docs/multi-head-reconciliation.md`.
+- **A create over a tombstone must resurrect the entry.** `registerFile` returned the existing
+  id for a tracked path but did **not** reset a tombstoned entry, so re-creating a deleted file
+  left it `deleted: true` with a stale `contentHash` while its head advanced —
+  `buildLocalState` then mis-projected the just-created file as deleted. Fix: on a create over a
+  tombstone, resurrect in place (`deleted=false`, fresh hash). The create op stays a fresh DAG
+  root, so a peer that deleted the file still gets a delete/create conflict (safe), never a
+  silent un-delete. Pinned by `recreate-after-delete.test.ts`. **Lesson:** reusing an id across
+  a delete→re-create must reset the entry's *state*, not just its head.
 
 Meta-lesson across all of them: **the dangerous failures are silent** — an edit that
 doesn't propagate, content at the wrong path, a file that won't empty, a base that unions.
