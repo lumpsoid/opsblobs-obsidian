@@ -247,7 +247,7 @@ export default class VaultSyncPlugin extends Plugin {
 
     this.addCommand({
       id: 'open-conflicts-panel',
-      name: 'Open conflicts panel',
+      name: 'Open conflicts',
       callback: () => { void this.activateConflictsView(); },
     });
 
@@ -437,12 +437,21 @@ export default class VaultSyncPlugin extends Plugin {
 
     this.syncInProgress = true;
     this.updateRibbonState('syncing');
+    // Snapshot text-conflict count so we can tell if THIS round newly introduced any
+    // (§3). Keyed off two-headed files specifically — that's exactly what the
+    // conflicts view lists — so a rise maps 1:1 to a card the user must resolve.
+    const textConflictsBefore = this.twoHeadedConflicts().length;
     try {
       const outcome = await this.coordinator.sync(source);
       // Land on the conflict state (not idle) if the round left conflicts the user
       // still needs to resolve, so the indicator doesn't silently go green.
       if (!outcome.ok) this.updateRibbonState('error');
       else this.updateRibbonState(this.conflictCount() > 0 ? 'conflict' : 'idle');
+      // Surface newly-introduced text conflicts (§3): only on a rise, so a periodic
+      // auto-sync doesn't nag every round while the same conflicts sit unresolved.
+      if (outcome.ok && this.twoHeadedConflicts().length > textConflictsBefore) {
+        this.revealNewConflicts(source, this.twoHeadedConflicts().length);
+      }
     } finally {
       this.syncInProgress = false;
       this.updateStatusBar();
@@ -451,6 +460,25 @@ export default class VaultSyncPlugin extends Plugin {
       // opLogger.onChange, so refresh the panel explicitly here.
       this.emitConflictChange();
     }
+  }
+
+  /** Make newly-introduced text conflicts impossible to miss (§3). A manual round is
+   *  a user-initiated action expecting a result, so it opens the conflicts tab
+   *  directly. An unattended round instead shows a persistent, actionable notice — no
+   *  surprise focus change while the user is doing something else — that opens the
+   *  same tab on click. */
+  private revealNewConflicts(source: 'manual' | 'auto', count: number): void {
+    if (source === 'manual') {
+      void this.activateConflictsView();
+      return;
+    }
+    const frag = createFragment(f => {
+      f.appendText(`Vault Sync: ${count} file${count !== 1 ? 's' : ''} need${count === 1 ? 's' : ''} conflict resolution.`);
+      f.createEl('br');
+      const link = f.createEl('a', { text: 'Open conflicts', cls: 'vault-sync-notice-link' });
+      link.addEventListener('click', () => { void this.activateConflictsView(); });
+    });
+    new Notice(frag, 0); // 0 = stays until dismissed
   }
 
   /** Public entry point for the settings "Sync now" button. */
@@ -639,12 +667,15 @@ export default class VaultSyncPlugin extends Plugin {
     };
   }
 
-  /** Reveal the conflicts panel, creating its leaf in the right sidebar if needed. */
+  /** Reveal the conflicts view, creating it as a main-area tab if needed. A tab (not
+   *  a right-sidebar drawer) makes it a first-class view and reads far better on
+   *  mobile, where the sidebar is a cramped slide-over. Reuses an existing leaf if one
+   *  is already open so repeated triggers don't spawn duplicate tabs. */
   async activateConflictsView(): Promise<void> {
     const { workspace } = this.app;
     let leaf = workspace.getLeavesOfType(CONFLICTS_VIEW_TYPE)[0] ?? null;
     if (!leaf) {
-      leaf = workspace.getRightLeaf(false) ?? workspace.getLeaf(true);
+      leaf = workspace.getLeaf('tab');
       await leaf.setViewState({ type: CONFLICTS_VIEW_TYPE, active: true });
     }
     void workspace.revealLeaf(leaf);
