@@ -22,7 +22,7 @@ machine-readable companion to this run is `bench/results/2026-07-23_xs-s-m.json`
 | Layer-1/2 host | AMD Ryzen 7 5800H, Node v26 — **a dev laptop, not a phone** |
 | Layer-1/2 runtime | 54.7 s for profiles XS, S, M |
 | Profiles | XS(F=50, B=2 KB), S(F=500, B=4 KB), M(F=2000, B=6 KB) |
-| Layer 3 (on-device) | **PENDING** — manual pass on a mid-range + a low-end Android phone not yet run |
+| Layer 3 (on-device) | **PARTIAL** — first Android run recorded below (first-enable capture on an ~8.4k-file vault). Formal mid-range + low-end matrix still pending. |
 
 **Read the layers correctly (spec §4):**
 - **Layer 1** (wall ms, heap MB) is a **relative** signal on this laptop. It is *not*
@@ -178,24 +178,70 @@ _Monotonic, un-reclaimed by GC → `memCache` never cleared._
 
 ---
 
+## Layer 3 — on-device, recorded (the number that actually matters)
+
+First real-device run: **B3 first-enable capture** on an Android phone (Chromium
+WebView; exact model TBD), vault of **8,388 notes**, via the `perfLog` diagnostic
+streaming `captureOfflineChanges` scan progress. It was stopped at 3,400/8,388 — it
+never finished (see the cliff), which is itself the finding.
+
+Per-100-file batch wall time (from the streamed progress lines):
+
+| files scanned | ms/100 files | ms/file | note |
+|---|--:|--:|---|
+| 100 → 3,200 | ~390–510 | **~4.1** | roughly flat / gently linear |
+| 3,200 → 3,300 | **26,735** | **267** | cliff — 65× jump |
+| 3,300 → 3,400 | **55,215** | **552** | still climbing |
+
+`startup load` (persisted-store load, near-empty on first enable) was 278 ms — fast;
+all the cost is in the capture.
+
+**This overturns the Layer-1 prediction.** The laptop bench showed a smooth O(F²) byte
+curve; the *device* is ~flat until ~3,200 files, then a **60–130× cliff**. A flat
+region followed by a sudden explosion is the signature of a **memory / GC wall**
+(the unbounded `ContentStore.memCache` — B6 — plus the growing in-memory `pendingOps`/
+registry filling the WebView heap), not the steady O(F²) registry rewrite. The laptop's
+fast RAM and fs hid it entirely — **the whole reason Layer 3 exists** (spec §4). The
+`perfLog` line now carries `heapMB=<used>/<limit>`; the next run will confirm whether
+the cliff coincides with the heap nearing its ceiling (memory) or is a Capacitor
+directory-scaling wall (`.vault-sync/content/` crossing a few thousand files).
+
+**Practical verdict:** first-enable of a multi-thousand-file vault is effectively
+**unusable** on mobile today — hours, and likely an OOM before completion.
+
+**Bugs this run surfaced (both real, one already fixed):**
+- **Crash-unsafe capture — FIXED** (`fix(sync): checkpoint oplog during offline
+  capture`). The registry advanced per-file but the oplog was persisted only at the
+  end, so an OOM kill mid-capture stranded every registered-but-un-opped file (they
+  skip re-capture and never sync). Now checkpointed every 200 ops.
+- **Stale pending count** (same fix) — the status bar showed a stale "217 pending"
+  during the multi-minute capture because the count only refreshed on the end-of-pass
+  oplog write; the periodic checkpoint now keeps it live.
+
+---
+
 ## Judged against the provisional budgets (spec §6)
 
-These budgets are for the **Layer-3 mobile** numbers, which are **not yet recorded**.
-The Layer-1 laptop wall times below are shown only to flag where a phone (~3–5× slower,
-plus real fs latency) is **likely** to blow the budget — a hypothesis for the on-device
-pass to confirm, not a verdict.
+These budgets are for the **Layer-3 mobile** numbers. Only first-enable capture has a
+recorded device run so far (above); the other rows still show the Layer-1 laptop time
+as a *hypothesis* for the on-device pass to confirm.
 
-| Operation | Budget (mid-range) | Laptop L1 (M) | Likely on phone? |
+| Operation | Budget (mid-range) | Laptop L1 (M) | On phone |
 |---|---|--:|---|
-| routine sync (1-file delta) | < 1 s | 153 ms | plausibly over on M once fs latency is real |
-| first-enable capture | < 4 s | 4.2 s | **likely over** — 18 k syscalls + O(F²) bytes |
-| resident RAM, long session | not monotonic | +8.1 MB/50 rounds | **fails the qualitative bar** (monotonic) |
+| routine sync (1-file delta) | < 1 s | 153 ms | not yet measured (plausibly over on M once fs latency is real) |
+| first-enable capture | < 4 s | 4.2 s | **CONFIRMED over** — ~4 ms/file to ~3.2k files, then a 60–130× cliff; an 8.4k-vault never completes |
+| resident RAM, long session | not monotonic | +8.1 MB/50 rounds | **fails the qualitative bar** (monotonic; the on-device cliff is consistent with the same unbounded cache) |
 
 ---
 
 ## Still to do (spec §9)
 
-- [ ] **Layer-3 on-device pass**: enable `perfLog`, run B1/B3/B4 (≥ profiles S, M) on a
-      mid-range and a low-end phone, record real wall-times here (add device columns).
+- [x] **First on-device run** — B3 first-enable capture, ~8.4k-file Android vault
+      (recorded above; found the ~3.2k-file cliff + two capture bugs).
+- [ ] **Confirm the cliff's cause** — re-run with the `heapMB=used/limit` progress
+      line at a completing size (profile M) to prove memory-pressure vs a Capacitor
+      directory wall.
+- [ ] **Full Layer-3 matrix** — B1/B3/B4 at profiles S and M on a mid-range and a
+      low-end phone, record device model + real wall-times (add device columns).
 - [ ] Re-run and append a new baseline before each release and after any change to the
       sync round, the DAG, persistence, or the merge.
