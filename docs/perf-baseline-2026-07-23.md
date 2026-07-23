@@ -300,11 +300,27 @@ The residual `sha256 = 2` is the one edited file (hashed once by capture) plus t
 push's blinded-blob hash — both O(touched), not O(F). The per-fold `buildLocalState`
 rebuilds in `reconcileConcurrentHeads` (B7) inherit the same O(touched) drop for free.
 
-**Deferred (spec §4/§7, R2 — Phase 2):** `buildLocalState` still *iterates* F entries
-and store-stages each gated file's bytes; skipping the byte-staging for the merge's
-non-working-set is a bigger, riskier merge-input change, **not warranted** by this
-Layer-2 number (reads already dropped to 1) — deferred until an on-device number says
-otherwise. **Layer 3 (on-device) for R1 still to record.**
+**Layer 3 confirmed (native-ARM / Termux, Node v26.4.0).** B1 at the **L profile
+(F=10000)** — the case that pre-fix hashed 10001 files and hung the on-device sweep at
+**6590 ms**:
+
+| B1 L (F=10000) | fileReads | sha256 | roundMs | heapMB |
+|---|--:|--:|--:|--:|
+| pre-R1 (native ARM) | 10000 | 10001 | **6590** | — |
+| post-R1 (native ARM) | **1** | **2** | **2346** | 16.8 |
+
+The counts are flat-in-F on the device build (the gate fires), and wall time dropped
+**2.8×** on the worst case. The accumulating SHA-256 cost A1/B1 named is gone.
+
+**Residual + R2 (spec §4/§7, Phase 2 — still deferred).** 2346 ms at F=10000 is no
+longer CPU-hashing or vault-reads (both flat): it is the remaining **O(F) work that
+survives the gate** — `buildLocalState` still *iterates* all F entries, `contentStore.get`-
+stages each gated file's bytes, and DAG-walks each head. R2 (skip byte-staging for the
+merge's non-working-set) attacks part of this, but its spec trigger — "*O(F) reads
+dominating*" — is **not met** (reads = 1). Before committing to R2's riskier merge-input
+change, the residual should be **decomposed** (capture stat-scan vs. buildLocalState
+staging vs. DAG walks vs. merge) so the fix targets whatever actually dominates the
+2.3 s — it may be the un-memoized DAG walks (B2/A2), not the staging R2 addresses.
 
 ---
 
@@ -396,8 +412,8 @@ so both would reproduce in the WebView.
 - [x] **Fix the O(F²) capture** — registry batching + memCache clearing (74× fewer
       bytes at M); crash-safety checkpointing.
 - [x] **Fix the O(F·B) steady-state round (R1, A1/B1)** — mtime/size gate in
-      `buildLocalState`; B1 sha256 F+1 → 2, fileReads F → 1 (see "The R1 fix" above).
-      Layer-3 on-device confirmation still pending.
+      `buildLocalState`; B1 sha256 F+1 → 2, fileReads F → 1, and native-ARM roundMs
+      6590 → 2346 at L=10000 (see "The R1 fix" above). Layer-3 confirmed.
 - [x] **Native-ARM (Termux) full sweep** — B1–B9 at XS/S/M on the phone's real cores
       (recorded above; ~3× CPU penalty confirmed, routine budgets pass, diff3 low-unique
       + steady-state memCache flagged as the CPU hazards).
