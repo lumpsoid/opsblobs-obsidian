@@ -171,6 +171,7 @@ export default class VaultSyncPlugin extends Plugin {
       hlc: this.hlc,
       registry: this.registry,
       runRound: () => this.runRound(),
+      openSettings: () => this.openSettings(),
       persistHlc: () => this.hlcStore.save(this.hlc.getCurrent()),
       markSynced: async () => {
         this.settings.lastSyncTime = Date.now();

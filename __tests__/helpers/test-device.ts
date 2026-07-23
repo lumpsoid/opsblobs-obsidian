@@ -117,7 +117,7 @@ export class TestDevice {
       0, // debounceMs 0 — a modify's op is available right after flush()
       this.hlcStore, // persist HLC per-op so reload() can restore logical time
       // Capture the non-blocking "still has conflict markers" notice (Step 5).
-      { info: (m: string) => this.notices.push(m), error: () => {} },
+      { info: (m: string) => this.notices.push(m), error: () => {}, setupError: () => {} },
     );
     this.applicator = new SyncApplicator(
       this.files,

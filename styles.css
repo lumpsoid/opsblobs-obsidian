@@ -17,6 +17,9 @@ textarea.vault-sync-exclusions {
 /* Actionable "finish setup" notice link (UX audit §1.2) */
 a.vault-sync-notice-link { display: inline-block; margin-top: 0.4rem; text-decoration: underline; font-weight: 600; cursor: pointer; }
 
+/* Durable setup-error notice — colored, not emoji-flagged (UX audit §5) */
+.vault-sync-notice-error { border-left: 3px solid var(--text-error); padding-left: 0.6rem; }
+
 /* Settings — onboarding readiness checklist (UX audit §1.1) */
 .vault-sync-readiness { margin: 0.25rem 0 1rem; font-size: 0.9rem; }
 .vault-sync-readiness-label { color: var(--text-muted); }

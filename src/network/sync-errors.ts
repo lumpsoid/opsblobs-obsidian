@@ -107,3 +107,17 @@ export class DecryptError extends Error {
     this.name = 'DecryptError';
   }
 }
+
+/** Is this a *setup-class* failure — one the user must fix in settings (wrong token,
+ *  wrong server/vault, passphrase mismatch, undecryptable data) — as opposed to a
+ *  transient transport error (network/timeout/5xx) that self-retries on the next
+ *  round? Setup errors warrant a durable, actionable surface, not a fading toast
+ *  (UX audit §5). */
+export function isSetupError(err: unknown): boolean {
+  return (
+    err instanceof AuthError ||
+    err instanceof NotFoundError ||
+    err instanceof KeyMismatchError ||
+    err instanceof DecryptError
+  );
+}

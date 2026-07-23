@@ -25,6 +25,7 @@ import { Notifier } from '../ports/notifier';
 import { SyncStateStore } from './sync-state-store';
 import { SyncRoundSummary } from './server-sync';
 import { DEFER_CONFLICT, DeferConflict } from './sync-applicator';
+import { isSetupError } from './sync-errors';
 
 export type SyncSource = 'manual' | 'auto';
 
@@ -59,6 +60,9 @@ export interface SyncCoordinatorDeps {
   persistHlc?: () => Promise<void>;
   /** Record a successful round in settings (lastSyncTime). Optional — no-op default. */
   markSynced?: () => Promise<void>;
+  /** Open the plugin's settings tab — attached to the durable notice a setup-class
+   *  error raises (§5), so the toast is actionable. Optional — omitted in tests. */
+  openSettings?: () => void;
   /** Wall clock, injected for deterministic tests. Defaults to Date.now. */
   now?: () => number;
 }
@@ -73,6 +77,7 @@ export class SyncCoordinator {
   private readonly runRound: () => Promise<SyncRoundSummary>;
   private readonly persistHlc: () => Promise<void>;
   private readonly markSynced: () => Promise<void>;
+  private readonly openSettings?: () => void;
   private readonly now: () => number;
 
   /** Source of the round currently running — read by the applicator's conflict
@@ -90,6 +95,7 @@ export class SyncCoordinator {
     this.runRound = deps.runRound;
     this.persistHlc = deps.persistHlc ?? (async () => {});
     this.markSynced = deps.markSynced ?? (async () => {});
+    this.openSettings = deps.openSettings;
     this.now = deps.now ?? (() => Date.now());
   }
 
@@ -134,12 +140,23 @@ export class SyncCoordinator {
       await this.syncState.clearError();
       await this.markSynced();
 
-      if (source === 'manual') this.notifier.info('✅ Vault sync complete');
+      if (source === 'manual') this.notifier.info('Vault sync complete');
       return { ok: true, summary };
     } catch (err) {
       const error = err as Error;
       console.error('Vault Sync error:', error);
-      this.notifier.error(`❌ Sync failed: ${error.message}`);
+      // Setup-class failures (auth/vault/passphrase) are the user's to fix and need a
+      // durable, actionable surface (§5); transient transport errors self-retry, so a
+      // fading toast is right for them. Either way the error is recorded in the
+      // observable sync-state for the status modal.
+      if (isSetupError(error)) {
+        this.notifier.setupError(
+          error.message,
+          this.openSettings ? { label: 'Open settings', run: this.openSettings } : undefined,
+        );
+      } else {
+        this.notifier.error(`Sync failed: ${error.message}`);
+      }
       await this.syncState.setError(error.message, this.now());
       return { ok: false, error };
     }

@@ -15,6 +15,7 @@ import { SyncStateStore } from '../src/network/sync-state-store';
 import { SyncRoundSummary } from '../src/network/server-sync';
 import { DEFER_CONFLICT } from '../src/network/sync-applicator';
 import { SyncCoordinator } from '../src/network/sync-coordinator';
+import { AuthError } from '../src/network/sync-errors';
 import { TestDevice } from './helpers/test-device';
 
 const EMPTY_SUMMARY: SyncRoundSummary = { pushed: 0, pulled: 0, deferred: [], stranded: [], deferredConflicts: [] };
@@ -29,7 +30,7 @@ async function harness(opts: { summary?: SyncRoundSummary; roundError?: Error } 
 
   const order: string[] = [];
   const editorSaver = { saveOpenEditors: vi.fn(async () => { order.push('save'); }) };
-  const notifier = { info: vi.fn(), error: vi.fn() };
+  const notifier = { info: vi.fn(), error: vi.fn(), setupError: vi.fn() };
 
   // Wrap the real logger methods to record order while keeping real behaviour.
   const realFlush = device.opLogger.flush.bind(device.opLogger);
@@ -89,7 +90,7 @@ describe('SyncCoordinator', () => {
   test('manual sync toasts success; auto sync stays silent', async () => {
     const manual = await harness();
     await manual.coordinator.sync('manual');
-    expect(manual.notifier.info).toHaveBeenCalledWith('✅ Vault sync complete');
+    expect(manual.notifier.info).toHaveBeenCalledWith('Vault sync complete');
 
     const auto = await harness();
     await auto.coordinator.sync('auto');
@@ -104,10 +105,43 @@ describe('SyncCoordinator', () => {
     const outcome = await h.coordinator.sync('manual');
 
     expect(outcome.ok).toBe(false);
-    expect(h.notifier.error).toHaveBeenCalledWith('❌ Sync failed: network down');
+    expect(h.notifier.error).toHaveBeenCalledWith('Sync failed: network down');
     expect(h.syncState.get().lastError).toEqual({ message: 'network down', at: 5000 });
     expect(clearError).not.toHaveBeenCalled();
     expect(h.device.pendingOps.length).toBeGreaterThan(0); // un-pushed work survives
+  });
+
+  test('a setup-class error routes to the durable setupError notice with an action, not the fading toast (§5)', async () => {
+    const openSettings = vi.fn();
+    const device = await TestDevice.create('dev-a');
+    const syncState = new SyncStateStore(device.metadata);
+    await syncState.load();
+    const notifier = { info: vi.fn(), error: vi.fn(), setupError: vi.fn() };
+    const coordinator = new SyncCoordinator({
+      editorSaver: { saveOpenEditors: vi.fn(async () => {}) },
+      notifier,
+      opLogger: device.opLogger,
+      syncState,
+      hlc: device.hlc,
+      registry: device.registry,
+      runRound: vi.fn(async () => { throw new AuthError(401); }),
+      openSettings,
+      now: () => 7000,
+    });
+
+    const outcome = await coordinator.sync('auto');
+
+    expect(outcome.ok).toBe(false);
+    // Durable, actionable presentation — NOT the transient error toast.
+    expect(notifier.error).not.toHaveBeenCalled();
+    expect(notifier.setupError).toHaveBeenCalledTimes(1);
+    const [msg, action] = notifier.setupError.mock.calls[0]!;
+    expect(msg).toContain('access token');
+    expect(action.label).toBe('Open settings');
+    action.run();
+    expect(openSettings).toHaveBeenCalled();
+    // Still recorded in the observable state for the status modal.
+    expect(syncState.get().lastError?.message).toContain('access token');
   });
 
   test('deferred conflicts are tagged reason:conflict and counted; drift is not (Step 7)', async () => {
