@@ -74,6 +74,22 @@ Two distinct problems remain:
 - The DAG-walk (B2) and cold-pull (B4) costs — separate.
 - Any migration/compat tooling (see §0).
 
+> **DAG-walk follow-up — measured 2026-07-23 (out of scope here, tracked for the next
+> round).** Characterizing B2 surfaced **two distinct** per-round DAG costs; full data +
+> the fix sketches live in `docs/mobile-perf-baseline-spec.md` (B2 / B2b measured-notes,
+> Appendix A #2). In brief:
+> - **B2 — deep-lineage walk/rehash.** A round over depth-K linear history is super-linear
+>   (≈ O(H^1.7)) via the O(depth) `ancestors()` / `reachableContentHashes` walks + re-reading
+>   & re-hashing base bytes along each head. *Fix:* memoize `ancestors()` within a round; stop
+>   re-staging unchanged history (ties into B1's O(F·B) re-hash).
+> - **B2b — the `mergeBase` `common²` filter.** With a *large* common-ancestor set (deep
+>   **shared** backbone, tip divergence) `isAncestor` calls scale ≈ FILES·(2K+1) while
+>   `mergeBase` stays flat → an O(K²)-per-round cliff (`version-dag.ts:165`). *Fix:* the
+>   topo-depth optimization (below / next round).
+>
+> These are a **separate optimization round** — this doc's capture path (O1–O4) does not
+> touch the merge phase. Recorded here only so the active handoff points at them.
+
 ---
 
 ## 3. O1 — mtime/size capture gate (primary)
