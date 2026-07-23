@@ -162,6 +162,33 @@ export class SyncSettingTab extends PluginSettingTab {
         }
       });
     });
+
+    this.renderAddDeviceHelp(containerEl);
+  }
+
+  /** A collapsible "here's how to sync a second device" explainer (UX audit §1.3) —
+   *  the single most common real-world task had no first-class explanation. Names the
+   *  three values to copy and how the fingerprint confirms they match. */
+  private renderAddDeviceHelp(containerEl: HTMLElement): void {
+    const help = containerEl.createEl('details', { cls: 'vault-sync-disclosure vault-sync-help' });
+    help.createEl('summary', { text: 'Add another device' });
+
+    const body = help.createDiv({ cls: 'setting-item-description' });
+    body.createEl('p', {
+      text: 'To sync a second device, install Vault Sync there and copy three values from this device:',
+    });
+    const steps = body.createEl('ol');
+    steps.createEl('li', { text: 'Vault ID — use the exact same value.' });
+    steps.createEl('li', { text: 'Vault passphrase — use the exact same passphrase.' });
+    steps.createEl('li', {
+      text: 'Access token — a token authorized for this vault, issued by your sync server ' +
+        '(each device can use its own token).',
+    });
+    body.createEl('p', {
+      text: 'Then press “Derive & verify” on both devices and compare the Key fingerprint: it ' +
+        'must be identical. If it differs, the passphrases don’t match and sync will refuse to ' +
+        'mix the two — fix the passphrase before syncing. Finally press Test connection, then Sync.',
+    });
   }
 
   /** Repaint the readiness checklist in place from current settings. Cheap — a

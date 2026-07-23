@@ -35,6 +35,8 @@ a.vault-sync-notice-link { display: inline-block; margin-top: 0.4rem; text-decor
   list-style-position: inside;
 }
 .vault-sync-disclosure > summary:hover { color: var(--text-accent); }
+.vault-sync-help ol { margin: 0.3rem 0 0.5rem 1.2rem; padding: 0; }
+.vault-sync-help li { margin: 0.15rem 0; }
 
 /* Sync status modal (S2) */
 .vault-sync-status-list { margin: 0.25rem 0 0.5rem 1rem; padding: 0; font-size: 0.85rem; color: var(--text-muted); max-height: 160px; overflow-y: auto; }
