@@ -37,7 +37,6 @@ not effort.
 | `src/ui/delete-conflict-modal.ts` | `DeleteConflictModal` — delete/modify decision (manual sync only) | yes |
 | `src/ui/binary-conflict-modal.ts` | `BinaryConflictModal` — binary decision (manual sync only) | yes |
 | `src/ui/confirm-modal.ts` | `ConfirmModal` — generic yes/no | yes |
-| `src/ui/conflict-modal.ts` | `ConflictResolutionModal` | **DEAD — imported nowhere** |
 
 Other UX-bearing code: `src/main.ts` (ribbon, status bar, commands, Notices),
 `src/network/sync-coordinator.ts` (toasts), `src/network/obsidian-notifier.ts` (Notice
@@ -45,13 +44,13 @@ adapter), `src/network/sync-errors.ts` (error copy), `src/core/operation-logger.
 (marker notice), `src/merge/diff3.ts:425-437` (inline marker labels written into notes),
 `styles.css`.
 
-**P1 — dead code with a divergent design.** `src/ui/conflict-modal.ts`
+**P1 — dead code with a divergent design. ✅ RESOLVED.** `src/ui/conflict-modal.ts`
 (`ConflictResolutionModal`, ~176 lines: modal 3-way merge, "Accept All Local/Remote/Both",
-red/blue panes, "Skip for now") is imported nowhere (`grep` confirms) — superseded by
-`conflicts-view.ts` but left in the tree with a *different* terminology ("Local/Remote") and
-color system (red/blue vs the live panel's green/blue). **Remediation:** delete it, or if any
-part is intended for reuse, reconcile its vocabulary/colors with the live panel first.
-Leaving it invites a future contributor to "fix" a UI users never see.
+red/blue panes, "Skip for now") was imported nowhere — superseded by `conflicts-view.ts` but
+left in the tree with a *different* terminology ("Local/Remote") and color system (red/blue vs
+the live panel's green/blue). **Removed:** the file was deleted along with its dead CSS block
+(`.vault-sync-conflict-modal` and the `.conflict-*`/`.resolution-*`/`.pane-local`/`.pane-remote`
+rules in `styles.css`). The live panel's `vault-sync-`-prefixed classes are untouched.
 
 ---
 
@@ -278,7 +277,7 @@ has **zero `@media` queries** (grep confirms). Findings:
 - [ ] Conflicts discoverable after a round (persistent actionable entry point) (§3).
 - [ ] Setup-class errors shown durably, not just a fading toast (§5).
 - [ ] Mobile: stack conflict panes vertically below a breakpoint (§6).
-- [ ] Delete `conflict-modal.ts` (or reconcile) (§0).
+- [x] Delete `conflict-modal.ts` (or reconcile) (§0).
 
 **P1 — strongly recommended**
 - [ ] One vocabulary per concept across panel + inline markers + settings (§2).
