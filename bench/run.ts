@@ -305,43 +305,60 @@ async function b6(p: Profile, rounds = 50): Promise<void> {
 }
 
 // ─── B7 — concurrent-head fold vs C (reconcileConcurrentHeads) ───────────────────
+//
+// The fold loop re-runs the FULL `buildLocalState()` (whole-vault re-read + re-hash +
+// base staging) once per fold — so its hypothesised cost is O(folds·(F·B + G)), the
+// F·B term being the whole-vault rebuild, NOT just the one concurrent file. To make
+// that term observable we seed a background vault of `B7_BG` quiet files alongside the
+// single wide-concurrency file: every fold re-reads all of them even though only
+// `note.md` diverges. Without a background vault (F=1) the per-fold rebuild reads one
+// file and the O(C·F) curve is invisible — the whole point of B7. The device-independent
+// signal is `fileReads`: with the background vault it lands at ≈ folds·(B7_BG+1), i.e. it
+// scales with BOTH the fold count (C) and the vault size (F) — the product the hypothesis
+// names. `readsPerFold` normalises out C so the F attribution is legible at a glance.
+const B7_BG = 200; // quiet background files the per-fold buildLocalState needlessly re-reads
 
 async function b7(C: number): Promise<void> {
   const server = new FakeSyncServer();
   const crypto = await makeCrypto();
   const base = await TestDevice.create('b7-base');
-  await base.seedFile('note.md', 'base\n', 1000);
+  // A background vault of quiet files + the one file the peers will diverge on. The
+  // quiet files never get a second head, so they never fold — they exist only to give
+  // each per-fold `buildLocalState` a whole vault to needlessly re-read (the F·B term).
+  await seedVault(base, B7_BG, 2_048);
+  await base.seedFile('note.md', 'base\n', 900_000);
   await makeClient(server, crypto, base).runSync();
 
-  // C peers each fork the file concurrently from the shared base. ALL receive the
-  // base first (while the server holds only the base — so nobody pulls a sibling),
-  // then each edits offline and pushes WITHOUT a reconciling round (pushOffline) — so
-  // all C heads land on the server as genuine concurrent leaves of the base.
+  // C peers each fork `note.md` concurrently from the shared base. ALL receive the
+  // base (+ background) first — while the server holds only the base, so nobody pulls a
+  // sibling head — then each edits offline and pushes WITHOUT a reconciling round
+  // (pushOffline), so all C heads land on the server as genuine concurrent leaves.
   const peers: TestDevice[] = [];
   for (let i = 0; i < C; i++) {
     const peer = await TestDevice.create(`b7-peer-${i}`);
-    await makeClient(server, crypto, peer).runSync();     // receive base only
+    await makeClient(server, crypto, peer).runSync();     // receive base + background
     peers.push(peer);
   }
   for (let i = 0; i < C; i++) {
-    await peers[i]!.editFile('note.md', `base\nhead-${i}\n`, 2000 + i);
-    await pushOffline(server, crypto, peers[i]!);         // land head i, no reconcile
+    await peers[i]!.editFile('note.md', `base\nhead-${i}\n`, 2_000_000 + i);
+    await pushOffline(server, crypto, peers[i]!);          // land head i, no reconcile
   }
 
-  // A fresh target device's FIRST sync pulls the base + all C concurrent heads in
-  // one round → reconcileConcurrentHeads' fold loop runs right here (a warm-up sync
-  // would converge it first and measure nothing). Its content store is empty, so
-  // buildLocalState re-reads happen inside the folds — the C-scaling we want.
+  // A fresh target device's FIRST sync pulls the base + background + all C concurrent
+  // heads in one round → reconcileConcurrentHeads' fold loop runs right here (a warm-up
+  // sync would converge it first and measure nothing). Its content store is empty, so the
+  // per-fold buildLocalState genuinely re-reads the whole vault — the C·F scaling we want.
   const target = await TestDevice.create('b7-target');
   const r = await profileOp(target, () => makeClient(server, crypto, target).runSync().then(() => {}));
+  const readsPerFold = Math.round((r.io.files.reads / Math.max(1, C - 1)) * 10) / 10;
   record({
-    scenario: 'B7', variant: `wide-concurrency C=${C}`,
+    scenario: 'B7', variant: `wide-concurrency C=${C} (bg F=${B7_BG})`,
     counts: {
-      fileReads: r.io.files.reads, dagLeaves: r.cpu.dagLeaves,
+      fileReads: r.io.files.reads, readsPerFold, dagLeaves: r.cpu.dagLeaves,
       dagMergeBase: r.cpu.dagMergeBase, sha256: r.cpu.sha256,
     },
     timing: { foldRoundMs: r.ms, heapMB: r.heapMB },
-    note: 'fold loop re-runs buildLocalState+recordVersionEdges per fold (superlinear in C)',
+    note: 'fold loop re-runs buildLocalState (whole-vault re-read) per fold → fileReads ≈ folds·(F+1), superlinear in C·F',
   });
 }
 

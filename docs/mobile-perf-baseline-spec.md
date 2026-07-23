@@ -254,6 +254,22 @@ the fold loop re-runs `buildLocalState()` + `recordVersionEdges()` per fold
 > hot-path #6 (the DAG snapshot is reloaded 3–4× per round + once per fold — cache it per round).
 > Gate on device data (§9): B7's wide-concurrency workload is rarer than the capture/steady-state
 > paths, so land it only if the on-device pass shows folds materially on the hot path.
+>
+> **Measured — the "before" (2026-07-23, `bench/run.ts` `b7`, C = 3/5/10).** The original B7
+> harness seeded a **one-file** vault, so each per-fold `buildLocalState` re-read a single file
+> and the O(C·F) rebuild was invisible (`fileReads ≈ C+1`) — the bench didn't exercise its own
+> hypothesis. Fixed by seeding a **background vault** of `B7_BG = 200` quiet files (never a second
+> head → never folded) alongside the one wide-concurrency file, so every fold needlessly re-reads
+> the whole vault. The curve is now clean and confirms O(C·F): `fileReads` = **604 / 1006 / 2011**
+> at C = 3/5/10 — i.e. **≈ C·(F+1)** (3·201 / 5·201 / 10·201), and `sha256` tracks it (1010 /
+> 1414 / 2424). So `reconcileConcurrentHeads` calls `buildLocalState` **C times** (C−1 genuine
+> folds + 1 terminating no-fold pass), each a *full whole-vault* re-read + re-hash + base-stage —
+> the redundant term is the F·B rebuild, not the single file that diverged. Layer-1 wall
+> (`foldRoundMs` 93 → 108 → 140) grows with C but is dominated by that per-pass vault read.
+> **Decision unchanged:** the fix (thread reusable state through the fold loop / rebuild only the
+> one changed file) stays **gated on the §9 device pass** — the "before" is now captured so the
+> gate can be evaluated the moment on-device folds show up on the hot path; when it lands, re-run
+> this same B7 and expect `fileReads` to drop from ≈ C·(F+1) toward ≈ (F+1) + C.
 
 **B8 — diff3 large-file merge vs B and line-uniqueness.**
 big-file and low-unique-line profiles, both-modified so `threeWayMerge` runs. *Hypothesis:*
@@ -367,7 +383,10 @@ are not fixes** — they are the map of what to measure.
    text-conflict leaf every iteration → `folds ≈ pulled ops`); attempted-leaf memo bounds it to
    O(distinct extra leaves). This was the dominant **B2** cost (fileReads 64k→460 at K=160, 62×).
    The remaining per-*genuine*-fold `buildLocalState` re-run (real cost in **C**, B7) is still open
-   — reuse the loaded state across folds instead of a full rebuild.
+   — reuse the loaded state across folds instead of a full rebuild. **B7 "before" measured
+   (2026-07-23):** with a 200-file background vault, `fileReads ≈ C·(F+1)` (604/1006/2011 at
+   C=3/5/10) — the loop does **C** full whole-vault rebuilds. Fix stays gated on the §9 device
+   pass (wide-concurrency is rare); see the B7 measured-note.
 6. **The DAG snapshot is loaded + JSON-parsed 3–4× per round** (dagNeedsRebuild,
    buildLocalState, recordVersionEdges, + per fold) — each O(G), redundant. `vault-sync-host.ts`. (B1, B7)
 7. **Cold pull / DAG rebuild is O(H)** — `dagNeedsRebuild` resets cursor to 0; `pullAll`
