@@ -225,6 +225,30 @@ export class VersionDag {
     return seen;
   }
 
+  /**
+   * A cheap in-memory copy of the graph for a single sync round. Each node is
+   * duplicated with a *fresh* `parents` Set, so mutating the clone (folding this
+   * round's pending ops into it for the staging reachability walk) cannot alias or
+   * grow the parent lists of the original — the pristine pre-round graph that
+   * `recordVersionEdges` still needs to journal this round's genuinely-new edges
+   * from (see the round-residual spec §3.1: sharing one instance would let
+   * `buildLocalState` pre-add the pending edges so `recordVersionEdges`'s
+   * `addVersion` returns `false` and never journals them). Cheaper than
+   * `fromJSON(toJSON())` — no JSON round-trip, no journal replay, no re-validation.
+   * O(nodes + edges).
+   */
+  clone(): VersionDag {
+    const copy = new VersionDag();
+    for (const [versionId, node] of this.nodes) {
+      copy.nodes.set(versionId, {
+        parents: new Set(node.parents),
+        contentHash: node.contentHash,
+        fileId: node.fileId,
+      });
+    }
+    return copy;
+  }
+
   /** Serializable snapshot (Set → array) for persistence. */
   toJSON(): Record<string, { parents: string[]; contentHash: string; fileId: string }> {
     const out: Record<string, { parents: string[]; contentHash: string; fileId: string }> = {};

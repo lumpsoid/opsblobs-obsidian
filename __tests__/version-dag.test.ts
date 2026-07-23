@@ -146,6 +146,33 @@ describe('VersionDag (pure structure)', () => {
     expect(dag.isAncestor('parent', 'child')).toBe(true);
   });
 
+  test('clone equals the original by toJSON, and mutating the clone does not touch it', () => {
+    const dag = new VersionDag();
+    dag.addVersion('O', [], 'hO', 'f1');
+    dag.addVersion('X', ['O'], 'hX', 'f1');
+    dag.addVersion('M', ['X', 'O'], 'hM', 'f1');   // a two-parent merge node
+
+    const copy = dag.clone();
+    // A faithful copy: identical serialized graph.
+    expect(copy.toJSON()).toEqual(dag.toJSON());
+    expect(copy.mergeBase('X', 'O')).toBe('O');
+    expect(copy.contentHashOf('M')).toBe('hM');
+
+    // Mutating the clone — adding a new node AND a new parent to an *existing*
+    // node (the parent-Set aliasing check) — must not leak into the original.
+    copy.addVersion('N', ['M'], 'hN', 'f1');        // new node reachable only in the clone
+    copy.addVersion('M', ['Z'], 'hM', 'f1');        // new parent on a shared node
+    expect(dag.has('N')).toBe(false);               // node isolation
+    expect(dag.isAncestor('Z', 'M')).toBe(false);   // parent-Set isolation (no aliasing)
+    // The clone did take the mutations.
+    expect(copy.has('N')).toBe(true);
+    expect(copy.isAncestor('Z', 'M')).toBe(true);
+
+    // And the reverse: mutating the original leaves the clone alone.
+    dag.addVersion('W', ['O'], 'hW', 'f1');
+    expect(copy.has('W')).toBe(false);
+  });
+
   test('JSON round-trip preserves the graph and content hashes', () => {
     const dag = new VersionDag();
     dag.addVersion('O', [], 'hO', 'f1');
