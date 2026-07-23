@@ -53,6 +53,9 @@ export default class VaultSyncPlugin extends Plugin {
   private crypto = new VaultCrypto();
 
   private ribbonIcon: HTMLElement | null = null;
+  /** The ribbon's current visual state — read by its click handler so an error-state
+   *  click opens details (matching its tooltip) instead of firing a sync (§5). */
+  private ribbonState: 'idle' | 'syncing' | 'conflict' | 'error' = 'idle';
   private statusBarItem: HTMLElement | null = null;
   private statusBarText = '';
   private syncInProgress = false;
@@ -208,7 +211,10 @@ export default class VaultSyncPlugin extends Plugin {
     this.registerView(CONFLICTS_VIEW_TYPE, leaf => new ConflictsView(leaf, this.conflictsHost()));
 
     this.ribbonIcon = this.addRibbonIcon(SYNC_ICON_ID, 'Vault Sync', () => {
-      void this.triggerSync('manual');
+      // In the error state the tooltip promises "click for details" — honor that by
+      // opening the status modal instead of silently firing another sync (§5).
+      if (this.ribbonState === 'error') this.openSyncStatus();
+      else void this.triggerSync('manual');
     });
     // Reflect any conflicts left outstanding from a previous session immediately.
     this.updateRibbonState(this.conflictCount() > 0 ? 'conflict' : 'idle');
@@ -601,6 +607,7 @@ export default class VaultSyncPlugin extends Plugin {
   // ─── UI helpers ───────────────────────────────────────────────────────────
 
   private updateRibbonState(state: 'idle' | 'syncing' | 'conflict' | 'error') {
+    this.ribbonState = state;
     if (!this.ribbonIcon) return;
     this.ribbonIcon.removeClass('vault-sync-idle', 'vault-sync-syncing', 'vault-sync-conflict', 'vault-sync-error');
     this.ribbonIcon.addClass(`vault-sync-${state}`);

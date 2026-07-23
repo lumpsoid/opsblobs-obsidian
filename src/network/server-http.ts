@@ -85,20 +85,20 @@ export class HttpServerApi implements ServerApi {
 
   async pullOps(since: number, limit: number): Promise<PullOpsResult> {
     const url = `${this.vaultBase()}/ops?since=${since}&limit=${limit}`;
-    const resp = await this.request('pulling changes', { url, method: 'GET', headers: this.authHeader() }, this.metaTimeout);
-    if (resp.status !== 200) throw this.statusError(resp.status, 'pulling changes');
+    const resp = await this.request('downloading changes', { url, method: 'GET', headers: this.authHeader() }, this.metaTimeout);
+    if (resp.status !== 200) throw this.statusError(resp.status, 'downloading changes');
     return resp.json as PullOpsResult;
   }
 
   async appendOps(baseCursor: number, ops: AppendOp[]): Promise<AppendResult> {
-    const resp = await this.request('pushing changes', {
+    const resp = await this.request('uploading your changes', {
       url: `${this.vaultBase()}/ops`,
       method: 'POST',
       headers: { ...this.authHeader(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ baseCursor, ops }),
     }, this.metaTimeout);
     if (resp.status === 409) throw new StaleCursorError();
-    if (resp.status !== 200) throw this.statusError(resp.status, 'pushing changes');
+    if (resp.status !== 200) throw this.statusError(resp.status, 'uploading your changes');
     return resp.json as AppendResult;
   }
 
