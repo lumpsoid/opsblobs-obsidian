@@ -10,7 +10,7 @@
 
 import { VaultState, FileEntry, MergeAction, Operation } from '../types';
 import { VaultSyncHost } from './server-sync';
-import { VaultFiles } from '../ports/vault-files';
+import { VaultFiles, VaultFileRef } from '../ports/vault-files';
 import { FileRegistry } from '../core/file-registry';
 import { ContentStore, hashContent } from '../core/content-store';
 import { OperationLogger } from '../core/operation-logger';
@@ -57,21 +57,53 @@ export class PluginVaultSyncHost implements VaultSyncHost {
       dag.addVersion(op.id, op.parents, op.contentHash, op.fileId);
     }
 
+    // Stat every live file once (no extra syscall — `TFile.stat` rides on the
+    // listing) so the per-entry loop can gate its read+hash on an mtime/size
+    // comparison, exactly as the capture pass does (R1, steady-state-round-
+    // optimization-spec §3).
+    const refs = new Map<string, VaultFileRef>();
+    for (const r of this.files.list()) refs.set(r.path, r);
+
     for (const [id, entry] of this.registry.getAllEntries()) {
       let resolved = entry;
 
       if (!entry.deleted) {
-        const content = await this.files.read(entry.path);
-        if (content !== null) {
-          const hash = await hashContent(content);
-          // Key the bytes under their *actual* hash, never the registry's
-          // recorded one. If an edit hasn't been logged yet the recorded hash is
-          // stale; keying under it would alias the current bytes over the
-          // ancestor, making the three-way merge see the file as unchanged and
-          // silently adopt the remote (data loss). If they differ, trust the
-          // disk and correct this snapshot so the merge compares real content.
-          if (hash !== entry.contentHash) resolved = { ...entry, contentHash: hash };
-          contentStore.set(hash, content);
+        const ref = refs.get(entry.path);
+        // ── R1 round stat-gate (steady-state-round-optimization-spec §3) ──────
+        // `captureOfflineChanges` ran milliseconds ago under this exact mtime+size
+        // gate and reconciled the registry with disk, so a tracked file whose stat
+        // is unchanged since we last hashed it has content byte-identical to
+        // `entry.contentHash`. Skip the read + SHA-256 and stage its bytes straight
+        // from the content store (a memCache/blob hit), disk-reading only on a
+        // store miss (no re-hash — the stat already says unchanged). This turns the
+        // round's O(F) whole-vault re-hash into O(touched). A placeholder
+        // (`contentHash === ''`), head-less, stat-drifted, or stat-absent entry
+        // fails the strict `===` and falls through to today's read+hash +
+        // snapshot-correction path unchanged — the F5 / un-opped-edit safeguards
+        // (§5) are preserved up to the same heuristic capture already accepts.
+        if (
+          entry.headVersionId &&
+          entry.contentHash !== '' &&
+          ref !== undefined &&
+          entry.mtime === ref.mtime &&
+          entry.size === ref.size
+        ) {
+          let bytes = await this.contentStore.get(entry.contentHash);
+          if (bytes === null) bytes = await this.files.read(entry.path);
+          if (bytes !== null) contentStore.set(entry.contentHash, bytes);
+        } else {
+          const content = await this.files.read(entry.path);
+          if (content !== null) {
+            const hash = await hashContent(content);
+            // Key the bytes under their *actual* hash, never the registry's
+            // recorded one. If an edit hasn't been logged yet the recorded hash is
+            // stale; keying under it would alias the current bytes over the
+            // ancestor, making the three-way merge see the file as unchanged and
+            // silently adopt the remote (data loss). If they differ, trust the
+            // disk and correct this snapshot so the merge compares real content.
+            if (hash !== entry.contentHash) resolved = { ...entry, contentHash: hash };
+            contentStore.set(hash, content);
+          }
         }
       }
 
