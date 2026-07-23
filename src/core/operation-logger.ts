@@ -33,6 +33,14 @@ const OPLOG_PATH = '.vault-sync/oplog.json';
  *  files scanned) — perf diagnostics only. */
 const CAPTURE_PROGRESS_EVERY = 100;
 
+/** How often `captureOfflineChanges` persists the oplog mid-pass (every N emitted
+ *  ops). A large first-enable capture runs for minutes on mobile and can be killed
+ *  mid-way (OOM at the memory cliff); checkpointing bounds the un-journalled ops an
+ *  interrupted pass can lose to <N (instead of the whole capture) and keeps the live
+ *  pending count fresh. Bytes-per-checkpoint grow with the pending set, so this
+ *  trades a bounded write cost for durability — kept modest to stay mobile-friendly. */
+const CAPTURE_CHECKPOINT_EVERY = 200;
+
 export class OperationLogger {
   private pendingOps: Operation[] = [];
   private debounceTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
@@ -100,6 +108,7 @@ export class OperationLogger {
    */
   async captureOfflineChanges(onProgress?: (scanned: number, total: number) => void): Promise<void> {
     let changed = false;
+    let sinceCheckpoint = 0;
     const onDisk = new Set<string>();
 
     // ── Live files: untracked → create, content drifted → update ─────────────
@@ -144,6 +153,18 @@ export class OperationLogger {
         await this.registry.setHeadVersion(entry.id, op.id);
       }
       changed = true;
+
+      // Crash-safety checkpoint. The registry is persisted per-file (registerFile /
+      // setHeadVersion each save), but without this the oplog was written only once,
+      // at the very end — so an interrupted capture (an OOM kill on a large mobile
+      // vault is realistic) left the registry marking files "captured" while their
+      // ops were never journalled, stranding them forever (they skip re-capture on
+      // the `entry.contentHash === hash` guard and never sync). Flushing every N ops
+      // bounds that loss to <N and refreshes the live pending count.
+      if (++sinceCheckpoint >= CAPTURE_CHECKPOINT_EVERY) {
+        await this.saveOpLog();
+        sinceCheckpoint = 0;
+      }
     }
     // Final tick so the last (sub-batch) files register in the progress log.
     if (onProgress && total > 0) onProgress(total, total);
