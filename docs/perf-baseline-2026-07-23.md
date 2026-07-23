@@ -332,6 +332,7 @@ round:
 | **steady state, laptop** (pre-R3) | **3.8** | **9.9** | **18.3** | **122.5** |
 | **steady state, laptop — post-R3** (1 DAG load/round) | **2.6** | **4.9** | **18.6** | **89.4** |
 | **steady state, native ARM** (pre-R3) | — | — | — | **308** |
+| **steady state, native ARM — post-R3** | — | — | — | **207** |
 
 The **native-ARM L steady-state round is 308 ms** (Termux, drained B1) — not the
 2346 ms the backlog artifact showed, and ~2.5× the laptop's 122 ms (in line with the
@@ -349,11 +350,13 @@ it now loads once via `host.loadDag()` and threads the instance through all thre
 §3.1 journal-integrity trap can't bite). Layer-2 laptop B1 **L drops 122.5 → 89.4 ms**
 (≈33 ms, the two removed load-equivalents at 10k nodes), M/S/XS flat-to-better, and the
 device-independent counts are unchanged (`sha256=2`, `fileReads=1`) — pinned by
-`__tests__/round-dag-load-dedup.test.ts`. **Native-ARM re-measure is pending an
-on-device Termux run** (`BENCH_ONLY=b1 BENCH_PROFILES=l`); the laptop drop implies the
-308 ms ARM round should fall proportionally (the DAG-load laps are pure CPU/parse).
-The residual O(F) iteration (capture stat-scan + `buildLocalState` loop) and the *one*
-remaining DAG load are R4/R2′ territory — deferred (§4/§7), not warranted yet.
+`__tests__/round-dag-load-dedup.test.ts`. **Native-ARM re-measure confirmed on device**
+(Termux native Node v26, drained B1 L, `BENCH_ONLY=b1 BENCH_PROFILES=l`): **308 → 207 ms
+(−33%)**, heap 28.5 MB, counts flat (`sha256=2`, `fileReads=1`) — the proportional fall
+the laptop drop predicted (the DAG-load laps are pure CPU/parse; 207 ms is ~2.3× the
+89.4 ms laptop, the same ~3× ARM penalty). The residual O(F) iteration (capture stat-scan
++ `buildLocalState` loop) and the *one* remaining DAG load are R4/R2′ territory —
+deferred (§4/§7), not warranted yet.
 
 **Residual + R2 (spec §4/§7, Phase 2 — CLOSED as not-warranted).** The decomposition
 answers the R2 gate directly: `buildLocalState` is 38 ms of the 118 ms and its

@@ -360,11 +360,11 @@ value is **308 ms**).
       `__tests__/round-dag-load-dedup.test.ts` (the five behavioral checks in §6 + the
       full suite as #6) over the real stack — the journal-integrity test (#2) was verified
       to FAIL against a naïve shared-instance impl before the clone fix. *Landed (`cd36c4f`).*
-- [x] **R3.3 — re-measure Layer 2** (bench): B1 **L 122.5 → 89.4 ms**, counts unchanged
-      (`sha256=2`, `fileReads=1`); baseline doc updated. *Landed (`c225a1c`).* **Layer 3
-      (device) still pending** — needs an on-device Termux run
-      (`BENCH_ONLY=b1 BENCH_PROFILES=l`) to refresh the 308 ms native-ARM row. That
-      device number is also the gate for whether R2′/R4 are warranted (below).
+- [x] **R3.3 — re-measure Layer 2 + Layer 3.** Layer 2 (laptop bench): B1 **L 122.5 →
+      89.4 ms**. Layer 3 (Termux native ARM, drained B1 L): **308 → 207 ms (−33%)**. Counts
+      unchanged both layers (`sha256=2`, `fileReads=1`); baseline doc updated. *Landed
+      (`c225a1c` + device row).* The 207 ms device number is the gate for whether R2′/R4
+      are warranted (below).
 - [ ] **R2′ — working-set byte-staging + bounded memCache** *(only if B6 heap growth is
       unacceptable on a large vault; §4.1).* Thread the remote-delta fileId set into
       `buildLocalState`, stage only `union(local-touched, remote-delta)` bytes, add a
@@ -404,11 +404,12 @@ change), then this + `docs/steady-state-round-optimization-spec.md` (R1, landed)
 **Status.** R1 is landed and confirmed on-device (commits `ddcc4eb`, `c6cd69d`,
 `ff7cd71`, `d87eff5` on `master`). **R3 is now landed** (`18dd2e3` clone, `cd36c4f`
 threading, `c225a1c` measurement) — one DAG load per round, Layer-2 laptop B1 L
-122.5 → 89.4 ms, counts unchanged, full suite green (268 tests, 1 skipped). **Remaining:
-(a)** the Layer-3 on-device re-measure of the L round (was 308 ms native ARM); **(b)**
-R2′ and R4, both still **deferred** and gated on that device number — build **only if**
-B6 heap growth (R2′) or the residual O(F) iteration (R4) is unacceptable on a large
-vault. Do not build speculatively (§4).
+122.5 → 89.4 ms, **Layer-3 native-ARM (Termux) L 308 → 207 ms (−33%)**, counts unchanged
+both layers, full suite green (268 tests, 1 skipped). **Remaining: R2′ and R4**, both
+still **deferred** and gated on the 207 ms device round — build **only if** B6 heap growth
+(R2′) or the residual O(F) iteration (R4) is unacceptable on a large vault. At 207 ms/round
+the L vault is well inside budget, so neither is warranted today. Do not build
+speculatively (§4).
 
 **The exact call sites (verified 2026-07-23, post-R1):**
 - `src/network/vault-sync-host.ts`
