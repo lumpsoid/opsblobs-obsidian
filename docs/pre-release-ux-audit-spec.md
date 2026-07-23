@@ -61,7 +61,28 @@ to the finding it resolves.
    self-retry. Both still record to the status modal. `openSettings` is injected into the
    coordinator so it stays obsidian-free.
 
-**2026-07-23 — P1 vocabulary decision (§2) — DECIDED & SHIPPING.** The two conflicting sides are
+**2026-07-23 — P1 remediation pass** (most P1 items landed; see §7 checklist):
+
+1. **Dismiss = defer (§3).** Both blocking modals (delete/modify, binary) now treat a dismiss as
+   *defer* — the applicator's existing hold-cursor / tag-`reason:'conflict'` path — never a silent
+   destructive pick, and each has an explicit **Decide later**. Emoji headers dropped.
+2. **Conflict legibility (§3).** The ancestor pane is **Original** with a read-only gloss; a live
+   **Preview result** shows exactly what Apply writes (same `resolveMarkedText` rule, so it can't
+   diverge from what lands); "Both" states its ordering (Mine, then Theirs).
+3. **Danger hierarchy (§4).** Re-baseline gets a solid-red danger button + a **type-to-confirm**
+   gate (`ConfirmModal.requireTyped`); the safe Clear-cache lost its warning styling.
+4. **Feedback (§5).** Transport phrases plain ("downloading changes" / "uploading your changes");
+   the error-state ribbon click opens the status modal (matching its tooltip); the status modal shows
+   the device *name*, drops the stranded hex, and color-flags attention rows.
+5. **Onboarding (§1.4/§1.5).** Fingerprint copy button + a "why it must match" gloss; the dead-end
+   unlock-failure copy now names the next step.
+
+**Still open (P1/P2):** one unified "Needs your attention" list spanning text + delete/binary
+conflicts (§3); an optional friendlier marker *header line* (§2); the remaining P2 polish
+(device-name + thumbnail in the binary modal, delete-strategy setting-value rename, full
+text-symbol de-emoji sweep).
+
+**2026-07-23 — P1 vocabulary decision (§2) — DECIDED & SHIPPED.** The two conflicting sides are
 **"Mine" / "Theirs"** everywhere users see them (panel panes, inline note markers, status copy);
 the common ancestor is **"Original"** (panel pane label + the `||||||| Original` inline marker).
 Marker *parsing* is by sigil prefix, so relabeling `ours`/`base`/`theirs` → `Mine`/`Original`/
@@ -131,17 +152,17 @@ Findings:
    values to copy and explains that the Key fingerprint must match (and that a mismatch means the
    passphrases differ and sync will refuse to mix them).
 
-4. **P1 — fingerprint verification assumes the user already knows to compare it.**
-   `Key fingerprint` (`settings-tab.ts:148`) shows a raw string + "must match on every
-   device" but offers no copy button, no side-by-side compare affordance, and no one-line
-   explanation of *why* (it catches a mistyped passphrase before data is trusted — see
-   `KeyMismatchError`).
-   **Fix:** add a copy button and a one-line "why" ("If this differs across devices, the
-   passphrases don't match and sync will refuse to mix them.").
+4. **P1 — fingerprint verification assumes the user already knows to compare it. ✅ SHIPPED.**
+   `Key fingerprint` showed a raw string + "must match on every device" but offered no copy
+   button and no *why*.
+   **Shipped:** a copy button on the fingerprint row and a one-line gloss — "Compare it across
+   devices: it must be identical. If it differs, the passphrases don't match and sync will refuse
+   to mix them."
 
-5. **P1 — dead-end failure copy.** `main.ts:397` *"could not derive the vault key from the
-   passphrase."* — jargon ("derive the vault key") and no next step.
-   **Fix:** *"Couldn't unlock the vault with this passphrase — check it in settings."*
+5. **P1 — dead-end failure copy. ✅ SHIPPED.** The old `main.ts` notice said *"could not derive the
+   vault key from the passphrase"* — jargon, no next step.
+   **Shipped:** *"couldn't unlock the vault with this passphrase — check it in settings."* (and the
+   "derive" verb → "unlock" across the fingerprint button/desc and status modal).
 
 6. **P2 — "Test connection" is the right tool but undiscovered on first run.** The success
    strings (`main.ts:376-377`) are genuinely good (including the empty-vault case), but a
@@ -166,13 +187,17 @@ precise term; **user-facing strings** must not).
 | an op | "recording an operation" (`settings-tab.ts:202`), "pending operations" (`:302`) | **"change"** / "pending changes" |
 | held/blocked items | "deferred", "stranded", "drift" bleeding into status framing | plain outcome language ("waiting", "held", "couldn't download yet") |
 
+> **Decided & shipped:** the two sides are **Mine / Theirs** and the ancestor is **Original**
+> (not the table's tentative "This device / Other device" / "Common version" — see Decisions of
+> record). Applied to the panel, the inline markers, and settings; derive-jargon → unlock/ready.
+
 Additional copy findings:
 
-- **P1 — raw VCS markers land in users' notes.** `diff3.ts:430-436` writes
-  `<<<<<<< ours`, `||||||| base`, `======= `, `>>>>>>> theirs` into the file on disk. A
-  non-technical user opening the note sees raw git markers. Keep the mechanism (it's how
-  in-context resolution works) but (a) label them in the chosen vocabulary and (b) make sure
-  the toast + panel teach what they are. Consider a friendlier marker header line.
+- **P1 — raw VCS markers land in users' notes. ◑ PARTIAL.** `diff3.ts` now writes
+  `<<<<<<< Mine`, `||||||| Original`, `=======`, `>>>>>>> Theirs` — labelled in the chosen
+  vocabulary (recognition is by sigil, so older `ours`/`base`/`theirs` notes still parse). The panel
+  teaches what each side is. **Still open:** the sigils themselves are still git-flavored; a
+  friendlier *header line* above the block was considered and deferred.
 - **P2 — product casing:** "Vault Sync" (product) vs "Vault sync status"
   (`sync-status-modal.ts:37`) vs "Vault sync complete" (`sync-coordinator.ts:137`). Normalize
   to "Vault Sync".
@@ -213,15 +238,16 @@ Findings:
   status modal. **Fix:** unify the mental model — all conflicts appear in one "Needs your
   attention" list (the status modal already has this heading) with a consistent CTA; the
   blocking modals become one *entry* in that list rather than the only way to resolve.
-- **P1 — the "Base"/"Common version" pane is unexplained** (`conflicts-view.ts:199`, non-
-  clickable). A novice won't know it's read-only context. **Fix:** label + one-line gloss;
-  visually de-emphasize it as reference.
-- **P1 — no preview of the resolved result** before "Apply resolution", and "Keep both"/
-  "Both" doesn't say which side lands first. **Fix:** show a merged preview; state ordering.
-- **P1 — silent default on modal dismiss.** Closing `DeleteConflictModal` (Esc/click-away)
-  resolves to `'restore'` (`:54-56`); `BinaryConflictModal` to `'keep_local'` (`:66-67`) —
-  a destructive-ish default the user may not realize was chosen. **Fix:** treat dismiss as
-  "decide later" (defer), not a silent pick; only an explicit button commits.
+- **P1 — the ancestor pane is unexplained. ✅ SHIPPED.** Renamed **Original**, glossed per-pane
+  ("The shared starting point, before either edit. Read-only reference."), and already visually
+  de-emphasized (greyed, non-clickable).
+- **P1 — no preview of the resolved result before Apply, and "Both" ordering unstated. ✅ SHIPPED.**
+  A live, collapsible **Preview result** renders exactly what Apply will write (computed from the
+  current picks via the same `resolveMarkedText` rule); "Both" now carries "Mine first, then Theirs".
+- **P1 — silent default on modal dismiss. ✅ SHIPPED.** Dismissing `DeleteConflictModal` /
+  `BinaryConflictModal` now **defers** (holds the cursor, tags `reason:'conflict'`, re-presents next
+  manual sync) instead of silently picking `'restore'` / `'keep_local'`; a decision is only committed
+  by an explicit button, and each modal has a **Decide later** that produces the same deferral.
 - **P2 — binary modal shows only text metadata** (size, `device 3f9a2b` raw UUID `:53`,
   timestamp) — no image thumbnail. **Fix:** thumbnail for image types; replace the raw UUID
   with the device *name*.
@@ -236,11 +262,13 @@ and four expert/maintenance actions. Findings:
 - **P1 — expert controls interleaved with basics. ✅ DONE (with decision 1).** Debounce delay and
   Ancestor retention (plus sync-.obsidian and exclusions) were developer-facing but in the main
   list. **Shipped:** all moved under the **Advanced** `<details>` disclosure.
-- **P1 — the most dangerous action is visually equal to the safest. ◑ PARTIAL (with decision 1).**
+- **P1 — the most dangerous action is visually equal to the safest. ✅ DONE.**
   Re-baseline could overwrite other devices' edits yet was styled like the "Safe" Clear cache.
-  **Shipped:** clear cache / re-check / reset / re-baseline are grouped under a **Maintenance &
-  danger zone** disclosure. **Still open:** distinct danger-styling for re-baseline vs the safe
-  actions, and escalated double-confirm copy (the single `ConfirmModal` is retained).
+  **Shipped:** the danger zone now has a severity gradient — re-baseline gets a solid-red
+  danger button (`.vault-sync-danger-btn`) *and* a **type-to-confirm** gate
+  (`ConfirmModal.requireTyped`: the confirm stays disabled until the user types "re-baseline"),
+  with copy that spells out the overwrite is not undoable here; the safe Clear-cache dropped its
+  warning styling so it no longer shouts like the destructive actions.
 - **P2 — "Clear sync cache" is styled as a warning but fires unguarded** (`:273`, no
   `ConfirmModal`). Its desc says "Safe", so acceptable; either drop the warning styling or add
   a confirm for consistency.
@@ -265,17 +293,15 @@ The typed error family (`sync-errors.ts`) is **good** — messages name the knob
   → a persistent, **color-flagged (no emoji)** notice with an "Open settings" action (new
   `Notifier.setupError`). Transient transport errors keep the fading toast (they self-retry). The
   `✅`/`❌` were dropped from the complete/failed toasts per the no-emoji decision.
-- **P1 — `{operation}` fragments read technical** ("pushing ops", "pulling") inside otherwise-
-  friendly sentences (`ServerError`/`NetworkError`/`TimeoutError`). **Fix:** map to plain
-  phrases ("uploading your changes", "downloading changes").
-- **P1 — raw internals in the status modal:** stranded content shown as truncated hex
-  (`sync-status-modal.ts:104` `contentHash.slice(0,12)+'…'`), device UUID fragment (`:124`),
-  "Vault key: ready (fingerprint) / not derived" (`:120`, "derived" jargon), "Last error"
-  prints `message` verbatim (`:110`, fine for typed errors, leaks for unexpected ones).
-  **Fix:** describe stranded items by *file* not hash; show the device *name*; use "unlocked".
-- **P1 — ribbon tooltip over-promises.** error state tooltip = *"error — click for details"*
-  (`main.ts:548`) but clicking the ribbon triggers a **sync** (`:209`), not details. **Fix:**
-  make the error-state click open the status modal (details), or change the copy.
+- **P1 — `{operation}` fragments read technical. ✅ SHIPPED.** The transport labels that read into
+  `ServerError`/`NetworkError`/`TimeoutError` are now "downloading changes" / "uploading your
+  changes" (blob calls already said "downloading/uploading a file").
+- **P1 — raw internals in the status modal. ✅ MOSTLY SHIPPED.** Stranded content is now described by
+  count + meaning (no hex fragment); the device row shows the *name*, not a UUID; "Vault key:
+  unlocked (fingerprint) / locked". **Left as-is:** "Last error" still prints `message` verbatim —
+  correct for the typed-error family, and the only remaining case (an unexpected raw error) is rare.
+- **P1 — ribbon tooltip over-promises. ✅ SHIPPED.** The error-state ribbon click now opens the status
+  modal (details), matching its "click for details" tooltip, instead of firing another sync.
 - **P2 — status-bar click is overloaded and unlabeled** (`main.ts:219`: conflicts→panel, else
   →sync). Nothing signals it's clickable or that behavior changes. **Fix:** consistent action
   + a tooltip.
@@ -296,9 +322,9 @@ has **zero `@media` queries** (grep confirms). Findings:
   Additionally the conflicts view moved from the right sidebar to a **main-area tab**
   (`activateConflictsView` now uses `workspace.getLeaf('tab')`), so it is no longer a cramped
   slide-over drawer on mobile at all.
-- **P1 — touch targets below ~44px.** Per-hunk "Mine/Theirs/Both" + global "All …" + footer
-  buttons at default sizing with `gap: 0.4rem` (`:75`). **Fix:** larger tap targets and
-  spacing under the mobile breakpoint.
+- **P1 — touch targets below ~44px. ✅ SHIPPED.** Under the `max-width:700px` breakpoint the per-hunk
+  / global / footer conflict buttons and the delete/binary/confirm modal buttons now get a 44px min
+  height, roomier padding, wider gaps, and `flex-grow` so a thumb can't miss.
 - **P1 — status-bar-as-primary-entry-point may not exist on mobile.** The conflicts panel's
   main route is the status bar click (`main.ts:218`); mobile status bars are less prominent/
   absent. **Fix:** ensure a Command-palette route always exists (it does — "Open conflicts
@@ -323,15 +349,25 @@ has **zero `@media` queries** (grep confirms). Findings:
 - [x] Delete `conflict-modal.ts` (or reconcile) (§0).
 
 **P1 — strongly recommended**
-- [ ] One vocabulary per concept across panel + inline markers + settings (§2).
-- [ ] Unify the conflict mental model; dismiss = defer, never a silent pick (§3).
-- [ ] "Common version" pane label + gloss; resolved-result preview (§3).
-- [x] Settings IA: Advanced disclosure + a Danger zone for re-baseline (§4). *(landed with §1.1: an
-      "Advanced" and a "Maintenance & danger zone" `<details>` disclosure. The distinct
-      danger-styling + double-confirm escalation for re-baseline is still open.)*
-- [ ] Plain-language `{operation}` phrases; ribbon error-click → details (§5).
-- [ ] Mobile touch targets + command-palette route guaranteed (§6). *(command-palette route
-      confirmed; touch targets still open.)*
+- [x] One vocabulary per concept across panel + inline markers + settings (§2). *(Mine/Theirs/Original
+      everywhere; markers relabelled back-compatibly; "unlock"/"ready" for the derive jargon;
+      "Vault Sync" casing. **Still open:** the optional friendlier marker *header line*, and the
+      P2 delete-strategy setting-value rename.)*
+- [◑] Unify the conflict mental model; dismiss = defer, never a silent pick (§3). *(dismiss = defer
+      shipped for both blocking modals, each with an explicit "Decide later"; the emoji headers
+      dropped. **Still open:** folding text + delete/binary into one "Needs your attention" list —
+      today text conflicts live in the panel and delete/binary in the status modal.)*
+- [x] "Original" pane label + gloss; resolved-result preview (§3). *(pane renamed Base→Original with
+      per-pane tooltips; live collapsible "Preview result"; "Both" states its ordering.)*
+- [x] Settings IA: Advanced disclosure + a Danger zone for re-baseline (§4). *(disclosures landed with
+      §1.1; re-baseline now has the loud solid-danger style + a type-to-confirm gate; the safe
+      Clear-cache lost its warning styling.)*
+- [x] Plain-language `{operation}` phrases; ribbon error-click → details (§5). *("downloading changes"/
+      "uploading your changes"; error-state ribbon click opens the status modal.)*
+- [x] Mobile touch targets + command-palette route guaranteed (§6). *(conflict + modal buttons get a
+      ~44px min height / roomier spacing under the breakpoint; command-palette route already existed.)*
+- [x] Onboarding P1s: fingerprint copy button + "why" gloss (§1.4); dead-end unlock copy (§1.5);
+      status-modal internals — device *name*, no stranded hex, color-flagged attention rows (§5).
 
 **P2 — polish**
 - [ ] Casing/naming normalization; device *name* instead of UUID everywhere (§2, §3, §5).
