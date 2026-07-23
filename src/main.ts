@@ -578,9 +578,12 @@ export default class VaultSyncPlugin extends Plugin {
             title: 'Re-baseline this device to the server?',
             message:
               'Every file on THIS device will be pushed to the server as the authoritative ' +
-              'version. If another device edited the same file, this device\'s version will ' +
-              `win the merge there. Vault content on this device is never touched. (${fileCount} file${fileCount !== 1 ? 's' : ''}.)`,
+              'version. If another device edited the same file, THIS device wins and the other ' +
+              'device\'s conflicting edit is overwritten on its next sync. This cannot be undone ' +
+              `from here. Vault content on this device is never touched. (${fileCount} file${fileCount !== 1 ? 's' : ''}.)`,
             confirmText: 'Re-baseline & push',
+            warning: true,
+            requireTyped: 're-baseline',
           }, resolve).open();
         }),
       () => this.triggerSync('manual'),

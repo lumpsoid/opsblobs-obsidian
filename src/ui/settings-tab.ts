@@ -382,7 +382,10 @@ export class SyncSettingTab extends PluginSettingTab {
       .setDesc('Remove content-store blobs the registry no longer references. ' +
         'Safe — only affects three-way merge quality, not vault content.')
       .addButton(btn => {
-        btn.setButtonText('Clear cache').setWarning().onClick(async () => {
+        // No warning styling: its own description says it's safe (merge-quality only,
+        // never vault content), so it shouldn't look as loud as the destructive
+        // actions below it (UX audit §4).
+        btn.setButtonText('Clear cache').onClick(async () => {
           btn.setDisabled(true);
           const removed = await this.host.clearContentCache();
           btn.setButtonText(`Removed ${removed}`);
@@ -424,7 +427,13 @@ export class SyncSettingTab extends PluginSettingTab {
         'use to rebuild or recover the server from a device you trust. If another device ' +
         'edited the same file, this device wins. Vault content here is never touched.')
       .addButton(btn => {
-        btn.setButtonText('Re-baseline').setWarning().onClick(async () => {
+        // The single most dangerous action here (it can overwrite other devices'
+        // edits), so it gets the loud, solid danger style — visibly distinct from the
+        // non-destructive warning buttons above (UX audit §4). The double-confirm is
+        // escalated in the plugin's rebaseline() handler.
+        btn.setButtonText('Re-baseline').setWarning();
+        btn.buttonEl.addClass('vault-sync-danger-btn');
+        btn.onClick(async () => {
           btn.setDisabled(true);
           try {
             await this.host.rebaselineToServer();

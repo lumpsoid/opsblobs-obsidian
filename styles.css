@@ -7,6 +7,21 @@
   justify-content: flex-end;
 }
 
+/* Type-to-confirm gate for the most dangerous action (UX audit §4) */
+.vault-sync-confirm-input { width: 100%; margin: 0.25rem 0 0.5rem; font-family: var(--font-monospace); }
+
+/* The loud, solid danger style — reserved for re-baseline, the one action that can
+   overwrite other devices' edits, so it is visibly distinct from the amber warning
+   buttons (UX audit §4). */
+.vault-sync-danger-btn,
+button.vault-sync-danger-btn.mod-warning {
+  background-color: var(--text-error);
+  color: var(--text-on-accent, #fff);
+  border: none;
+}
+.vault-sync-danger-btn:hover:not(:disabled) { filter: brightness(1.12); }
+.vault-sync-danger-btn:disabled { opacity: 0.5; }
+
 /* Settings — exclusions textarea */
 textarea.vault-sync-exclusions {
   width: 100%;

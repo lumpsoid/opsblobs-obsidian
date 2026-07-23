@@ -16,6 +16,11 @@ export interface ConfirmOptions {
   cancelText?: string;
   /** Style the confirm button as a warning (destructive-looking) action. */
   warning?: boolean;
+  /** Escalate to a type-to-confirm gate (UX audit §4): the confirm button stays
+   *  disabled until the user types this exact phrase, so the most dangerous actions
+   *  can't be fired by a single reflexive click. Also renders the button in the
+   *  loud danger style. */
+  requireTyped?: string;
 }
 
 export class ConfirmModal extends Modal {
@@ -34,16 +39,35 @@ export class ConfirmModal extends Modal {
     contentEl.createEl('h2', { text: this.opts.title });
     contentEl.createEl('p', { text: this.opts.message });
 
+    const typed = this.opts.requireTyped;
+
     const buttons = contentEl.createDiv({ cls: 'confirm-modal-buttons' });
 
     const confirmBtn = buttons.createEl('button', {
       text: this.opts.confirmText ?? 'Confirm',
-      cls: this.opts.warning ? 'mod-warning' : 'mod-cta',
+      cls: (this.opts.warning || typed) ? 'mod-warning' : 'mod-cta',
     });
+    if (typed) confirmBtn.addClass('vault-sync-danger-btn');
     confirmBtn.addEventListener('click', () => this.decide(true));
 
     const cancelBtn = buttons.createEl('button', { text: this.opts.cancelText ?? 'Cancel' });
     cancelBtn.addEventListener('click', () => this.decide(false));
+
+    // Type-to-confirm gate: keep the confirm button disabled until the phrase matches.
+    // The hint + input sit above the buttons so the escalation is obvious, not hidden.
+    if (typed) {
+      const hint = contentEl.createEl('p', {
+        text: `Type “${typed}” below to enable the button.`,
+        cls: 'setting-item-description',
+      });
+      const input = contentEl.createEl('input', { type: 'text', cls: 'vault-sync-confirm-input' });
+      input.placeholder = typed;
+      confirmBtn.disabled = true;
+      input.addEventListener('input', () => { confirmBtn.disabled = input.value.trim() !== typed; });
+      contentEl.insertBefore(hint, buttons);
+      contentEl.insertBefore(input, buttons);
+      window.setTimeout(() => input.focus(), 0);
+    }
   }
 
   private decide(confirmed: boolean) {
