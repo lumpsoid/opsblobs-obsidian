@@ -145,6 +145,60 @@ async function b2(K: number): Promise<void> {
   });
 }
 
+// ─── B2b — mergeBase's common² filter (deep SHARED backbone, tip divergence) ─────
+//
+// B2 diverges at the create version, so each file's LCA `common` set is size 1 and
+// mergeBase's `common.filter(common.some(isAncestor))` (version-dag.ts:165) does ~0
+// work — B2 measures the ancestors()-walk/rehash cost, NOT this quadratic filter
+// (its `isAncestor/mergeBase` ratio stays flat ~1). B2b moves the divergence to the
+// TIP of a deep shared backbone: both devices fast-forward onto a depth-K lineage,
+// then each makes one concurrent edit, so mergeBase(a1,b1) sees a `common` set of
+// size ≈ K. This is the topology that actually exercises the filter. The signature:
+// `mergeBase` call count stays constant (≈ per-file) while `isAncestor` scales as
+// ≈ FILES·(2K+1) — the ratio climbs linearly with depth (measured 11→41→161→321→641
+// at K=5/20/80/160/320), and the round goes super-linear in wall time (≈ O(K²) work
+// over constant files). fileReads/reachable stay FLAT — the complement of B2.
+async function b2b(K: number): Promise<void> {
+  const FILES = 20;
+  const server = new FakeSyncServer();
+  const crypto = await makeCrypto();
+  const A = await TestDevice.create('b2b-a');
+  const B = await TestDevice.create('b2b-b');
+
+  await seedVault(A, FILES, 2_048);
+  await makeClient(server, crypto, A).runSync();
+  await makeClient(server, crypto, B).runSync();       // both at the create version v0
+
+  // A builds a deep backbone (depth K) and pushes it; B pulls the whole chain and
+  // FAST-FORWARDS to the tip vK — so the backbone is genuinely SHARED ancestry.
+  let wall = 1_000_000;
+  for (let k = 0; k < K; k++)
+    for (let i = 0; i < FILES; i++)
+      await A.editFile(`notes/note-${i}.md`, makeText(2_048, `bb-${i}-${k}`), wall++);
+  await makeClient(server, crypto, A).runSync();
+  await makeClient(server, crypto, B).runSync();       // B fast-forwards to vK (shared)
+
+  // Tip divergence: A edits once more and pushes (a1 = vK→child); B edits once
+  // concurrently off vK (b1), then syncs → mergeBase(b1,a1) with common ≈ {v0..vK}.
+  for (let i = 0; i < FILES; i++)
+    await A.editFile(`notes/note-${i}.md`, makeText(2_048, `a-tip-${i}`), 2_000_000 + i);
+  await makeClient(server, crypto, A).runSync();
+  for (let i = 0; i < FILES; i++)
+    await B.editFile(`notes/note-${i}.md`, makeText(2_048, `b-tip-${i}`), 2_500_000 + i);
+
+  const r = await profileOp(B, () => makeClient(server, crypto, B).runSync().then(() => {}));
+  const isAncPerBase = Math.round((r.cpu.dagIsAncestor / Math.max(1, r.cpu.dagMergeBase)) * 100) / 100;
+  record({
+    scenario: 'B2b', variant: `deep-shared-backbone K=${K} H≈${FILES * K}`,
+    counts: {
+      dagMergeBase: r.cpu.dagMergeBase, dagIsAncestor: r.cpu.dagIsAncestor,
+      isAncPerBase, dagReachable: r.cpu.dagReachable, fileReads: r.io.files.reads,
+    },
+    timing: { mergeRoundMs: r.ms, heapMB: r.heapMB },
+    note: 'common ≈ K → mergeBase O(common²) filter bites: isAncPerBase climbs ~2K, mergeBase/reads flat',
+  });
+}
+
 // ─── B3 — cold startup vs F (captureOfflineChanges) ──────────────────────────────
 
 async function b3(p: Profile): Promise<void> {
@@ -392,6 +446,8 @@ async function main(): Promise<void> {
   for (const p of PROFILES) await b1(p);
   console.log('B2 — round vs history H (DAG walks)');
   for (const K of (process.env.BENCH_FULL ? [20, 50, 200, 1000] : [20, 50])) await b2(K);
+  console.log('B2b — mergeBase common² filter (deep shared backbone)');
+  for (const K of (process.env.BENCH_FULL ? [20, 50, 200, 1000] : [20, 50])) await b2b(K);
   console.log('B3 — cold startup vs F');
   for (const p of PROFILES) await b3(p);
   console.log('B4 — cold pull / DAG rebuild vs H');

@@ -159,13 +159,34 @@ super-linear behavior (its `common.filter(common.some(isAncestor))` is O(common�
 > walks and the re-read/re-hash of base bytes along each head's history**, repeated per file
 > per round. So B2-as-written measures the **deep-lineage walk-and-rehash** cost (the real
 > curve), and effectively *clears* `mergeBase`'s quadratic filter for the linear-lineage
-> case. **The `common²·(V+E)` cliff only bites when a file has many *incomparable* common
-> ancestors** (a criss-cross / merge-heavy sub-DAG) — which this profile never builds. To
-> test that specific suspicion, add a **B2b variant** whose two heads share a merge-heavy
-> sub-DAG (repeated concurrent-then-merge cycles) so `common` grows and the filter lands on
-> the hot path. Fixes implied by the *measured* curve (deep-walk, not filter): memoize/cache
-> `ancestors()` results within a round, and gate `buildLocalState`'s base-byte staging so it
-> doesn't re-hash unchanged history every round (relates to B1's O(F·B) re-hash).
+> case. **The `common²·(V+E)` cliff only bites when a file's two heads share a *large*
+> common-ancestor set** — which this profile never builds (it diverges at the create
+> version, so `common` size = 1). Fixes implied by *this* curve (deep-walk, not filter):
+> memoize/cache `ancestors()` results within a round, and gate `buildLocalState`'s base-byte
+> staging so it doesn't re-hash unchanged history every round (relates to B1's O(F·B) re-hash).
+
+**B2b — mergeBase's `common²` filter (deep SHARED backbone, tip divergence).**
+The variant that isolates the filter B2 cleared. Both devices fast-forward onto a depth-K
+*shared* backbone, then each makes **one** concurrent tip edit, so `mergeBase(a1, b1)` sees a
+`common` set of size ≈ K. `bench/run.ts` `b2b`.
+
+> **Measured (2026-07-23, K = 5/20/80/160/320).** **Hypothesis confirmed — and it is the
+> clean complement of B2.** `mergeBase` call count stays **constant** (61 ≈ per-file), but
+> `isAncestor` scales as **≈ FILES·(2K+1)** → the `isAncestor/mergeBase` ratio climbs
+> **linearly** with depth: **11.3 → 41.3 → 161.3 → 321.3 → 641.3**. Each `mergeBase` now does
+> O(K) `isAncestor` calls over its size-K `common` set (vs ~0 in B2), each itself an O(K)
+> walk ⇒ **O(K²) filter work per round over constant files**, and wall time goes super-linear
+> (683 → 1,642 ms for K = 160 → 320, a 2× depth). Crucially `dagReachable` / `fileReads` stay
+> **FLAT** (840 / 860) — B2b pays in the *filter*, B2 pays in the *walk/rehash*; together they
+> decompose the two DAG cost sources. The Layer-2 `isAncestor` count is the device-independent
+> signal (wall time only starts to bite at K ≳ 160 on a laptop; a slow phone / larger graph
+> moves that left). **Fix:** the `common.filter(common.some(isAncestor))` maximal-element scan
+> is the target — precompute a topological depth per node so "is x a proper ancestor of any
+> other common?" is an O(1) depth-compare instead of an isAncestor DFS, or short-circuit once a
+> single maximal element is found for the fast-forward-eligible case. (A *true* criss-cross —
+> many mutually-**incomparable** maximal common ancestors → `MULTIPLE_BASES` — would defeat the
+> short-circuit entirely and is the pathological ceiling; B2b's totally-ordered backbone is the
+> achievable-through-the-real-stack lower bound on that cost.)
 
 **B3 — Cold startup vs F (`captureOfflineChanges`).**
 Populate F files on disk (via `seedExistingFile` — no events), then `reload()` and time
@@ -292,10 +313,14 @@ are not fixes** — they are the map of what to measure.
    — **B2 measured (2026-07-23):** the round *is* super-linear in depth (≈ O(H^1.7)), but via
    the **O(depth) `ancestors()`/`reachableContentHashes` walks + base-byte re-hashing**, not
    the `common²` filter — that filter did ~0 `isAncestor` work here (`common.length == 1` for a
-   linear lineage; `isAncestor/mergeBase ≈ 1.0` flat across the sweep). The quadratic filter
-   only bites a **merge-heavy / criss-cross** sub-DAG (needs a **B2b variant** to exercise).
-   Implied fixes: memoize `ancestors()` within a round; stop re-staging unchanged history's
-   base bytes (ties into #1). See the B2 §5 measured-note.
+   linear lineage; `isAncestor/mergeBase ≈ 1.0` flat across the sweep). **B2b measured
+   (2026-07-23)** isolates the filter with a *deep shared backbone*: `common ≈ K`, `mergeBase`
+   flat but `isAncestor` ≈ FILES·(2K+1) → the ratio climbs 11→41→161→321→641, an **O(K²)-per-round
+   filter cliff** (reads/reachable stay flat). So there are **two** distinct DAG costs here:
+   the deep-walk/rehash (B2) and the `common²` maximal-scan (B2b). Implied fixes: memoize
+   `ancestors()` + stop re-staging unchanged history (B2); precompute per-node topo-depth so the
+   maximal-element scan is an O(1) compare, not an isAncestor DFS (B2b). See the B2/B2b §5
+   measured-notes.
 3. **`ContentStore.memCache` is unbounded; `clearMemCache()` is never called** —
    `content-store.ts:31,112`. Session-lifetime RAM growth toward total content bytes. (B6)
 4. **FileRegistry full pretty-printed JSON rewrite on every one of ~12 mutation sites**, looped
