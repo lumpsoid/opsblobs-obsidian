@@ -104,7 +104,15 @@ async function b1(p: Profile): Promise<void> {
   const crypto = await makeCrypto();
   const dev = await TestDevice.create('b1');
   await seedVault(dev, p.F, p.B);
-  await makeClient(server, crypto, dev).runSync();     // converge
+  await makeClient(server, crypto, dev).runSync();     // converge (pushes F ops)
+  // DRAIN the convergence backlog. We persist the *pull* cursor, not the append head
+  // (server-sync.ts:330), so a device's own just-pushed ops re-pull once on the next
+  // round. `seedVault` batch-creates F files and converges in ONE round, so without
+  // this the measured round would re-pull the whole F-op backlog at once (pull =
+  // O(F) decrypts) — a one-time post-convergence cost, NOT the per-keystroke steady
+  // state B1 measures. One drained round advances the cursor past the backlog so the
+  // measured round pulls ~0, exactly as a long-running synced vault does.
+  await makeClient(server, crypto, dev).runSync();
   // Warm the stat cache: `seedVault` drives ONLINE creates, which record a head but
   // no mtime/size, so the FIRST capture is an O(F) stat-recording pass. A synced
   // vault is past that — one warm capture records every file's stat, modelling the

@@ -302,25 +302,48 @@ rebuilds in `reconcileConcurrentHeads` (B7) inherit the same O(touched) drop for
 
 **Layer 3 confirmed (native-ARM / Termux, Node v26.4.0).** B1 at the **L profile
 (F=10000)** — the case that pre-fix hashed 10001 files and hung the on-device sweep at
-**6590 ms**:
+**6590 ms** — verifies the gate fires on the device build (counts flat-in-F):
 
-| B1 L (F=10000) | fileReads | sha256 | roundMs | heapMB |
+| B1 L (F=10000) | fileReads | sha256 |
+|---|--:|--:|
+| pre-R1 (native ARM) | 10000 | 10001 |
+| post-R1 (native ARM) | **1** | **2** |
+
+The accumulating SHA-256 cost A1/B1 named is gone. **Caveat on the wall time:** the
+native-ARM run reported `roundMs` 6590 → 2346, but that L round is **not** the
+steady-state round — see the correction below.
+
+### Correction — B1 measured the wrong round (backlog drain, not steady state)
+
+A phase decomposition of B1-at-L (runSync's built-in `PhaseTimer`) showed the
+post-R1 round was **83% `pull`, having pulled 10000 ops**. That is not per-edit steady
+state: we persist the *pull* cursor, not the append head (server-sync.ts:330), so a
+device's own just-pushed ops re-pull once next round. B1 batch-creates F files and
+converges in **one** round, leaving the cursor at 0, so the measured round drained the
+whole **F-op backlog at once** — a one-time post-convergence cost R1 never targeted.
+
+B1 now runs one **drain round** after convergence (advancing the cursor past the
+backlog) before the measured edit, so `pull` drops to **0 ops**. The true steady-state
+round (laptop, backlog drained):
+
+| B1 roundMs (laptop) | XS(50) | S(500) | M(2000) | L(10000) |
 |---|--:|--:|--:|--:|
-| pre-R1 (native ARM) | 10000 | 10001 | **6590** | — |
-| post-R1 (native ARM) | **1** | **2** | **2346** | 16.8 |
+| backlog-drain artifact | 21 | 129 | 190 | 2346 (ARM) |
+| **steady state (drained)** | **3.8** | **9.9** | **18.3** | **122.5** |
 
-The counts are flat-in-F on the device build (the gate fires), and wall time dropped
-**2.8×** on the worst case. The accumulating SHA-256 cost A1/B1 named is gone.
+Phase split of the drained L round (118 ms laptop total): captureOfflineChanges
+**30 ms** (O(F) stat scan) · buildLocalState **38 ms** (gated, no hashing) · DAG
+load+`recordVersionEdges` **33 ms** (O(DAG)) · merge+apply **12 ms** · **pull 0.1 ms**.
 
-**Residual + R2 (spec §4/§7, Phase 2 — still deferred).** 2346 ms at F=10000 is no
-longer CPU-hashing or vault-reads (both flat): it is the remaining **O(F) work that
-survives the gate** — `buildLocalState` still *iterates* all F entries, `contentStore.get`-
-stages each gated file's bytes, and DAG-walks each head. R2 (skip byte-staging for the
-merge's non-working-set) attacks part of this, but its spec trigger — "*O(F) reads
-dominating*" — is **not met** (reads = 1). Before committing to R2's riskier merge-input
-change, the residual should be **decomposed** (capture stat-scan vs. buildLocalState
-staging vs. DAG walks vs. merge) so the fix targets whatever actually dominates the
-2.3 s — it may be the un-memoized DAG walks (B2/A2), not the staging R2 addresses.
+**Residual + R2 (spec §4/§7, Phase 2 — CLOSED as not-warranted).** The decomposition
+answers the R2 gate directly: `buildLocalState` is 38 ms of the 118 ms and its
+byte-staging (the only thing R2 removes) is ~8 ms — R2 would trade a risky
+merge-input-completeness change for ~7% of the round. Its spec trigger ("*O(F) reads
+dominating*") is not met (reads = 1). What *does* remain is O(F) **iteration** (the
+capture stat-scan + the buildLocalState loop) and O(DAG) **load** each round — neither
+is what R2 addresses. **R2 is not pursued.** If the steady-state round is optimized
+further, the targets are the capture/buildLocalState entry iteration and the per-round
+DAG deserialization, not byte-staging.
 
 ---
 
@@ -412,8 +435,10 @@ so both would reproduce in the WebView.
 - [x] **Fix the O(F²) capture** — registry batching + memCache clearing (74× fewer
       bytes at M); crash-safety checkpointing.
 - [x] **Fix the O(F·B) steady-state round (R1, A1/B1)** — mtime/size gate in
-      `buildLocalState`; B1 sha256 F+1 → 2, fileReads F → 1, and native-ARM roundMs
-      6590 → 2346 at L=10000 (see "The R1 fix" above). Layer-3 confirmed.
+      `buildLocalState`; B1 sha256 F+1 → 2, fileReads F → 1, counts flat-in-F confirmed
+      native-ARM. Decomposition closed R2 as not-warranted and found B1 was measuring the
+      post-convergence backlog-drain round, not steady state (now drained; see "The R1
+      fix" above). Steady-state native-ARM roundMs at L still to re-record on device.
 - [x] **Native-ARM (Termux) full sweep** — B1–B9 at XS/S/M on the phone's real cores
       (recorded above; ~3× CPU penalty confirmed, routine budgets pass, diff3 low-unique
       + steady-state memCache flagged as the CPU hazards).
