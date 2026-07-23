@@ -160,11 +160,15 @@ export class SyncSettingTab extends PluginSettingTab {
     testSetting.addButton(btn => {
       btn.setButtonText('Test').onClick(async () => {
         btn.setButtonText('Testing…').setDisabled(true);
+        // Convey pass/fail by color, not a glyph (no-emoji UI decision, §5).
+        testSetting.descEl.removeClass('vault-sync-test-ok', 'vault-sync-test-err');
         testSetting.setDesc('Testing…');
         try {
           testSetting.setDesc(await this.host.testConnection());
+          testSetting.descEl.addClass('vault-sync-test-ok');
         } catch (e) {
-          testSetting.setDesc(`✗ ${(e as Error).message}`);
+          testSetting.setDesc((e as Error).message);
+          testSetting.descEl.addClass('vault-sync-test-err');
         } finally {
           btn.setButtonText('Test').setDisabled(false);
         }
@@ -247,7 +251,11 @@ export class SyncSettingTab extends PluginSettingTab {
           });
       });
 
-    new Setting(containerEl)
+    // The Device ID is a raw UUID with no everyday use — tuck it behind a Diagnostics
+    // disclosure so it doesn't clutter the basics (UX audit §4).
+    const diag = containerEl.createEl('details', { cls: 'vault-sync-disclosure' });
+    diag.createEl('summary', { text: 'Diagnostics' });
+    new Setting(diag)
       .setName('Device ID')
       .setDesc('Unique identifier for this device (read-only).')
       .addText(t => {

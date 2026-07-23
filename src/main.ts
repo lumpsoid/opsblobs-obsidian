@@ -382,7 +382,7 @@ export default class VaultSyncPlugin extends Plugin {
       crypto: this.crypto,
       host,
       hlc: this.hlc,
-      onProgress: (label) => this.setStatusBarText(`⟳ ${label}`),
+      onProgress: (label) => this.setStatusBarText(label, 'syncing'),
     });
   }
 
@@ -407,8 +407,8 @@ export default class VaultSyncPlugin extends Plugin {
     const { keyState } = await this.buildSyncClient().preflight();
     if (keyState === 'mismatch') throw new KeyMismatchError();
     return keyState === 'match'
-      ? '✓ Connected — server reachable, token accepted, and the passphrase matches this vault.'
-      : '✓ Connected — server reachable and token accepted. The vault has no data yet; this device will establish the key on first sync.';
+      ? 'Connected — server reachable, token accepted, and the passphrase matches this vault.'
+      : 'Connected — server reachable and token accepted. The vault has no data yet; this device will establish the key on first sync.';
   }
 
   /** The Obsidian shell around a sync round: the reentrancy/config/crypto guards
@@ -627,16 +627,16 @@ export default class VaultSyncPlugin extends Plugin {
     if (!this.statusBarItem) return;
 
     // Outstanding conflicts take priority — they need the user, not just a sync. Show
-    // the count (Step 6) so a glance says how many files the panel has waiting.
+    // the count (Step 6) so a glance says how many files the panel has waiting. State is
+    // conveyed by color (no-emoji UI decision, §5); the word label carries it for a11y.
     const conflicts = this.conflictCount();
-    const text =
-      conflicts > 0
-        ? `⚠ ${conflicts} conflict${conflicts !== 1 ? 's' : ''}`
-        : this.opLogger.getPendingOps().length > 0
-          ? '⟳ Changes to sync'
-          : '✓ Synced';
-
-    this.setStatusBarText(text);
+    if (conflicts > 0) {
+      this.setStatusBarText(`${conflicts} conflict${conflicts !== 1 ? 's' : ''}`, 'conflict');
+    } else if (this.opLogger.getPendingOps().length > 0) {
+      this.setStatusBarText('Changes to sync', 'pending');
+    } else {
+      this.setStatusBarText('Synced', 'synced');
+    }
   }
 
   // ─── Conflicts panel (Step 6) ─────────────────────────────────────────────
@@ -695,12 +695,18 @@ export default class VaultSyncPlugin extends Plugin {
   /** Single writer for the status bar. Called by every state-change event and
    *  by the sync progress handler, so it only touches the DOM when the text
    *  changed — and it keeps {@link statusBarText} in lockstep with the DOM so a
-   *  transient progress label ("⟳ Pulling…") is always overwritten by the next
+   *  transient progress label ("Pulling…") is always overwritten by the next
    *  render, even when the pre- and post-sync states happen to be identical. */
-  private setStatusBarText(text: string): void {
+  private setStatusBarText(text: string, state: 'syncing' | 'conflict' | 'pending' | 'synced' = 'synced'): void {
     if (!this.statusBarItem || text === this.statusBarText) return;
     this.statusBarText = text;
     this.statusBarItem.setText(text);
+    // Color-code the state (no-emoji UI decision, §5). Each state maps to a distinct
+    // label, so the text guard above already implies the class only changes here.
+    this.statusBarItem.removeClass(
+      'vault-sync-sb-syncing', 'vault-sync-sb-conflict', 'vault-sync-sb-pending', 'vault-sync-sb-synced',
+    );
+    this.statusBarItem.addClass(`vault-sync-sb-${state}`);
   }
 
   /** Open the inspectable sync-status surface (S2) — replaces the old transient

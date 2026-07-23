@@ -54,9 +54,12 @@ to the finding it resolves.
    periodic auto-sync doesn't nag every round while the same conflicts sit unresolved.
 4. **No emojis in user-facing UI — use color (§5, cross-cutting).** Notices convey status by
    **color** (theme vars, e.g. `--text-error`), not glyphs. Applied to the new setup-error
-   notice and the sync-complete / sync-failed toasts (the `✅`/`❌` were dropped). *Not yet swept:*
-   pre-existing status-bar / status-modal text symbols (`⚠ ⟳ ✓`) — a full de-emoji sweep is still
-   open. Recorded as a standing preference for future work.
+   notice and the sync-complete / sync-failed toasts (the `✅`/`❌` were dropped). *Sweep now
+   complete (P2 pass, below):* the status-bar `⚠ ⟳ ✓`, the `⟳` sync-progress prefix, the
+   `✓`/`✗` on the Test-connection result, and the `⚠️` on the marker notice are gone — state is
+   carried by a color class plus a word label. The one glyph kept is the Setup readiness
+   `✓`/`✗` (§1.1): there it is *paired* with green/red color (not color-only), which is the
+   accessible pattern, so it stays.
 5. **Setup-class errors get a durable, actionable surface (§5).** `isSetupError()` classifies
    auth / 404 / key-mismatch / decrypt as *setup* failures → a persistent (non-fading),
    color-flagged notice with an **Open settings** action, via a new `Notifier.setupError`.
@@ -84,7 +87,20 @@ to the finding it resolves.
 
 **Still open (P2):** an optional friendlier marker *header line* (§2); a binary-conflict
 *thumbnail* preview (the binary card now shows size + device + time inline, no raw UUID); the
-delete-strategy setting-value rename; the full status-bar text-symbol de-emoji sweep.
+delete-strategy setting-value rename.
+
+**2026-07-23 — P2 polish pass** (de-emoji sweep + Device ID moved):
+
+1. **De-emoji sweep (§5, no-emoji UI).** The last user-facing glyphs are gone — status bar
+   (`⚠ ⟳ ✓` → color class `.vault-sync-sb-{conflict,pending,syncing,synced}` + the existing word
+   label), the `⟳` sync-progress prefix, the Test-connection result (`✓`/`✗` → `.vault-sync-test-ok`
+   / `.vault-sync-test-err` colour on the description), and the `⚠️` on the "still has conflict
+   markers" notice. `setStatusBarText` now takes a `state` and owns the single color class. The
+   Setup readiness `✓`/`✗` is deliberately **retained** (glyph + color together = accessible, not
+   color-only).
+2. **Device ID → Diagnostics (§4).** The read-only raw-UUID Device ID row moved out of the
+   top-level "This device" block into a collapsed **Diagnostics** `<details>` disclosure, so the
+   basics aren't cluttered by a value with no everyday use. Device *name* stays in "This device".
 
 **2026-07-23 — Unified conflicts, "full inline" (§3) — DECIDED & SHIPPED.** The two conflict
 experiences are unified into **one surface, the Conflicts panel**. Delete/binary conflicts no longer
@@ -298,8 +314,9 @@ and four expert/maintenance actions. Findings:
 - **P2 — "Clear sync cache" is styled as a warning but fires unguarded** (`:273`, no
   `ConfirmModal`). Its desc says "Safe", so acceptable; either drop the warning styling or add
   a confirm for consistency.
-- **P2 — Device ID read-only raw UUID near the top** (`:61`) adds clutter. **Fix:** move to
-  an "About/diagnostics" area or show only on demand.
+- **P2 — Device ID read-only raw UUID near the top** (`:61`) adds clutter. **✅ DONE.** Moved
+  into a collapsed **Diagnostics** `<details>` disclosure; the Device *name* stays in "This
+  device".
 - **P1 — the critical passphrase field has no confirm/typo guard** (`:135`). A mistype now
   fails *safely* (the key-check guard → `KeyMismatchError`), but the user still hits it only
   at sync time. **Fix:** the fingerprint + Test connection already form the guard; make them
@@ -331,8 +348,9 @@ The typed error family (`sync-errors.ts`) is **good** — messages name the knob
 - **P2 — status-bar click is overloaded and unlabeled** (`main.ts:219`: conflicts→panel, else
   →sync). Nothing signals it's clickable or that behavior changes. **Fix:** consistent action
   + a tooltip.
-- **P2 — "✅ Vault sync complete" only on manual sync** (`sync-coordinator.ts:137`) — fine, but
-  ensure auto-sync still updates the status bar to "✓ Synced" so silent success is visible.
+- **P2 — "Vault sync complete" toast only on manual sync** (`sync-coordinator.ts:137`) — fine, but
+  ensure auto-sync still updates the status bar to the "Synced" (green) state so silent success is
+  visible. *(The status bar now conveys "Synced" by color + label after every round, auto included.)*
 
 ---
 
@@ -397,11 +415,16 @@ has **zero `@media` queries** (grep confirms). Findings:
       status-modal internals — device *name*, no stranded hex, color-flagged attention rows (§5).
 
 **P2 — polish**
-- [ ] Casing/naming normalization; device *name* instead of UUID everywhere (§2, §3, §5).
+- [x] De-emoji sweep: status bar / sync-progress / Test-connection / marker notice glyphs → color +
+      word label (§5). *(readiness `✓`/`✗` kept — glyph+color is accessible, not color-only.)*
+- [ ] Casing/naming normalization; device *name* instead of UUID everywhere (§2, §3, §5). *(the raw
+      UUID is gone from the binary card and Device ID is now behind Diagnostics; casing is "Vault
+      Sync" throughout — only the delete-strategy setting-value rename remains.)*
 - [ ] Binary conflict thumbnail; neutral device-name placeholder (§3, §6). *(neutral "My phone /
       laptop" placeholder done in §1.1; the raw UUID is gone from the binary card (now a device
       label); image thumbnail still open.)*
-- [ ] Clear-cache confirm consistency; move Device ID to diagnostics (§4).
+- [x] Clear-cache confirm consistency; move Device ID to diagnostics (§4). *(clear-cache warning
+      styling already dropped in the §4 P1 pass; Device ID now lives in a Diagnostics disclosure.)*
 
 > **Status (2026-07-23):** all seven P0 items **and** the P1 set have landed (vocabulary,
 > full-inline conflict unification, danger hierarchy, plain phrasing, touch targets, onboarding

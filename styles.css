@@ -47,6 +47,17 @@ a.vault-sync-notice-link { display: inline-block; margin-top: 0.4rem; text-decor
 .vault-sync-check.is-ok { color: var(--text-success); }
 .vault-sync-check.is-missing { color: var(--text-error); }
 
+/* Test-connection result — pass/fail by color, not a glyph (UX audit §5, no-emoji UI) */
+.vault-sync-test-ok { color: var(--text-success); }
+.vault-sync-test-err { color: var(--text-error); }
+
+/* Status-bar state — color, not a glyph (UX audit §5, no-emoji UI). The word label
+ * ("Synced" / "N conflicts") still carries the state, so this isn't color-only. */
+.vault-sync-sb-conflict { color: var(--text-error); font-weight: 600; }
+.vault-sync-sb-pending { color: var(--text-accent); }
+.vault-sync-sb-syncing { color: var(--text-muted); }
+.vault-sync-sb-synced { color: var(--text-success); }
+
 /* Settings — Advanced / Danger-zone disclosures (UX audit §1.1, §4) */
 .vault-sync-disclosure { margin: 1rem 0 0.5rem; border-top: 1px solid var(--background-modifier-border); }
 .vault-sync-disclosure > summary {

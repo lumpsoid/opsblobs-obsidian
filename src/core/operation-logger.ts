@@ -346,7 +346,7 @@ export class OperationLogger {
       await this.contentStore.put(hash, content);
       await this.registry.updateContentHash(path, hash, hlcTs);
       if (hasConflictMarkers(new TextDecoder().decode(content))) {
-        this.notifier?.info(`⚠️ ${path} still has conflict markers — resolve them and save to finish syncing`);
+        this.notifier?.info(`${path} still has conflict markers — resolve them and save to finish syncing`);
         return;
       }
       const parents = entry.conflictParents;
