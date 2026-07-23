@@ -251,3 +251,60 @@ Judged against the perf-baseline §6 budgets, on a mid-range phone:
 
 If O1 lands and a no-op sync's capture is still O(F), the gate isn't working — treat as
 a correctness bug, not a tuning miss.
+
+---
+
+## 11. Handoff / current context (2026-07-23)
+
+Written so a fresh session can resume without re-deriving the codebase. Read
+`docs/sync-engineering-guide.md` first (mandatory before any core/merge/network change),
+then this.
+
+**Status.** O1 **landed** at commit `e84d5cb` on branch `sync-robustness-fixes` (off
+`master`). Working tree clean apart from this doc edit. Full suite green (**251 pass / 1
+skip**); `npm run build` (tsc + esbuild) clean. **Next up: O2 — content-store sharding.**
+
+**Repo workflow facts (learned this round — save yourself the rediscovery):**
+- Build/test: `npm run build` (= `tsc -noEmit -skipLibCheck && esbuild`), `npx vitest run`.
+  Bare `tsc --noEmit` shows pre-existing vitest/vite module-resolution noise — ignore it;
+  use the `-skipLibCheck` form. `noUncheckedIndexedAccess` is ON (index access needs `!`).
+- **Commits omit the `Co-Authored-By` trailer** (project convention / `[[no-coauthor-trailer]]`).
+  Conventional-commit style (`perf(sync): …`).
+- Tests **drive the real stack over in-memory fakes** via `TestDevice`
+  (`__tests__/helpers/test-device.ts`) — never a reimplementation. `seedExistingFile`
+  places bytes with no event (the capture path); `reload()` models a restart over the
+  same fakes. `FakeVaultFiles.io.*` counters are the ground-truth I/O assertions.
+- **Bench gotcha:** `npm run bench` **overwrites** `bench/results/2026-07-23_xs-s-m.{json,md}`
+  — which is the committed **pre-batching** baseline. After running, `git checkout --` those
+  two files to restore them. Compare your run against
+  `bench/results/2026-07-23_post-capture-fix_xs-s-m.*` (the batching baseline), **not** the
+  pre-batching one. `latest.*` are untracked/transient.
+
+**O2 concrete plan (`src/core/content-store.ts`).** Shard blobs git-style:
+`content/<hash[0:2]>/<hash>.bin` (256 buckets). No migration (§0) — a dev's flat
+`content/` is abandoned (wipe `.vault-sync/` or Rebuild sync metadata).
+- `contentPath(hash)` → `${CONTENT_DIR}/${hash.slice(0,2)}/${hash}.bin`.
+- `put()` must **mkdir the shard dir** before `write` (today it only relies on `init()`
+  having made `CONTENT_DIR`). `MetadataStore.write` does not auto-mkdir parents.
+- **⚠ The load-bearing gotcha — `listHashes()`/`gc()`.** The two `MetadataStore.list()`
+  implementations have **different semantics**, and sharding exposes it:
+  - `FakeMetadataStore.list(dir)` is **recursive** (prefix match — returns keys at any
+    depth), so it'd keep working by accident.
+  - `ObsidianMetadataStore.list(dir)` is **one-level** (`adapter.list(p).files` returns
+    only files *directly* in `p`; subfolders are in the discarded `.folders`). After
+    sharding, `list(CONTENT_DIR)` returns **nothing** on device → `listHashes` empty → GC
+    silently collects nothing (a content leak; not corruption, but wrong).
+  - **Fix:** make `listHashes` shard-aware in a way that works on *both* — iterate the 256
+    known prefixes (`00`..`ff`) and `list()` each shard dir, concatenating. Deterministic,
+    needs no port change, correct under both list() semantics. (Alternative — widen the
+    port with a recursive/`listDirs` call — is more surface; prefer the prefix sweep.)
+    Add a test that would **fail on the one-level semantics**, e.g. drive `gc` and assert
+    a sharded-but-unreferenced blob is actually deleted (and that a fake with one-level
+    semantics, or a direct check, catches the regression). Also sanity-check
+    `__tests__/helpers/fakes/README.md` where adapter assumptions are pinned.
+- Touch: `content-store.ts` (`contentPath`, `put`, `listHashes`, `init` stays as-is);
+  tests `__tests__/content-store-gc.test.ts` + any put→get→has→delete round-trip. `has()`
+  and `get()` already route through `contentPath`, so they shard for free.
+
+**Then:** O3 (registry journal) only if device B5 still superlinear; O4 opportunistic;
+finally re-measure Layer 2 + Layer 3 and update the perf baseline (§8).
