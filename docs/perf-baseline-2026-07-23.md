@@ -53,10 +53,13 @@ noted. Each maps to an Appendix-A hypothesis — **all were confirmed**.
    the registry write (commit below) cuts M to **26.5 MB / 6,096 syscalls** — a **74×**
    reduction in bytes — and removes the on-device cliff's cause.
 
-2. **Every routine round re-reads + re-SHA-256s the whole live vault (A1, B1).** A
-   **1-file** edit round hashed **F+1** files and issued **F** vault reads (M: 2001
-   hashes, 2000 reads for a one-file change). Round cost is O(F·B), independent of the
-   delta — the dominant per-round cost as a vault grows.
+2. **Every routine round re-reads + re-SHA-256s the whole live vault (A1, B1). —
+   FIXED, see "The R1 fix" below.** A **1-file** edit round hashed **F+1** files and
+   issued **F** vault reads (M: 2001 hashes, 2000 reads for a one-file change). Round
+   cost was O(F·B), independent of the delta — the dominant per-round cost as a vault
+   grows. R1 extends the capture mtime/size gate into `buildLocalState`, so the
+   steady-state capture→round sequence now hashes **≈1** and reads **1** at every
+   profile (M: **2** hashes, **1** read), independent of F.
 
 3. **VersionDAG walks scale with per-file history depth (A2/A6, B2).** A merge round
    against a peer with deep lineage did **20,440** `reachableContentHashes` walks and
@@ -267,6 +270,44 @@ registry journal** (the pattern the version-DAG store already uses). And the
 
 ---
 
+## The R1 fix — steady-state round stat-gate (`buildLocalState`)
+
+Landed after the capture fix (headline finding #2, A1/B1;
+`docs/steady-state-round-optimization-spec.md`). One change to
+`PluginVaultSyncHost.buildLocalState()` (`src/network/vault-sync-host.ts`), preserving
+every data-safety invariant (`sync-engineering-guide.md` §5/§7).
+
+The redundancy: the coordinator runs `captureOfflineChanges` (the mtime/size drift
+scan) milliseconds *before* every round, then `buildLocalState` unconditionally
+re-read + re-SHA-256'd the whole live vault again. R1 extends the shipped capture gate
+into the round — a live entry whose `mtime`/`size` still match `TFile.stat` is trusted
+(`entry.contentHash`) and its bytes are staged straight from the content store
+(memCache/blob hit, disk-read fallback on a store miss), with **no re-hash**. A
+placeholder / head-less / stat-drifted / stat-absent entry falls through to the exact
+prior read + hash + snapshot-correction path, so the F5 / un-opped-edit safeguards hold
+up to the same heuristic capture already accepts.
+
+**Layer-2 result (B1, `bench/run.ts` now profiles the real capture→round sequence).**
+Per-round SHA-256 and vault reads go **flat in F** — the O(F·B) per-round cost is gone:
+
+| Profile | sha256 before | sha256 after | fileReads before | fileReads after |
+|---|--:|--:|--:|--:|
+| XS (F=50)   | 51   | **2** | 50   | **1** |
+| S (F=500)   | 501  | **2** | 500  | **1** |
+| M (F=2000)  | 2001 | **2** | 2000 | **1** |
+
+The residual `sha256 = 2` is the one edited file (hashed once by capture) plus the
+push's blinded-blob hash — both O(touched), not O(F). The per-fold `buildLocalState`
+rebuilds in `reconcileConcurrentHeads` (B7) inherit the same O(touched) drop for free.
+
+**Deferred (spec §4/§7, R2 — Phase 2):** `buildLocalState` still *iterates* F entries
+and store-stages each gated file's bytes; skipping the byte-staging for the merge's
+non-working-set is a bigger, riskier merge-input change, **not warranted** by this
+Layer-2 number (reads already dropped to 1) — deferred until an on-device number says
+otherwise. **Layer 3 (on-device) for R1 still to record.**
+
+---
+
 ## Judged against the provisional budgets (spec §6)
 
 These budgets are for the **Layer-3 mobile** numbers. Only first-enable capture has a
@@ -354,6 +395,9 @@ so both would reproduce in the WebView.
       (O(F²) registry re-serialization), turned into a GC cliff on-device.
 - [x] **Fix the O(F²) capture** — registry batching + memCache clearing (74× fewer
       bytes at M); crash-safety checkpointing.
+- [x] **Fix the O(F·B) steady-state round (R1, A1/B1)** — mtime/size gate in
+      `buildLocalState`; B1 sha256 F+1 → 2, fileReads F → 1 (see "The R1 fix" above).
+      Layer-3 on-device confirmation still pending.
 - [x] **Native-ARM (Termux) full sweep** — B1–B9 at XS/S/M on the phone's real cores
       (recorded above; ~3× CPU penalty confirmed, routine budgets pass, diff3 low-unique
       + steady-state memCache flagged as the CPU hazards).
