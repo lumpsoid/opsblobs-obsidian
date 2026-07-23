@@ -83,7 +83,7 @@ describe('SyncCoordinator', () => {
     const state = h.syncState.get();
     expect(state.lastError).toBeNull();                       // cleared on success
     expect(state.lastSync).toMatchObject({ pushed: 2, pulled: 3, at: 5000 });
-    expect(state.deferred).toEqual([{ fileId: id, path: id, reason: 'drift', at: 5000 }]);
+    expect(state.deferred).toEqual([{ fileId: id, path: id, at: 5000 }]);
     expect(state.stranded).toEqual([{ contentHash: 'hashY', at: 5000 }]);
   });
 
@@ -144,42 +144,63 @@ describe('SyncCoordinator', () => {
     expect(syncState.get().lastError?.message).toContain('access token');
   });
 
-  test('deferred conflicts are tagged reason:conflict and counted; drift is not (Step 7)', async () => {
-    // Step 7: no hand-maintained badge. A round's `deferredConflicts` (delete/binary
-    // auto-defers) are folded into the observable `deferred` list with reason
-    // 'conflict'; F5 drift lands as reason 'drift'. `deferredConflictCount()` — the
-    // derived count the plugin's badge reads — reflects only the conflicts, and a
-    // later round that no longer defers them clears the count with no clear/self-heal.
-    const h = await harness({
-      summary: { pushed: 0, pulled: 2, deferred: ['fConf', 'fDrift'], stranded: [], deferredConflicts: ['fConf'] },
+  test('a deferred delete/binary conflict becomes a descriptor (not drift) and is counted', async () => {
+    // "Full inline" (§3): a round's `deferredConflicts` are the delete/binary conflicts
+    // the decide* handlers deferred to the panel — recorded as rich `conflicts`
+    // descriptors, split out of the F5-drift `deferred` list. `deferredConflictCount()`
+    // reflects only those; a later round that no longer defers them drops the count.
+    const deleteAction = { type: 'delete_conflict', fileId: 'fConf', path: 'c.md', side: 'remote_deleted', content: new Uint8Array() } as Extract<MergeAction, { type: 'delete_conflict' }>;
+    const h = await harness();
+    // The stubbed round stands in for the applicator invoking the coordinator's handler.
+    h.runRound.mockImplementationOnce(async () => {
+      await h.coordinator.decideDeleteConflict('ask', deleteAction);
+      return { pushed: 0, pulled: 2, deferred: ['fConf', 'fDrift'], stranded: [], deferredConflicts: ['fConf'] };
     });
 
     await h.coordinator.sync('manual');
 
-    const deferred = h.syncState.get().deferred;
-    expect(deferred.find(d => d.fileId === 'fConf')!.reason).toBe('conflict');
-    expect(deferred.find(d => d.fileId === 'fDrift')!.reason).toBe('drift');
-    expect(h.coordinator.deferredConflictCount()).toBe(1);        // only the conflict
+    // Drift stays in `deferred`; the conflict moves to `conflicts` with its descriptor.
+    expect(h.syncState.get().deferred.map(d => d.fileId)).toEqual(['fDrift']);
+    const conflicts = h.syncState.get().conflicts;
+    expect(conflicts.map(c => c.fileId)).toEqual(['fConf']);
+    expect(conflicts[0]).toMatchObject({ kind: 'delete', path: 'c.md', side: 'remote_deleted' });
+    expect(h.coordinator.deferredConflictCount()).toBe(1);
     expect(h.syncState.get().lastSync?.conflicts).toBe(1);
 
-    // A subsequent round that defers nothing (the conflict resolved) replaces the
-    // list wholesale — the count drops to zero on its own, no bookkeeping.
+    // A subsequent round that defers nothing replaces the list wholesale — count → 0.
     h.runRound.mockResolvedValueOnce(EMPTY_SUMMARY);
     await h.coordinator.sync('manual');
     expect(h.coordinator.deferredConflictCount()).toBe(0);
   });
 
-  test('auto delete conflict defers only for the ask strategy; a standing policy runs unattended', async () => {
+  test('delete conflict: a recorded panel decision is consumed; a standing policy applies; else defer', async () => {
     const h = await harness();
-    h.coordinator.setSource('auto');
     const action = { type: 'delete_conflict', fileId: 'f3', path: 'c.md', side: 'remote_deleted', content: new Uint8Array() } as Extract<MergeAction, { type: 'delete_conflict' }>;
 
-    const deferred = await h.coordinator.decideDeleteConflict('ask', action, async () => 'restore');
-    expect(deferred).toBe(DEFER_CONFLICT);
+    // No decision, 'ask' strategy → defer to the panel (record a descriptor).
+    expect(await h.coordinator.decideDeleteConflict('ask', action)).toBe(DEFER_CONFLICT);
 
-    // A non-ask policy is the user's standing choice → applied even under auto.
-    const policy = await h.coordinator.decideDeleteConflict('keep_deleted', action, async () => 'restore');
-    expect(policy).toBe('keep_deleted');
+    // A standing non-'ask' policy is the user's blanket choice → applied.
+    expect(await h.coordinator.decideDeleteConflict('keep_deleted', action)).toBe('keep_deleted');
+
+    // A decision the user recorded in the panel is consumed (even under 'ask').
+    await h.syncState.recordDecision('f3', { kind: 'delete', decision: 'restore' });
+    expect(await h.coordinator.decideDeleteConflict('ask', action)).toBe('restore');
+  });
+
+  test('binary conflict: a recorded decision is consumed; else defer to the panel', async () => {
+    const h = await harness();
+    const hlc = (deviceId: string, wallTime: number) => ({ deviceId, wallTime, counter: 0 });
+    const action = {
+      type: 'binary_conflict', fileId: 'f4', localPath: 'p.png', remotePath: 'p.png',
+      localContent: new Uint8Array(10), remoteContent: new Uint8Array(20),
+      localHlc: hlc('dev-a', 1000), remoteHlc: hlc('dev-b', 2000),
+    } as Extract<MergeAction, { type: 'binary_conflict' }>;
+
+    expect(await h.coordinator.decideBinaryConflict(action)).toBe(DEFER_CONFLICT);
+
+    await h.syncState.recordDecision('f4', { kind: 'binary', decision: 'keep_remote' });
+    expect(await h.coordinator.decideBinaryConflict(action)).toBe('keep_remote');
   });
 
   test('reset: confirm=false aborts (never reconciles/captures/clears)', async () => {

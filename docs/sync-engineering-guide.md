@@ -157,14 +157,14 @@ relevant `core`/`merge` unit) with a port for the Obsidian bit.
 | `network/sync-applicator.ts` | Applies merge actions to the real vault (writes/moves/trashes, writes conflict markers, mints merge nodes via `mintMergeResolution`). Reports `deferred` + `deferredConflicts` fileIds back to the round. |
 | `network/vault-sync-host.ts` | `PluginVaultSyncHost` — bridges the obsidian-free round to the live stores; stages each head's DAG-reachable base bytes for the three-way merge. |
 | `network/version-dag-store.ts` | Persists the `VersionDag` incrementally: a compacted snapshot (`version-dag.json`) + an append-only JSONL journal (`version-dag.log`) of edges since. A round `appendEdges` only its *new* edges (O(delta)); the O(N) full rewrite is deferred to `compact()` past a threshold. Defensive `load()` = snapshot ⊕ journal-replay, tolerant of a missing/corrupt snapshot and a torn trailing journal line. |
-| `network/sync-coordinator.ts` | Obsidian-free orchestration: the capture→round→record sequence, manual/auto delete/binary conflict decisions, reset/rebaseline. `deferredConflictCount()` is a derived per-round count (no badge bookkeeping). |
+| `network/sync-coordinator.ts` | Obsidian-free orchestration: the capture→round→record sequence, delete/binary conflict decisions (always defer to the panel; consume a `pendingDecision` when present — §3 "full inline"), reset/rebaseline. `deferredConflictCount()` is a derived per-round count (no badge bookkeeping). |
 | `network/sync-state-store.ts` | The **observable** sync state (`.vault-sync/sync-state.json`): `deferred` files (each `reason: 'drift' \| 'conflict'`), `stranded` content, last error, last-round summary. No outstanding-conflict set (retired in Step 7). |
 | `network/cursor-store.ts` / `hlc-store.ts` | Scalar cursor + persisted HLC. |
 | `network/encryption.ts` | `VaultCrypto` — passphrase-derived key, op/blob envelopes, blinded content hashes (unlinkable dedup). |
 | `network/server-http.ts` / `fake-server.ts` | Real HTTP `ServerApi` vs in-memory fake (contract-tested to be equivalent). `HttpServerApi` bounds every `requestUrl` with `withTimeout` and maps each transport outcome to the typed error family (401/403→auth, 404→not-found, 5xx→server, no-response→network). |
 | `network/sync-errors.ts` | The **user-actionable typed-error family** every round can throw — `KeyMismatchError` (passphrase guard), `AuthError`/`NotFoundError`/`ServerError`/`NetworkError`/`TimeoutError` (transport), `DecryptError` (wrong/legacy key at pull), `StaleCursorError` (internal, F4). Each `message` is written for the user; the coordinator toasts it verbatim. Obsidian-free. |
 | `network/with-timeout.ts` | Pure `withTimeout(op, ms, label)` — bounds a hung `requestUrl` (which has no native timeout) and rejects with `TimeoutError`. The detached request is harmless (idempotent writes). |
-| `ui/conflicts-view.ts` | The non-blocking Conflicts panel (an `ItemView`): lists two-headed files + a per-hunk 3-way compare; applying writes marker-free bytes through the ordinary save path. |
+| `ui/conflicts-view.ts` | The non-blocking Conflicts panel (an `ItemView`): the single "needs your attention" surface — two-headed text files (per-hunk 3-way compare, applied through the ordinary save path) **and** delete/binary conflict cards resolved inline (records a `pendingDecision`, §3 "full inline"). |
 
 ---
 
@@ -290,21 +290,30 @@ self-heal) is **retired** — that whole `SyncStateStore` outstanding-conflict s
    modal, no cursor hold) and records the file **two-headed** via
    `registry.markConflicted` (`FileEntry.conflictParents = [A, B]`). The write is
    F5-drift-guarded.
-2. **Surface (delete/binary)** — these can't sit as inline markers, so an *auto* round
-   **defers** them (`DEFER_CONFLICT`), holding the cursor so they re-present on the next
-   manual sync. A *manual* round runs the delete/binary modal.
+2. **Surface (delete/binary)** — these can't sit as inline markers, so **every** round
+   (auto *and* manual) **defers** them (`DEFER_CONFLICT`), holding the cursor so they
+   re-present next round. There is **no blocking modal** anymore (UX audit §3, "full
+   inline"): each deferral is recorded as a rich `ConflictDescriptor` on the observable
+   state (`SyncState.conflicts`) and rendered as a card in the **Conflicts panel**, where
+   the user picks a side. The pick is stored as a `SyncState.pendingDecisions[fileId]` and
+   **consumed by the next round's** `decideDeleteConflict`/`decideBinaryConflict` (which
+   return it instead of deferring), so the applicator applies it and mints the merge node.
+   Exception: a standing non-`ask` delete-conflict *policy* still applies unattended.
 3. **The two derived facts:**
    - **Text conflicts** = `listTwoHeadedConflicts(registry entries)` — the files with two
      `conflictParents` heads.
-   - **Auto-deferred delete/binary conflicts** = this round's `deferredConflicts`
-     (applicator-tagged), surfaced in the observable `deferred` list with
-     `reason: 'conflict'` (vs F5's `'drift'`) and **replaced wholesale each round** — the
-     held cursor re-surfaces them, so there is nothing to record or clear.
-   - `main.conflictCount()` = `twoHeadedConflicts().length + deferredConflictCount()`.
-4. **Resolution is just editing.** A two-headed file's **next save** — hand-edited markers
-   or a click through the Conflicts panel — removes the markers; `op-logger.flushModify`
-   emits a `Ops.merge` node with `parents: [A, B]`, collapsing to one head. A save that
-   *still* contains markers → a gentle non-blocking notice, no merge yet.
+   - **Delete/binary conflicts** = `SyncState.conflicts` (the descriptors the round's
+     decide* handlers accumulated), **replaced wholesale each round** — the held cursor
+     re-surfaces them, so there is nothing to clear. `pendingDecisions` self-heals to this
+     live set (a resolved conflict's decision is pruned in `setRound`).
+   - `main.conflictCount()` = `twoHeadedConflicts().length + deferredConflictCount()`,
+     where `deferredConflictCount() = SyncState.conflicts.length`.
+4. **Resolution.** *Text:* a two-headed file's **next save** — hand-edited markers or a click
+   through the Conflicts panel — removes the markers; `op-logger.flushModify` emits a
+   `Ops.merge` node with `parents: [A, B]`, collapsing to one head (a save still containing
+   markers → a gentle non-blocking notice, no merge yet). *Delete/binary:* the panel records
+   a `pendingDecision` and triggers a sync; that round's applicator applies the choice and
+   mints the two-parent merge node. Either way the resolution is a merge node peers adopt.
 5. **Replicate.** The merge node is pushed like an edit; a peer still holding either head
    **fast-forwards** onto it (it descends from both) — no re-conflict, no `supersedes`.
    `resolveContentConflict` has a two-headed guard so it never nests markers over markers.

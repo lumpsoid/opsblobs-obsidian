@@ -63,9 +63,11 @@ to the finding it resolves.
 
 **2026-07-23 — P1 remediation pass** (most P1 items landed; see §7 checklist):
 
-1. **Dismiss = defer (§3).** Both blocking modals (delete/modify, binary) now treat a dismiss as
-   *defer* — the applicator's existing hold-cursor / tag-`reason:'conflict'` path — never a silent
-   destructive pick, and each has an explicit **Decide later**. Emoji headers dropped.
+1. **Dismiss = defer, then "full inline" (§3).** First pass made both blocking modals treat a
+   dismiss as *defer* (never a silent destructive pick). The follow-up **removed the modals
+   entirely** ("full inline", see the dedicated decision below): delete/binary conflicts now defer
+   on every round into the Conflicts panel and resolve inline — so a silent-dismiss pick is gone by
+   construction.
 2. **Conflict legibility (§3).** The ancestor pane is **Original** with a read-only gloss; a live
    **Preview result** shows exactly what Apply writes (same `resolveMarkedText` rule, so it can't
    diverge from what lands); "Both" states its ordering (Mine, then Theirs).
@@ -77,10 +79,22 @@ to the finding it resolves.
 5. **Onboarding (§1.4/§1.5).** Fingerprint copy button + a "why it must match" gloss; the dead-end
    unlock-failure copy now names the next step.
 
-**Still open (P1/P2):** one unified "Needs your attention" list spanning text + delete/binary
-conflicts (§3); an optional friendlier marker *header line* (§2); the remaining P2 polish
-(device-name + thumbnail in the binary modal, delete-strategy setting-value rename, full
-text-symbol de-emoji sweep).
+**Still open (P2):** an optional friendlier marker *header line* (§2); a binary-conflict
+*thumbnail* preview (the binary card now shows size + device + time inline, no raw UUID); the
+delete-strategy setting-value rename; the full status-bar text-symbol de-emoji sweep.
+
+**2026-07-23 — Unified conflicts, "full inline" (§3) — DECIDED & SHIPPED.** The two conflict
+experiences are unified into **one surface, the Conflicts panel**. Delete/binary conflicts no longer
+open a blocking modal on any round; they **always defer** and are recorded as durable
+`ConflictDescriptor`s (`SyncState.conflicts`) that render as inline cards in the panel. Resolving a
+card writes a `SyncState.pendingDecisions[fileId]` and triggers a sync; the next round's
+`decideDeleteConflict`/`decideBinaryConflict` **consume** the decision (return it) so the applicator
+applies it and mints the two-parent merge node — identical convergence to the old modal path, just
+non-blocking and discoverable in one place. `pendingDecisions` self-heals to the live conflict set
+each round. A standing non-`ask` delete policy still applies unattended. `DeleteConflictModal` /
+`BinaryConflictModal` were deleted; the status modal keeps only a pointer to the panel.
+**Rejected:** "list in panel but resolve via the existing modal" and "cross-link the two surfaces"
+— both keep the split interaction model the finding calls out.
 
 **2026-07-23 — P1 vocabulary decision (§2) — DECIDED & SHIPPED.** The two conflicting sides are
 **"Mine" / "Theirs"** everywhere users see them (panel panes, inline note markers, status copy);
@@ -100,10 +114,12 @@ precise term. Product-name casing normalized to **"Vault Sync"**.
 |---|---|---|
 | `src/ui/settings-tab.ts` | `SyncSettingTab` — the only config surface | yes |
 | `src/ui/sync-status-modal.ts` | `SyncStatusModal` — inspectable status | yes |
-| `src/ui/conflicts-view.ts` | `ConflictsView` — non-blocking text-conflict side panel | yes |
-| `src/ui/delete-conflict-modal.ts` | `DeleteConflictModal` — delete/modify decision (manual sync only) | yes |
-| `src/ui/binary-conflict-modal.ts` | `BinaryConflictModal` — binary decision (manual sync only) | yes |
-| `src/ui/confirm-modal.ts` | `ConfirmModal` — generic yes/no | yes |
+| `src/ui/conflicts-view.ts` | `ConflictsView` — the single non-blocking conflicts panel: text (per-hunk) **and** delete/binary (inline decision) | yes |
+| `src/ui/confirm-modal.ts` | `ConfirmModal` — generic yes/no (+ type-to-confirm gate) | yes |
+
+> **Removed (§3 "full inline"):** `src/ui/delete-conflict-modal.ts` and
+> `src/ui/binary-conflict-modal.ts` — the blocking delete/binary modals are gone; those
+> decisions are now cards in the Conflicts panel, resolved inline.
 
 Other UX-bearing code: `src/main.ts` (ribbon, status bar, commands, Notices),
 `src/network/sync-coordinator.ts` (toasts), `src/network/obsidian-notifier.ts` (Notice
@@ -213,14 +229,16 @@ Additional copy findings:
 
 ## 3. Conflict resolution UX — **P0/P1**
 
-There are **three distinct conflict experiences with no unifying model** presented to the
-user, and blocking-vs-nonblocking is inconsistent.
+*Audit-time state (retained for context): there were three distinct conflict experiences with no
+unifying model, and blocking-vs-nonblocking was inconsistent.* **This is now unified — see the
+"full inline" decision of record:** all conflicts live in the one `ConflictsView` panel.
 
 1. **Text conflicts** — non-blocking: markers written into the note + the `ConflictsView`
-   side panel (per-hunk 3-way, "Mine/Base/Theirs" panes `:197-199`, buttons `:207-209`).
-2. **Delete/modify** — blocking `DeleteConflictModal`, **manual sync only**; an auto sync
-   defers it silently to the status modal.
-3. **Binary** — blocking `BinaryConflictModal`, **manual sync only**; same silent-defer.
+   panel (per-hunk 3-way, "Mine/Original/Theirs" panes, side buttons + a resolved-result preview).
+2. **Delete/modify** — *was* a blocking `DeleteConflictModal` (manual only); **now** an inline card
+   in the panel ("Keep modified" / "Keep deleted"), deferred on every round until resolved.
+3. **Binary** — *was* a blocking `BinaryConflictModal` (manual only); **now** an inline card in the
+   panel (size + device + time per side, "Keep this device" / "Keep other device").
 
 Findings:
 
@@ -232,12 +250,15 @@ Findings:
   conflicts" notice (no surprise focus change). The rise is keyed off the two-headed count so a
   periodic auto-sync doesn't nag. The view also moved from the right sidebar to a **main-area
   tab** (better on mobile). The command-palette route ("Open conflicts") is retained.
-- **P1 — blocking vs waiting is inconsistent and unexplained.** Text waits (panel); delete/
-  binary block (modal) but only on manual sync, and are silently deferred on auto sync.
-  A user who only auto-syncs may never see a delete/binary decision unless they open the
-  status modal. **Fix:** unify the mental model — all conflicts appear in one "Needs your
-  attention" list (the status modal already has this heading) with a consistent CTA; the
-  blocking modals become one *entry* in that list rather than the only way to resolve.
+- **P1 — blocking vs waiting is inconsistent and unexplained. ✅ SHIPPED ("full inline").** Text
+  waited (panel) while delete/binary blocked (modal, manual only) or silently deferred (auto).
+  **Shipped:** delete/binary conflicts **no longer block** — every round defers them to the
+  **Conflicts panel** as inline cards (persisted `ConflictDescriptor`s), so text and
+  delete/binary now share one surface and one mental model. Resolving a card records a
+  `pendingDecision` the next round consumes (the applicator mints the merge node); a standing
+  non-`ask` delete policy still applies unattended. The status modal's "Needs your attention"
+  section now just lists them with an **Open Conflicts panel** button. The blocking modals were
+  deleted.
 - **P1 — the ancestor pane is unexplained. ✅ SHIPPED.** Renamed **Original**, glossed per-pane
   ("The shared starting point, before either edit. Read-only reference."), and already visually
   de-emphasized (greyed, non-clickable).
@@ -248,9 +269,10 @@ Findings:
   `BinaryConflictModal` now **defers** (holds the cursor, tags `reason:'conflict'`, re-presents next
   manual sync) instead of silently picking `'restore'` / `'keep_local'`; a decision is only committed
   by an explicit button, and each modal has a **Decide later** that produces the same deferral.
-- **P2 — binary modal shows only text metadata** (size, `device 3f9a2b` raw UUID `:53`,
-  timestamp) — no image thumbnail. **Fix:** thumbnail for image types; replace the raw UUID
-  with the device *name*.
+- **P2 — binary conflict shows only text metadata ◑ PARTIAL.** The binary decision is now an inline
+  panel card showing size + device + time per side; the raw UUID is gone (it uses the same
+  `describeDevice` short label as the text-conflict provenance chips). **Still open:** an image
+  *thumbnail* for image types.
 
 ---
 
@@ -353,10 +375,11 @@ has **zero `@media` queries** (grep confirms). Findings:
       everywhere; markers relabelled back-compatibly; "unlock"/"ready" for the derive jargon;
       "Vault Sync" casing. **Still open:** the optional friendlier marker *header line*, and the
       P2 delete-strategy setting-value rename.)*
-- [◑] Unify the conflict mental model; dismiss = defer, never a silent pick (§3). *(dismiss = defer
-      shipped for both blocking modals, each with an explicit "Decide later"; the emoji headers
-      dropped. **Still open:** folding text + delete/binary into one "Needs your attention" list —
-      today text conflicts live in the panel and delete/binary in the status modal.)*
+- [x] Unify the conflict mental model; dismiss = defer, never a silent pick (§3). *("Full inline":
+      delete/binary conflicts no longer block — they're inline cards in the Conflicts panel
+      alongside text conflicts (one surface, one model), resolved by recording a decision the next
+      round consumes. The blocking modals were deleted, so "silent dismiss pick" is gone by
+      construction.)*
 - [x] "Original" pane label + gloss; resolved-result preview (§3). *(pane renamed Base→Original with
       per-pane tooltips; live collapsible "Preview result"; "Both" states its ordering.)*
 - [x] Settings IA: Advanced disclosure + a Danger zone for re-baseline (§4). *(disclosures landed with
@@ -372,7 +395,8 @@ has **zero `@media` queries** (grep confirms). Findings:
 **P2 — polish**
 - [ ] Casing/naming normalization; device *name* instead of UUID everywhere (§2, §3, §5).
 - [ ] Binary conflict thumbnail; neutral device-name placeholder (§3, §6). *(neutral "My phone /
-      laptop" placeholder done in §1.1; thumbnail still open.)*
+      laptop" placeholder done in §1.1; the raw UUID is gone from the binary card (now a device
+      label); image thumbnail still open.)*
 - [ ] Clear-cache confirm consistency; move Device ID to diagnostics (§4).
 
 > **P0 status (2026-07-23):** all seven P0 items landed. Remaining work is P1/P2 plus the

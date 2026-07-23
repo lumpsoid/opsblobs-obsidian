@@ -10,7 +10,7 @@ import { ContentStore } from './core/content-store';
 import { randomUuid } from './core/encoding';
 import { OperationLogger } from './core/operation-logger';
 import { resolveDeleteStrategy } from './core/conflict-policy';
-import { SyncApplicator, DeferConflict } from './network/sync-applicator';
+import { SyncApplicator } from './network/sync-applicator';
 import { ObsidianVaultFiles } from './network/obsidian-vault-files';
 import { ObsidianMetadataStore } from './network/obsidian-metadata-store';
 import { ObsidianVaultWatcher } from './network/obsidian-vault-watcher';
@@ -23,8 +23,6 @@ import { VersionDagStore } from './network/version-dag-store';
 import { HlcStore } from './network/hlc-store';
 import { SyncStateStore } from './network/sync-state-store';
 import { PluginVaultSyncHost } from './network/vault-sync-host';
-import { DeleteConflictModal } from './ui/delete-conflict-modal';
-import { BinaryConflictModal } from './ui/binary-conflict-modal';
 import { SyncStatusModal } from './ui/sync-status-modal';
 import { ConfirmModal } from './ui/confirm-modal';
 import { SyncSettingTab } from './ui/settings-tab';
@@ -134,26 +132,17 @@ export default class VaultSyncPlugin extends Plugin {
       this.contentStore,
       this.opLogger,
       this.hlc,
-      // A text conflict is surfaced non-blockingly as inline markers by the
-      // applicator (sync v2 Step 5) — no handler. The remaining choice-based
-      // delete/binary conflicts still delegate the manual/auto branching +
-      // outstanding-conflict bookkeeping to the coordinator (S5); the plugin
-      // supplies only the Obsidian modal a *manual* round opens for the decision.
+      // A text conflict is surfaced non-blockingly as inline markers by the applicator
+      // (sync v2 Step 5) — no handler. Delete/binary conflicts no longer open a blocking
+      // modal (§3, "full inline"): the coordinator defers them to the Conflicts panel and
+      // consumes the decision the user records there on a later round. No Obsidian modal
+      // is wired here anymore — the panel is the resolution surface.
       (action) =>
         this.coordinator.decideDeleteConflict(
           resolveDeleteStrategy(this.settings.deleteConflictStrategy),
           action,
-          a =>
-            new Promise<'keep_deleted' | 'restore' | DeferConflict>(resolve => {
-              new DeleteConflictModal(this.app, a.path, a.side, resolve).open();
-            }),
         ),
-      (action) =>
-        this.coordinator.decideBinaryConflict(action, a =>
-          new Promise<'keep_local' | 'keep_remote' | DeferConflict>(resolve => {
-            new BinaryConflictModal(this.app, a, resolve).open();
-          }),
-        ),
+      (action) => this.coordinator.decideBinaryConflict(action),
     );
 
     // Load persisted state
@@ -444,20 +433,21 @@ export default class VaultSyncPlugin extends Plugin {
 
     this.syncInProgress = true;
     this.updateRibbonState('syncing');
-    // Snapshot text-conflict count so we can tell if THIS round newly introduced any
-    // (§3). Keyed off two-headed files specifically — that's exactly what the
-    // conflicts view lists — so a rise maps 1:1 to a card the user must resolve.
-    const textConflictsBefore = this.twoHeadedConflicts().length;
+    // Snapshot the total conflict count so we can tell if THIS round newly introduced
+    // any (§3). Covers both text (two-headed files) and delete/binary conflicts — the
+    // Conflicts panel now lists both — so a rise maps to a new item the user must
+    // resolve, and a persisting conflict (same count) doesn't re-nag.
+    const conflictsBefore = this.conflictCount();
     try {
       const outcome = await this.coordinator.sync(source);
       // Land on the conflict state (not idle) if the round left conflicts the user
       // still needs to resolve, so the indicator doesn't silently go green.
       if (!outcome.ok) this.updateRibbonState('error');
       else this.updateRibbonState(this.conflictCount() > 0 ? 'conflict' : 'idle');
-      // Surface newly-introduced text conflicts (§3): only on a rise, so a periodic
+      // Surface newly-introduced conflicts (§3): only on a rise, so a periodic
       // auto-sync doesn't nag every round while the same conflicts sit unresolved.
-      if (outcome.ok && this.twoHeadedConflicts().length > textConflictsBefore) {
-        this.revealNewConflicts(source, this.twoHeadedConflicts().length);
+      if (outcome.ok && this.conflictCount() > conflictsBefore) {
+        this.revealNewConflicts(source, this.conflictCount());
       }
     } finally {
       this.syncInProgress = false;
@@ -671,6 +661,16 @@ export default class VaultSyncPlugin extends Plugin {
       },
       describeDevice: (deviceId) =>
         deviceId === this.settings.deviceId ? 'this device' : `device ${deviceId.slice(0, 6)}`,
+      // Delete/binary conflicts (§3 "full inline"): the panel lists the round's
+      // descriptors and resolves them by recording a decision the next sync consumes.
+      listDeleteBinaryConflicts: () => this.syncState.get().conflicts,
+      resolveDeleteBinary: async (fileId, decision) => {
+        await this.syncState.recordDecision(fileId, decision);
+        // The recorded decision is applied by the next round's applicator (mints the
+        // merge node). Trigger it now so the resolution lands promptly; the finally
+        // block's emitConflictChange refreshes the panel once the entry is gone.
+        await this.triggerSync('manual');
+      },
       onChange: (cb) => {
         this.conflictChangeListeners.add(cb);
         return () => this.conflictChangeListeners.delete(cb);
@@ -713,7 +713,7 @@ export default class VaultSyncPlugin extends Plugin {
       deviceName: this.settings.deviceName,
       pendingPaths: this.opLogger.getPendingOps().map(op => op.path),
       state: this.syncState.get(),
-      onResolveConflicts: () => { void this.recheckConflicts(); },
+      onOpenConflicts: () => { void this.activateConflictsView(); },
     }).open();
   }
 }

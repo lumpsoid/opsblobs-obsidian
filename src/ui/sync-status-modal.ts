@@ -4,12 +4,10 @@
 //
 //  The inspectable "current state of sync" surface — replaces the transient
 //  8-second Notice. Shows the last round's result, still-pending changes, and
-//  anything that needs attention: delete/binary conflicts an auto-round deferred
-//  (reason 'conflict' — need a manual sync), files deferred for on-disk drift
-//  (reason 'drift' — retry automatically), content stranded waiting on a blob, and
-//  the last error. The conflict-deferred files get a "Resolve now" action that
-//  re-runs a manual sync so their resolution modal opens (via recheckConflicts).
-//  (Text conflicts live in the non-blocking Conflicts panel, not here.)
+//  anything that needs attention: delete/binary conflicts awaiting a decision, files
+//  deferred for on-disk drift (retry automatically), content stranded waiting on a
+//  blob, and the last error. The conflicts get an "Open Conflicts panel" action — the
+//  panel is where they (and text conflicts) are actually resolved (§3 "full inline").
 
 import { App, Modal, Setting } from 'obsidian';
 import { SyncState } from '../network/sync-state-store';
@@ -23,9 +21,9 @@ export interface SyncStatusSnapshot {
   deviceName: string;
   pendingPaths: string[];
   state: SyncState;
-  /** Re-pull the whole history and recompute merges, bringing back a skipped
-   *  conflict. Closes the modal and runs a sync. */
-  onResolveConflicts: () => void;
+  /** Open the Conflicts panel — where delete/binary conflicts are resolved (§3).
+   *  Closes the modal first. */
+  onOpenConflicts: () => void;
 }
 
 export class SyncStatusModal extends Modal {
@@ -61,36 +59,36 @@ export class SyncStatusModal extends Modal {
       this.pathList(this.snap.pendingPaths);
     }
 
-    // ── Deferred conflicts (need a manual sync) ───────────────────────────────
-    const conflicts = s.deferred.filter(d => d.reason === 'conflict');
+    // ── Delete/binary conflicts (resolved in the Conflicts panel) ─────────────
+    const conflicts = s.conflicts;
     contentEl.createEl('h3', { text: `Needs your attention (${conflicts.length})` });
     if (conflicts.length === 0) {
-      contentEl.createEl('p', { text: 'No deferred conflicts.', cls: 'setting-item-description' });
+      contentEl.createEl('p', { text: 'No conflicts waiting.', cls: 'setting-item-description' });
     } else {
       contentEl.createEl('p', {
-        text: 'An unattended sync deferred these delete/binary conflicts. Your current version is kept; run a manual sync to resolve each.',
+        text: 'These delete/binary conflicts are waiting for your decision. Your current version is kept until you choose.',
         cls: 'setting-item-description',
       });
       for (const c of conflicts) {
         // Flagged by color, not an emoji (no-emoji UI decision, §5).
         contentEl.createEl('div', {
-          text: `${c.path} — since ${this.rel(c.at)}`,
+          text: `${c.path} (${c.kind}) — since ${this.rel(c.at)}`,
           cls: 'setting-item-description vault-sync-status-attention',
         });
       }
       new Setting(contentEl)
-        .setName('Resolve deferred conflicts')
-        .setDesc('Re-pull the full history and re-present each conflict for resolution.')
+        .setName('Resolve conflicts')
+        .setDesc('Open the Conflicts panel to choose which version to keep for each.')
         .addButton(btn => {
-          btn.setButtonText('Resolve now').setCta().onClick(() => {
+          btn.setButtonText('Open Conflicts panel').setCta().onClick(() => {
             this.close();
-            this.snap.onResolveConflicts();
+            this.snap.onOpenConflicts();
           });
         });
     }
 
     // ── Deferred (drift) ──────────────────────────────────────────────────────
-    const drift = s.deferred.filter(d => d.reason === 'drift');
+    const drift = s.deferred; // deferred is F5-drift only now (conflicts are separate)
     if (drift.length > 0) {
       contentEl.createEl('h3', { text: `Deferred — changed during sync (${drift.length})` });
       contentEl.createEl('p', {

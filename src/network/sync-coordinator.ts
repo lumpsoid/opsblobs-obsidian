@@ -22,12 +22,10 @@ import { OperationLogger } from '../core/operation-logger';
 import { FileRegistry } from '../core/file-registry';
 import { EditorSaver } from '../ports/editor-saver';
 import { Notifier } from '../ports/notifier';
-import { SyncStateStore } from './sync-state-store';
+import { SyncStateStore, ConflictDescriptor } from './sync-state-store';
 import { SyncRoundSummary } from './server-sync';
 import { DEFER_CONFLICT, DeferConflict } from './sync-applicator';
 import { isSetupError } from './sync-errors';
-// The interactive resolvers may now themselves defer (the modal's "Decide later" /
-// dismiss path, §3), so their result type includes DeferConflict.
 
 export type SyncSource = 'manual' | 'auto';
 
@@ -38,15 +36,6 @@ export interface SyncOutcome {
   summary?: SyncRoundSummary;
   error?: Error;
 }
-
-/** Interactive resolvers — the plugin's modal wrappers. Only invoked on a manual
- *  round; an auto round defers before ever reaching them. A text `conflict` has no
- *  resolver: it is surfaced non-blockingly as inline markers (sync v2 Step 5) and
- *  resolved by the next ordinary save, never a modal. */
-export type InteractiveDeleteResolver =
-  (action: Extract<MergeAction, { type: 'delete_conflict' }>) => Promise<'keep_deleted' | 'restore' | DeferConflict>;
-export type InteractiveBinaryResolver =
-  (action: Extract<MergeAction, { type: 'binary_conflict' }>) => Promise<'keep_local' | 'keep_remote' | DeferConflict>;
 
 export interface SyncCoordinatorDeps {
   editorSaver: EditorSaver;
@@ -82,10 +71,10 @@ export class SyncCoordinator {
   private readonly openSettings?: () => void;
   private readonly now: () => number;
 
-  /** Source of the round currently running — read by the applicator's conflict
-   *  handlers (via the `decide*` methods) so an unattended `'auto'` round defers
-   *  instead of blocking on a modal (S5). Set at the start of every `sync()`. */
-  private currentSource: SyncSource = 'manual';
+  /** Delete/binary conflict descriptors accumulated by the `decide*` handlers while
+   *  the current round applies (they defer instead of blocking a modal, §3). Reset at
+   *  the start of every `sync()` and folded into the observable state after the round. */
+  private roundConflicts: ConflictDescriptor[] = [];
 
   constructor(deps: SyncCoordinatorDeps) {
     this.editorSaver = deps.editorSaver;
@@ -99,15 +88,6 @@ export class SyncCoordinator {
     this.markSynced = deps.markSynced ?? (async () => {});
     this.openSettings = deps.openSettings;
     this.now = deps.now ?? (() => Date.now());
-  }
-
-  /** The source of the in-flight round (for the plugin's conflict-handler closures). */
-  get source(): SyncSource {
-    return this.currentSource;
-  }
-
-  setSource(source: SyncSource): void {
-    this.currentSource = source;
   }
 
   /**
@@ -124,7 +104,8 @@ export class SyncCoordinator {
    * never clears the error or pending ops — the un-pushed work survives for retry.
    */
   async sync(source: SyncSource): Promise<SyncOutcome> {
-    this.currentSource = source;
+    // Fresh slate for the descriptors the round's decide* handlers will accumulate.
+    this.roundConflicts = [];
     try {
       // S1: force-save editors → flush armed debounce timers → capture on-disk drift.
       await this.editorSaver.saveOpenEditors();
@@ -164,12 +145,12 @@ export class SyncCoordinator {
     }
   }
 
-  /** Delete/binary conflicts an unattended auto-round deferred and that still need a
-   *  manual sync — a *derived* count over the last round's observable state (no
-   *  hand-maintained set, Step 7). Text conflicts are the two-headed files, counted
-   *  separately by the plugin from the registry. */
+  /** Delete/binary conflicts awaiting a decision in the Conflicts panel — a *derived*
+   *  count over the last round's observable state (no hand-maintained set). Text
+   *  conflicts are the two-headed files, counted separately by the plugin from the
+   *  registry. */
   deferredConflictCount(): number {
-    return this.syncState.get().deferred.filter(d => d.reason === 'conflict').length;
+    return this.syncState.get().conflicts.length;
   }
 
   /**
@@ -201,60 +182,69 @@ export class SyncCoordinator {
     await runManualSync();
   }
 
-  // ─── Conflict decisions (manual: delegate to a modal · auto: defer) ──────────
+  // ─── Conflict decisions ("full inline", §3) ──────────────────────────────────
   //
-  // A text `conflict` has no decision here — the applicator writes inline markers
-  // non-blockingly and the next ordinary save resolves it (sync v2 Step 5). Only the
-  // choice-based delete/binary conflicts still route through a modal (manual) or
-  // defer (auto).
-
-  //
-  // No badge bookkeeping here anymore (Step 7): an auto-defer is surfaced by the
-  // round's `deferredConflicts` (the applicator tags it), and a resolution simply
-  // stops the file re-appearing. These methods only decide defer-vs-resolve.
+  // A text `conflict` has no decision here — the applicator writes inline markers and
+  // the next ordinary save resolves it (sync v2 Step 5). The choice-based delete/binary
+  // conflicts no longer open a blocking modal on any round; they always *defer* to the
+  // Conflicts panel (recording a descriptor for it), UNLESS the user already made a
+  // decision there (consumed here) or a standing non-`ask` policy applies. The held
+  // cursor re-surfaces a deferred conflict until it is resolved.
 
   /**
-   * Delete/modify conflict. A non-`ask` strategy is the user's standing policy and
-   * runs unattended in either mode. `ask` under auto defers (the applicator holds
-   * the cursor + tags it a conflict); `ask` under manual runs the modal.
+   * Delete/modify conflict. Precedence: a decision the user recorded in the panel is
+   * consumed now (the round applies it, minting the merge node); else a standing
+   * non-`ask` policy is the user's blanket choice and applies unattended; else defer
+   * to the panel (record a descriptor).
    */
   async decideDeleteConflict(
     strategy: 'ask' | 'keep_deleted' | 'restore',
     action: Extract<MergeAction, { type: 'delete_conflict' }>,
-    interactive: InteractiveDeleteResolver,
   ): Promise<'keep_deleted' | 'restore' | DeferConflict> {
-    if (strategy === 'ask' && this.currentSource === 'auto') return DEFER_CONFLICT;
-    return strategy !== 'ask' ? strategy : interactive(action);
+    const rec = this.syncState.getDecision(action.fileId);
+    if (rec?.kind === 'delete') return rec.decision;
+    if (strategy !== 'ask') return strategy;
+    this.roundConflicts.push({
+      fileId: action.fileId, path: action.path, kind: 'delete', side: action.side, at: this.now(),
+    });
+    return DEFER_CONFLICT;
   }
 
-  /** Binary conflict. Auto → defer (cursor held, tagged a conflict); manual → modal. */
+  /** Binary conflict. A recorded panel decision is consumed now; otherwise defer to
+   *  the panel (there is no standing policy for binary conflicts). */
   async decideBinaryConflict(
     action: Extract<MergeAction, { type: 'binary_conflict' }>,
-    interactive: InteractiveBinaryResolver,
   ): Promise<'keep_local' | 'keep_remote' | DeferConflict> {
-    if (this.currentSource === 'auto') return DEFER_CONFLICT;
-    return interactive(action);
+    const rec = this.syncState.getDecision(action.fileId);
+    if (rec?.kind === 'binary') return rec.decision;
+    this.roundConflicts.push({
+      fileId: action.fileId, path: action.localPath, kind: 'binary', at: this.now(),
+      binary: {
+        localBytes: action.localContent.length, remoteBytes: action.remoteContent.length,
+        localDevice: action.localHlc.deviceId, remoteDevice: action.remoteHlc.deviceId,
+        localAt: action.localHlc.wallTime, remoteAt: action.remoteHlc.wallTime,
+      },
+    });
+    return DEFER_CONFLICT;
   }
 
-  /** Fold a completed round's summary into the persisted sync-state (S2): the
-   *  one-line last-sync record plus the deferred/stranded lists, resolving raw
-   *  fileIds/hashes to vault paths for display. */
+  /** Fold a completed round's summary into the persisted sync-state (S2): the one-line
+   *  last-sync record, the F5-drift `deferred` list, the stranded list, and the
+   *  delete/binary `conflicts` descriptors the round's decide* handlers accumulated.
+   *  The applicator's `deferredConflicts` fileIds are exactly those descriptors' ids, so
+   *  they are split out of `deferred` (which stays drift-only). */
   private async recordRoundOutcome(summary: SyncRoundSummary): Promise<void> {
     const at = this.now();
-    // Tag each deferral drift-vs-conflict from the applicator's `deferredConflicts`
-    // subset, so the UI can label them and count only the conflicts (Step 7).
     const conflictIds = new Set(summary.deferredConflicts);
-    const deferred = summary.deferred.map(fileId => ({
-      fileId,
-      path: this.registry.getById(fileId)?.path ?? fileId,
-      reason: (conflictIds.has(fileId) ? 'conflict' : 'drift') as 'drift' | 'conflict',
-      at,
-    }));
+    const deferred = summary.deferred
+      .filter(fileId => !conflictIds.has(fileId))
+      .map(fileId => ({ fileId, path: this.registry.getById(fileId)?.path ?? fileId, at }));
     const stranded = summary.stranded.map(contentHash => ({ contentHash, at }));
     await this.syncState.setRound(
       { at, pushed: summary.pushed, pulled: summary.pulled, conflicts: summary.deferredConflicts.length },
       deferred,
       stranded,
+      this.roundConflicts,
     );
   }
 }

@@ -15,6 +15,7 @@
 import { ButtonComponent, ItemView, WorkspaceLeaf, setIcon } from 'obsidian';
 import { ConflictResolution } from '../types';
 import { ConflictListItem } from '../core/conflict-inventory';
+import { ConflictDescriptor, ConflictDecision } from '../network/sync-state-store';
 import { parseConflictMarkers, resolveMarkedText, ConflictMarkerSegment } from '../merge/diff3';
 
 export const CONFLICTS_VIEW_TYPE = 'vault-sync-conflicts';
@@ -24,6 +25,11 @@ export const CONFLICTS_VIEW_TYPE = 'vault-sync-conflicts';
 export interface ConflictsViewHost {
   /** The two-headed files awaiting resolution (a derived query over the registry). */
   listConflicts(): ConflictListItem[];
+  /** Delete/binary conflicts awaiting a decision (persisted descriptors, §3). */
+  listDeleteBinaryConflicts(): ConflictDescriptor[];
+  /** Record the user's inline decision for a delete/binary conflict and apply it (the
+   *  next sync round consumes it and mints the merge node). */
+  resolveDeleteBinary(fileId: string, decision: ConflictDecision): Promise<void>;
   /** Current on-disk text of a tracked file (its marked working copy), or null. */
   readFile(path: string): Promise<string | null>;
   /** Write the resolved (marker-free) text — the Step-5 resolving save. */
@@ -77,8 +83,10 @@ export class ConflictsView extends ItemView {
     const token = ++this.renderToken;
     const root = this.containerEl.children[1] as HTMLElement;
     const items = this.host.listConflicts();
+    const dbConflicts = this.host.listDeleteBinaryConflicts();
+    const total = items.length + dbConflicts.length;
 
-    // Fetch every file's marked text first (async), then paint in one pass so a
+    // Fetch every text file's marked content first (async), then paint in one pass so a
     // slow read can't interleave a stale card into a newer render.
     const texts = await Promise.all(items.map(i => this.host.readFile(i.path)));
     if (token !== this.renderToken) return; // a newer render superseded us
@@ -90,25 +98,81 @@ export class ConflictsView extends ItemView {
     header.createEl('h3', { text: 'Sync conflicts' });
     header.createEl('div', {
       cls: 'vault-sync-conflicts-count',
-      text: items.length === 0
+      text: total === 0
         ? 'No conflicts — everything is in sync.'
-        : `${items.length} file${items.length !== 1 ? 's' : ''} need${items.length === 1 ? 's' : ''} resolution. ` +
-          'Choose a side per change, then Apply — or edit the markers directly in the note.',
+        : `${total} item${total !== 1 ? 's' : ''} need${total === 1 ? 's' : ''} your attention.`,
     });
 
-    // Prune per-file UI state for files that are no longer conflicted.
+    // Prune per-file UI state for text files that are no longer conflicted.
     const liveIds = new Set(items.map(i => i.fileId));
     for (const id of [...this.selections.keys()]) if (!liveIds.has(id)) this.selections.delete(id);
     for (const id of [...this.previewOpen]) if (!liveIds.has(id)) this.previewOpen.delete(id);
 
-    if (items.length === 0) {
+    if (total === 0) {
       setIcon(root.createDiv('vault-sync-conflicts-empty'), 'check-circle-2');
       return;
     }
 
+    // Delete/binary conflicts first (a single decision each), then the text-merge cards.
+    if (dbConflicts.length > 0) {
+      for (const c of dbConflicts) this.renderDecisionCard(root, c);
+    }
     items.forEach((item, idx) => {
       this.renderFileCard(root, item, texts[idx] ?? null);
     });
+  }
+
+  /** A delete/binary conflict card: one decision, resolved inline (§3 "full inline").
+   *  Recording a choice triggers a sync that applies it; the card drops on refresh. */
+  private renderDecisionCard(root: HTMLElement, c: ConflictDescriptor): void {
+    const card = root.createDiv('vault-sync-conflict-card');
+    const head = card.createDiv('vault-sync-conflict-card-header');
+    const title = head.createDiv('vault-sync-conflict-path');
+    setIcon(title.createSpan('vault-sync-conflict-path-icon'), c.kind === 'delete' ? 'trash-2' : 'image');
+    title.createSpan({ text: c.path });
+
+    const body = card.createDiv('vault-sync-conflict-note');
+    const actions = card.createDiv('vault-sync-conflict-actions');
+
+    const resolve = (decision: ConflictDecision) => {
+      // Optimistically disable the whole card while the applying round runs.
+      actions.querySelectorAll('button').forEach(b => (b as HTMLButtonElement).disabled = true);
+      void this.host.resolveDeleteBinary(c.fileId, decision);
+    };
+
+    if (c.kind === 'delete') {
+      const deletedHere = c.side === 'local_deleted';
+      body.setText(
+        `Deleted on ${deletedHere ? 'this device' : 'another device'} but modified on ` +
+        `${deletedHere ? 'another device' : 'this device'}. Keep the deletion, or restore the ` +
+        'modified version?',
+      );
+      new ButtonComponent(actions).setButtonText('Keep modified version').setCta()
+        .onClick(() => resolve({ kind: 'delete', decision: 'restore' }));
+      new ButtonComponent(actions).setButtonText('Keep deleted')
+        .onClick(() => resolve({ kind: 'delete', decision: 'keep_deleted' }));
+    } else {
+      const b = c.binary;
+      body.setText('Changed on two devices at once. Binary files can\'t be merged — keep one whole ' +
+        'version (the other stays in the sync history and can be recovered later).');
+      if (b) {
+        const sides = card.createDiv('vault-sync-binary-sides');
+        this.renderBinarySide(sides, 'This device', b.localBytes, b.localDevice, b.localAt);
+        this.renderBinarySide(sides, 'Other device', b.remoteBytes, b.remoteDevice, b.remoteAt);
+      }
+      new ButtonComponent(actions).setButtonText("Keep this device's version").setCta()
+        .onClick(() => resolve({ kind: 'binary', decision: 'keep_local' }));
+      new ButtonComponent(actions).setButtonText("Keep other device's version")
+        .onClick(() => resolve({ kind: 'binary', decision: 'keep_remote' }));
+    }
+  }
+
+  private renderBinarySide(parent: HTMLElement, label: string, bytes: number, deviceId: string, at: number): void {
+    const el = parent.createDiv('vault-sync-binary-side');
+    el.createDiv({ cls: 'vault-sync-pane-label', text: label });
+    const who = this.host.describeDevice(deviceId);
+    const when = relativeTime(at);
+    el.createDiv({ text: `${formatBytes(bytes)} · ${who}${when ? ` · ${when}` : ''}`, cls: 'vault-sync-binary-side-meta' });
   }
 
   private renderFileCard(root: HTMLElement, item: ConflictListItem, text: string | null): void {
@@ -275,4 +339,11 @@ function relativeTime(wallTime: number): string {
   if (hr < 24) return `${hr}h ago`;
   const day = Math.floor(hr / 24);
   return `${day}d ago`;
+}
+
+/** Human-readable byte size for the binary-conflict side metadata. */
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
