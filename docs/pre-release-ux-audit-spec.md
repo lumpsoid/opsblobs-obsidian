@@ -1,7 +1,9 @@
 # Vault Sync — Pre-Release UX Audit & Remediation Spec
 
 **Status:** audit-of-record · **Date:** 2026-07-23 · **Owner:** UX + client ·
-**Progress: all P0 + all P1 landed; P2 polish + the §8 manual-smoke pass remain.**
+**Progress: all P0 + all P1 landed, plus most P2 polish (de-emoji sweep, Device ID → Diagnostics,
+delete-strategy vocabulary). Only two P2 items remain — a friendlier marker header line and a
+binary-conflict thumbnail — plus the §8 manual-smoke pass.**
 
 This is a **point-in-time audit** of every user-facing surface of the plugin, plus a
 prioritized remediation plan to make setup and daily use *clear and comfortable* before
@@ -438,9 +440,11 @@ has **zero `@media` queries** (grep confirms). Findings:
 
 > **Status (2026-07-23):** all seven P0 items **and** the P1 set have landed (vocabulary,
 > full-inline conflict unification, danger hierarchy, plain phrasing, touch targets, onboarding
-> copy). Remaining work is **P2 polish** plus the **manual-smoke matrix (§8)** on desktop + a real
-> mobile device — the code is verified by unit tests in the obsidian-free layer, but every UI
-> surface still needs a hands-on pass (see the Known manual-smoke surface in the engineering guide).
+> copy), plus most of **P2** (de-emoji sweep, Device ID → Diagnostics, delete-strategy vocabulary).
+> Remaining: **two P2 items** — a friendlier marker *header line* and a binary-conflict *thumbnail* —
+> plus the **manual-smoke matrix (§8)** on desktop + a real mobile device. The code is verified by
+> unit tests in the obsidian-free layer, but every UI surface still needs a hands-on pass (see the
+> Known manual-smoke surface in the engineering guide).
 
 ---
 
