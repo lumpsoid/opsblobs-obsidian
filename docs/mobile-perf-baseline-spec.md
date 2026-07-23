@@ -161,9 +161,21 @@ super-linear behavior (its `common.filter(common.some(isAncestor))` is O(common�
 > curve), and effectively *clears* `mergeBase`'s quadratic filter for the linear-lineage
 > case. **The `common²·(V+E)` cliff only bites when a file's two heads share a *large*
 > common-ancestor set** — which this profile never builds (it diverges at the create
-> version, so `common` size = 1). Fixes implied by *this* curve (deep-walk, not filter):
-> memoize/cache `ancestors()` results within a round, and gate `buildLocalState`'s base-byte
-> staging so it doesn't re-hash unchanged history every round (relates to B1's O(F·B) re-hash).
+> version, so `common` size = 1).
+>
+> **Root cause corrected + FIXED (`server-sync.ts` `reconcileConcurrentHeads`).** A deeper
+> profile decomposed the residual: `reachableContentHashes` was invoked ~3,200× per round at
+> K = 160 (`buildLocalState`'s full per-file read+hash+stage loop re-run ~K times), so the cost
+> was **not** the O(depth) `ancestors()` walk (memoizing it would not have helped) — it was the
+> reconcile fold loop **spinning**. `reconcileConcurrentHeads` set `folded = true` whenever it
+> *attempted* a foldable leaf, but a two-headed **text conflict** doesn't collapse (the pairwise
+> merge re-conflicts), so it re-picked the same leaf every iteration and spun to `maxFolds`
+> (≈ pulled ops), re-running `buildLocalState` each time. Fix: remember attempted
+> `(fileId, leafId)` pairs → folds bounded to O(distinct extra leaves). **Measured B2 K = 160:
+> `fileReads` 64,460 → 460 (140×), `reachable`/`sha256` now flat in K, `mergeRoundMs`
+> 29,108 → 466 ms (62×).** Residual ms growth is the inherent O(H) pull/decrypt of the deep
+> chain (a B4-class cost), not the reconcile. Pinned by `reconcile-conflict-spin.test.ts`
+> (conflict still surfaced, neither edit lost, `buildLocalState` count single-digit vs ~K+1).
 
 **B2b — mergeBase's `common²` filter (deep SHARED backbone, tip divergence).**
 The variant that isolates the filter B2 cleared. Both devices fast-forward onto a depth-K
@@ -337,7 +349,12 @@ are not fixes** — they are the map of what to measure.
    per-file during capture/apply → up to O(F²) bytes written, ×~3 fs ops via the atomic
    temp+remove+rename dance. `file-registry.ts`, `obsidian-metadata-store.ts:33-49`. (B3, B5)
 5. **`reconcileConcurrentHeads` re-runs `buildLocalState` + DAG reload inside its fold loop** —
-   `server-sync.ts:554-557`. O(folds·(F·B+G)); pathological in **C**. (B7)
+   `server-sync.ts:554-557`. O(folds·(F·B+G)); pathological in **C**. (B7) — **partly FIXED:** the
+   loop no longer *spins* on a non-collapsing conflict fold (it re-picked the same un-foldable
+   text-conflict leaf every iteration → `folds ≈ pulled ops`); attempted-leaf memo bounds it to
+   O(distinct extra leaves). This was the dominant **B2** cost (fileReads 64k→460 at K=160, 62×).
+   The remaining per-*genuine*-fold `buildLocalState` re-run (real cost in **C**, B7) is still open
+   — reuse the loaded state across folds instead of a full rebuild.
 6. **The DAG snapshot is loaded + JSON-parsed 3–4× per round** (dagNeedsRebuild,
    buildLocalState, recordVersionEdges, + per fold) — each O(G), redundant. `vault-sync-host.ts`. (B1, B7)
 7. **Cold pull / DAG rebuild is O(H)** — `dagNeedsRebuild` resets cursor to 0; `pullAll`
