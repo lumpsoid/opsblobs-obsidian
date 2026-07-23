@@ -156,16 +156,42 @@ export class VersionDag {
   mergeBase(a: string, b: string): MergeBaseResult {
     const ancA = this.ancestors(a);
     const ancB = this.ancestors(b);
-    const common: string[] = [];
-    for (const h of ancA) if (ancB.has(h)) common.push(h);
-    if (common.length === 0) return null;
-    // The LCA(s) are the *maximal* common ancestors — those that are not a proper
-    // ancestor of any other common ancestor. Exactly one → the merge base; more
-    // than one incomparable → ambiguous.
-    const maximal = common.filter(
-      x => !common.some(y => y !== x && this.isAncestor(x, y)),
-    );
-    return maximal.length === 1 ? maximal[0]! : MULTIPLE_BASES;
+    const common = new Set<string>();
+    for (const h of ancA) if (ancB.has(h)) common.add(h);
+    if (common.size === 0) return null;
+    // The LCA(s) are the *maximal* common ancestors — those not a proper ancestor of
+    // any other common ancestor. Exactly one → the merge base; ≥2 incomparable →
+    // ambiguous (criss-cross).
+    //
+    // Computed in ONE multi-source upward walk, not the former O(common²·(V+E))
+    // pairwise `isAncestor` scan (which was the B2b merge-round cliff — its cost grew
+    // ~2·depth per call, see docs/mobile-perf-baseline-spec.md). Walk up from every
+    // common node's PARENTS, marking each node reached: a common node so marked is a
+    // proper ancestor of some other common node, hence NOT maximal. Touches each edge
+    // once → O(V+E), and issues zero `isAncestor` calls. Correct independent of node
+    // ordering (a set-membership question), so `mergeBase(a,b) === mergeBase(b,a)` —
+    // determinism preserved. Cycle-safe via the `dominated` visited set.
+    const dominated = new Set<string>();
+    const stack: string[] = [];
+    for (const c of common) {
+      const node = this.nodes.get(c);
+      if (node) for (const p of node.parents) stack.push(p);
+    }
+    while (stack.length > 0) {
+      const cur = stack.pop()!;
+      if (dominated.has(cur)) continue;
+      dominated.add(cur);
+      const node = this.nodes.get(cur);
+      if (node) for (const p of node.parents) stack.push(p);
+    }
+    let base: string | null = null;
+    let count = 0;
+    for (const c of common) {
+      if (dominated.has(c)) continue;   // c is an ancestor of another common node
+      base = c;
+      if (++count > 1) return MULTIPLE_BASES;
+    }
+    return count === 1 ? base : MULTIPLE_BASES;
   }
 
   /**

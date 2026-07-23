@@ -89,6 +89,26 @@ describe('VersionDag (pure structure)', () => {
     expect(dag.mergeBase('M', 'X')).toBe('X');
   });
 
+  test('deep shared backbone, tip divergence → base is the tip, no O(common²) scan', () => {
+    // The B2b topology (docs/mobile-perf-baseline-spec.md): both heads fast-forward
+    // onto a deep SHARED chain, then diverge by one edit each — so `common` is the
+    // whole backbone (large), the case the old pairwise-isAncestor filter blew up on.
+    // The multi-source maximal-scan must still return the single deepest common node.
+    const dag = new VersionDag();
+    dag.addVersion('v0', [], 'h0', 'f1');
+    let prev = 'v0';
+    for (let i = 1; i <= 12; i++) {
+      dag.addVersion(`v${i}`, [prev], `h${i}`, 'f1');   // linear backbone v0..v12
+      prev = `v${i}`;
+    }
+    dag.addVersion('X', ['v12'], 'hX', 'f1');   // device A's tip edit off the backbone
+    dag.addVersion('Y', ['v12'], 'hY', 'f1');   // device B's tip edit (concurrent)
+    // common(X, Y) = {v0..v12}, but the LCA is the single deepest one: v12.
+    expect(dag.mergeBase('X', 'Y')).toBe('v12');
+    expect(dag.mergeBase('Y', 'X')).toBe('v12');   // order-independent
+    expect(dag.isAncestor('X', 'Y')).toBe(false);
+  });
+
   test('criss-cross: two incomparable common ancestors → MULTIPLE', () => {
     const dag = new VersionDag();
     dag.addVersion('P', [], 'hP', 'f1');

@@ -180,13 +180,22 @@ The variant that isolates the filter B2 cleared. Both devices fast-forward onto 
 > **FLAT** (840 / 860) — B2b pays in the *filter*, B2 pays in the *walk/rehash*; together they
 > decompose the two DAG cost sources. The Layer-2 `isAncestor` count is the device-independent
 > signal (wall time only starts to bite at K ≳ 160 on a laptop; a slow phone / larger graph
-> moves that left). **Fix:** the `common.filter(common.some(isAncestor))` maximal-element scan
-> is the target — precompute a topological depth per node so "is x a proper ancestor of any
-> other common?" is an O(1) depth-compare instead of an isAncestor DFS, or short-circuit once a
-> single maximal element is found for the fast-forward-eligible case. (A *true* criss-cross —
-> many mutually-**incomparable** maximal common ancestors → `MULTIPLE_BASES` — would defeat the
-> short-circuit entirely and is the pathological ceiling; B2b's totally-ordered backbone is the
-> achievable-through-the-real-stack lower bound on that cost.)
+> moves that left).
+>
+> **FIXED (`version-dag.ts` `mergeBase`).** The `common.filter(common.some(isAncestor))`
+> maximal-element scan was replaced by a **single multi-source upward walk**: walk up from
+> every common node's parents, mark everything reached, and any common node so marked is a
+> proper ancestor of another common node → non-maximal. One traversal, O(V+E), **zero
+> `isAncestor` calls** — provably correct independent of node ordering (a set-membership
+> question), so determinism/commutativity hold. Re-measured K = 5/20/80/160/320: `isAncestor`
+> is now **flat at 81** (the constant `state-merge` fast-forward checks; `mergeBase` itself
+> issues none), down from `61·(2K+1)` — a **483× drop at K = 320** (39,121 → 81), and the ratio
+> collapses 641 → **1.33**. The topo-depth idea (an O(1) depth-compare prune) is unnecessary:
+> the multi-source walk kills the quadratic without any incremental depth bookkeeping to
+> maintain/propagate. Pinned by `version-dag.test.ts` "deep shared backbone, tip divergence".
+> *(The residual `mergeRoundMs` growth is now purely B2's O(depth) `ancestors()` walk + base
+> staging — the next target. A true criss-cross, many mutually-incomparable maximal common
+> ancestors → `MULTIPLE_BASES`, is handled by the same single walk at the same O(V+E) cost.)*
 
 **B3 — Cold startup vs F (`captureOfflineChanges`).**
 Populate F files on disk (via `seedExistingFile` — no events), then `reload()` and time
@@ -317,10 +326,11 @@ are not fixes** — they are the map of what to measure.
    (2026-07-23)** isolates the filter with a *deep shared backbone*: `common ≈ K`, `mergeBase`
    flat but `isAncestor` ≈ FILES·(2K+1) → the ratio climbs 11→41→161→321→641, an **O(K²)-per-round
    filter cliff** (reads/reachable stay flat). So there are **two** distinct DAG costs here:
-   the deep-walk/rehash (B2) and the `common²` maximal-scan (B2b). Implied fixes: memoize
-   `ancestors()` + stop re-staging unchanged history (B2); precompute per-node topo-depth so the
-   maximal-element scan is an O(1) compare, not an isAncestor DFS (B2b). See the B2/B2b §5
-   measured-notes.
+   the deep-walk/rehash (B2, open) and the `common²` maximal-scan (B2b, **FIXED**). B2b's
+   filter is gone: `mergeBase`'s pairwise-isAncestor scan is now a single multi-source upward
+   walk (O(V+E), zero isAncestor) — `isAncestor` dropped from `61·(2K+1)` to a flat 81 (483× at
+   K = 320). Remaining: memoize `ancestors()` + stop re-staging unchanged history (B2). See the
+   B2/B2b §5 measured-notes.
 3. **`ContentStore.memCache` is unbounded; `clearMemCache()` is never called** —
    `content-store.ts:31,112`. Session-lifetime RAM growth toward total content bytes. (B6)
 4. **FileRegistry full pretty-printed JSON rewrite on every one of ~12 mutation sites**, looped
