@@ -105,8 +105,18 @@ export class OperationLogger {
    *  run for many minutes on mobile; the callback surfaces liveness + the throughput
    *  curve even when it hasn't finished (a phase timed only on completion reports
    *  nothing). Inert when omitted — no work is done in the hot path beyond a modulo.
+   * @param signal Optional cancellation for the walk. On a large mobile vault this pass
+   *  runs for minutes; when the plugin is disabled mid-capture `main.ts` aborts this so
+   *  the loop stops at its next iteration instead of hashing thousands of files after
+   *  the user has left. It persists the partial progress (the same registry+oplog flush
+   *  the checkpoints use) and returns *before* the delete-detection pass — a partial
+   *  `onDisk` set there would look like a vault-wide offline delete. The un-scanned tail
+   *  is simply picked up on the next capture; deferring capture is always safe.
    */
-  async captureOfflineChanges(onProgress?: (scanned: number, total: number) => void): Promise<void> {
+  async captureOfflineChanges(
+    onProgress?: (scanned: number, total: number) => void,
+    signal?: AbortSignal,
+  ): Promise<void> {
     let changed = false;
     let sinceCheckpoint = 0;
     const onDisk = new Set<string>();
@@ -124,6 +134,17 @@ export class OperationLogger {
     const total = live.length;
     let scanned = 0;
     for (const ref of live) {
+      // Cancelled (plugin disabled mid-capture): persist what we've scanned so far —
+      // the same registry-then-oplog ordering the checkpoint uses, so disk stays
+      // consistent — and return BEFORE the delete-detection pass below. `onDisk` is
+      // only partially filled here, and running that pass would read every un-scanned
+      // file as "vanished while offline" and emit a vault-wide phantom delete. The
+      // tail re-captures on the next enable; the `finally` still runs `resumeSaves`.
+      if (signal?.aborted) {
+        await this.registry.flush();
+        if (changed) await this.saveOpLog();
+        return;
+      }
       if (onProgress && ++scanned % CAPTURE_PROGRESS_EVERY === 0) onProgress(scanned, total);
       const path = ref.path;
       if (this.isExcluded(path)) continue;

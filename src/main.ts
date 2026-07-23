@@ -66,6 +66,12 @@ export default class VaultSyncPlugin extends Plugin {
    *  it isn't running. Surfaced in the status modal so a minutes-long first pass shows
    *  how far along it is. Only set for a *large* capture (see CAPTURE_PROGRESS_UI_MIN). */
   private indexingProgress: { scanned: number; total: number } | null = null;
+  /** Aborts the in-flight first-enable capture when the plugin is disabled/unloaded.
+   *  The capture walks every vault file (O(F·B) hashing) and can run for minutes on a
+   *  large mobile vault; without this it would run to completion after the user has
+   *  already disabled the plugin. Tripped in `onunload`, checked at the top of the
+   *  capture loop, which then persists its partial progress and returns early. */
+  private captureAbort = new AbortController();
 
   /** Subscribers (the conflicts panel) to notify when the two-headed set may have
    *  changed — an op recorded/cleared, or a sync round finished. `opLogger.onChange`
@@ -272,6 +278,11 @@ export default class VaultSyncPlugin extends Plugin {
   }
 
   onunload() {
+    // Signal the in-flight first-enable capture to stop at its next loop iteration.
+    // It persists what it has scanned so far (checkpoint-safe) and re-resumes on the
+    // next enable — so disabling mid-capture on a large vault no longer keeps the
+    // device hashing thousands of files after the user has walked away.
+    this.captureAbort.abort();
     this.opLogger.stopListening();
     // Final HLC persist on shutdown (F7) so time issued since the last op/sync
     // survives the restart. Fire-and-forget — onunload can't await.
@@ -461,7 +472,7 @@ export default class VaultSyncPlugin extends Plugin {
       }
       // Diagnostics (Layer 3): per-phase heap + timing only when perfLog is on.
       sink?.(`captureOfflineChanges ${scanned}/${total}${heapNote()}`, performance.now() - t0);
-    });
+    }, this.captureAbort.signal);
     sink?.(`captureOfflineChanges total${heapNote()}`, performance.now() - t0);
     // Capture done — the modal's indexing section clears itself once this reads null.
     this.indexingProgress = null;
