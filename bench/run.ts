@@ -50,6 +50,22 @@ const PROFILES: Profile[] = selected.map(k => {
   return p;
 }).filter((p): p is Profile => p !== null);
 
+// ─── Scenario / sweep selectors (constrained-host escape hatches) ─────────────────
+// A phone under Termux can't run the whole sweep — BENCH_FULL's K=1000 point alone
+// builds ~20k hashed edits *of setup* per scenario (B2/B2b/B4), which reads as an
+// "eternity" hang on mobile. These let a run pick a subset that actually completes:
+//   BENCH_ONLY=b1,b3     run only these scenarios (default: all)
+//   BENCH_K=20           override the B2/B2b/B4 K-sweep (default: [20,50], full: [20,50,200,1000])
+//   BENCH_ROUNDS=10      B6 session length (default: 50)
+//   BENCH_C=3,5          override the B7 concurrency sweep (default: [3,5,10])
+const ONLY = (process.env.BENCH_ONLY ?? '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+const want = (name: string): boolean => ONLY.length === 0 || ONLY.includes(name);
+const parseNums = (v: string | undefined, fallback: number[]): number[] =>
+  v ? v.split(',').map(s => Number(s.trim())).filter(n => Number.isFinite(n) && n > 0) : fallback;
+const K_SWEEP = parseNums(process.env.BENCH_K, process.env.BENCH_FULL ? [20, 50, 200, 1000] : [20, 50]);
+const B6_ROUNDS = Math.max(1, Number(process.env.BENCH_ROUNDS ?? 50));
+const C_SWEEP = parseNums(process.env.BENCH_C, [3, 5, 10]);
+
 // ─── Result rows ────────────────────────────────────────────────────────────────
 
 interface Row {
@@ -459,26 +475,27 @@ async function main(): Promise<void> {
   console.log(`[bench] profiles: ${PROFILES.map(p => p.name).join(', ')}\n`);
   const t0 = nowMs();
 
-  console.log('B1 — steady-state round vs F');
-  for (const p of PROFILES) await b1(p);
-  console.log('B2 — round vs history H (DAG walks)');
-  for (const K of (process.env.BENCH_FULL ? [20, 50, 200, 1000] : [20, 50])) await b2(K);
-  console.log('B2b — mergeBase common² filter (deep shared backbone)');
-  for (const K of (process.env.BENCH_FULL ? [20, 50, 200, 1000] : [20, 50])) await b2b(K);
-  console.log('B3 — cold startup vs F');
-  for (const p of PROFILES) await b3(p);
-  console.log('B4 — cold pull / DAG rebuild vs H');
-  for (const K of (process.env.BENCH_FULL ? [20, 50, 200, 1000] : [20, 50])) await b4(K);
-  console.log('B5 — write amplification (L2 only)');
-  for (const p of PROFILES) await b5(p);
-  console.log('B6 — memory over a session');
-  for (const p of PROFILES) await b6(p);
-  console.log('B7 — concurrent-head fold vs C');
-  for (const C of [3, 5, 10]) await b7(C);
-  console.log('B8 — diff3 large-file merge');
-  await b8();
-  console.log('B9 — crypto attribution');
-  await b9();
+  if (ONLY.length) console.log(`[bench] scenarios: ${ONLY.join(', ')} · K=${K_SWEEP.join(',')} · B6 rounds=${B6_ROUNDS}\n`);
+  if (want('b1')) { console.log('B1 — steady-state round vs F');
+    for (const p of PROFILES) await b1(p); }
+  if (want('b2')) { console.log('B2 — round vs history H (DAG walks)');
+    for (const K of K_SWEEP) await b2(K); }
+  if (want('b2b')) { console.log('B2b — mergeBase common² filter (deep shared backbone)');
+    for (const K of K_SWEEP) await b2b(K); }
+  if (want('b3')) { console.log('B3 — cold startup vs F');
+    for (const p of PROFILES) await b3(p); }
+  if (want('b4')) { console.log('B4 — cold pull / DAG rebuild vs H');
+    for (const K of K_SWEEP) await b4(K); }
+  if (want('b5')) { console.log('B5 — write amplification (L2 only)');
+    for (const p of PROFILES) await b5(p); }
+  if (want('b6')) { console.log('B6 — memory over a session');
+    for (const p of PROFILES) await b6(p, B6_ROUNDS); }
+  if (want('b7')) { console.log('B7 — concurrent-head fold vs C');
+    for (const C of C_SWEEP) await b7(C); }
+  if (want('b8')) { console.log('B8 — diff3 large-file merge');
+    await b8(); }
+  if (want('b9')) { console.log('B9 — crypto attribution');
+    await b9(); }
 
   const elapsed = ((nowMs() - t0) / 1000).toFixed(1);
   console.log(`\n[bench] done in ${elapsed}s — ${rows.length} rows`);
