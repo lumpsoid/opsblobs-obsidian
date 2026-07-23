@@ -4,7 +4,11 @@
 // ---------------------------------------------
 //
 //  Content-addressed storage for ancestor versions and pending content.
-//  Stored at .vault-sync/content/<hash>.bin
+//  Stored at .vault-sync/content/<hash[0:2]>/<hash>.bin — sharded by the first
+//  byte of the (hex) hash into 256 buckets (git-style). A single flat directory
+//  crossed a Capacitor/Android directory-scaling wall past a few thousand blobs
+//  (the ~3,500-file first-enable step, capture-optimization-spec §4); sharding
+//  keeps every content-dir fs op on a directory of ≤ F/256 entries.
 //  Uses Web Crypto SHA-256 (available on all platforms incl. iOS).
 
 import { MetadataStore } from '../ports/metadata-store';
@@ -14,6 +18,15 @@ import { uint8ToBase64, base64ToUint8 } from './encoding';
 export { uint8ToBase64, base64ToUint8 };
 
 const CONTENT_DIR = '.vault-sync/content';
+
+// The 256 possible shard directory names ("00".."ff"). Content hashes are hex,
+// so `hash[0:2]` is always one of these. `listHashes` sweeps this fixed set
+// rather than enumerating subdirectories, because the port's `list()` is only
+// guaranteed to return files *directly* under a dir (ObsidianMetadataStore
+// discards `.folders`) — see the note on `listHashes`.
+const SHARD_PREFIXES: string[] = Array.from({ length: 256 }, (_, i) =>
+  i.toString(16).padStart(2, '0'),
+);
 
 export async function hashContent(content: Uint8Array): Promise<string> {
   const buffer = await crypto.subtle.digest('SHA-256', content);
@@ -29,6 +42,9 @@ export async function hashString(s: string): Promise<string> {
 export class ContentStore {
   // In-memory cache to avoid repeated disk reads during a single sync session
   private memCache: Map<string, Uint8Array> = new Map();
+  // Shard directories we've already ensured this session, so a batch capture
+  // pays at most one `mkdir` per shard (256 max) instead of one per file.
+  private ensuredShards: Set<string> = new Set();
 
   constructor(private metadata: MetadataStore) {}
 
@@ -43,6 +59,9 @@ export class ContentStore {
     this.memCache.set(hash, content);
     const path = this.contentPath(hash);
     if (!(await this.metadata.exists(path))) {
+      // The shard dir must exist before the write — `MetadataStore.write` does
+      // not auto-mkdir parents, and `init()` only created CONTENT_DIR itself.
+      await this.ensureShard(hash);
       // Convert Uint8Array → base64 for text-based storage
       await this.metadata.write(path, uint8ToBase64(content));
     }
@@ -75,12 +94,25 @@ export class ContentStore {
     }
   }
 
-  /** List all stored hashes. */
+  /**
+   * List all stored hashes. Sweeps the 256 known shard dirs and concatenates,
+   * rather than listing CONTENT_DIR itself: `MetadataStore.list()` is only
+   * guaranteed to return files *directly* under the given dir (the Obsidian
+   * adapter discards `.folders`), so a single `list(CONTENT_DIR)` would return
+   * nothing on device now that blobs live one level deeper — silently GC'ing
+   * nothing. The prefix sweep is correct under both the recursive fake and the
+   * one-level device semantics.
+   */
   async listHashes(): Promise<string[]> {
-    const files = await this.metadata.list(CONTENT_DIR);
-    return files
-      .map(p => p.split('/').pop()?.replace('.bin', '') ?? '')
-      .filter(Boolean);
+    const hashes: string[] = [];
+    for (const prefix of SHARD_PREFIXES) {
+      const files = await this.metadata.list(`${CONTENT_DIR}/${prefix}`);
+      for (const p of files) {
+        const name = p.split('/').pop()?.replace('.bin', '') ?? '';
+        if (name) hashes.push(name);
+      }
+    }
+    return hashes;
   }
 
   /**
@@ -113,7 +145,17 @@ export class ContentStore {
     this.memCache.clear();
   }
 
+  /** Ensure the shard directory for `hash` exists (once per shard per session). */
+  private async ensureShard(hash: string): Promise<void> {
+    const dir = `${CONTENT_DIR}/${hash.slice(0, 2)}`;
+    if (this.ensuredShards.has(dir)) return;
+    if (!(await this.metadata.exists(dir))) {
+      await this.metadata.mkdir(dir);
+    }
+    this.ensuredShards.add(dir);
+  }
+
   private contentPath(hash: string): string {
-    return `${CONTENT_DIR}/${hash}.bin`;
+    return `${CONTENT_DIR}/${hash.slice(0, 2)}/${hash}.bin`;
   }
 }

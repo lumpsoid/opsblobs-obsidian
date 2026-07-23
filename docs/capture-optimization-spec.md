@@ -233,8 +233,21 @@ Ranked by impact-per-effort; land and measure each before the next.
       fields — same O(), tiny constant). NB `buildLocalState`'s own O(F) re-hash (B1)
       is a **separate** path O1 does not touch — a follow-up if a no-op *round* must
       also go O(touched).
-- [ ] **O2 — content dir sharding.** `ContentStore` path/list/gc. Tests.
-      *(Removes the first-enable step.)*
+- [x] **O2 — content dir sharding.** *Implemented (uncommitted).* Blobs now live at
+      `content/<hash[0:2]>/<hash>.bin` (256 buckets). `ContentStore.contentPath` shards;
+      `put` ensures the shard dir once per shard per session (`ensuredShards` set —
+      `MetadataStore.write` does not auto-mkdir); `listHashes` **sweeps the 256 known
+      `00`..`ff` prefixes** and lists each, rather than `list(CONTENT_DIR)` — correct under
+      both the recursive fake and the one-level Obsidian adapter (which discards
+      `.folders`). `get`/`has`/`delete`/`gc` shard for free (they route through
+      `contentPath`/`listHashes`). No migration (§0): a flat `content/` is abandoned.
+      Tests: `content-store-gc.test.ts` extended — GC over the shard layout, a
+      **one-level-`list()` regression** (`FakeMetadataStore.listMode = 'one-level'`, would
+      fail if `listHashes` reverted to the naive parent-dir list), and a sharded
+      put→get→has→delete→listHashes round-trip from a cold store. Full suite green
+      (254 pass / 1 skip); `npm run build` clean. Adapter assumptions pinned in
+      `__tests__/helpers/fakes/README.md`. *(Removes the first-enable step — verify on
+      device: the ~3,500-file step should be gone.)*
 - [ ] **O3 — registry journal** *(only if B5 still superlinear on device).*
 - [ ] **O4 — minor** *(opportunistic).*
 - [ ] Re-measure Layer 2 (`npm run bench`) + Layer 3 (device), update the perf baseline.

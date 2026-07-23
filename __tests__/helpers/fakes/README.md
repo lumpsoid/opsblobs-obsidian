@@ -37,6 +37,19 @@ one side should be mirrored here:
   falling back to the temp for the kill-window between remove and rename. Stores
   that load a corrupt file as a safe default (empty DAG, cursor 0) rely on this so
   the "corrupt" branch is reserved for genuine bugs, not routine interrupted writes.
+- **`MetadataStore.list()` returns only files *directly* under the dir.**
+  `ObsidianMetadataStore.list()` returns `adapter.list(p).files` and **discards
+  `.folders`**, so it does not recurse. Code that stores under subdirectories (the
+  sharded content store, `content/<hash[0:2]>/<hash>.bin`) must not call
+  `list(parentDir)` expecting to find them — `ContentStore.listHashes` instead
+  sweeps the 256 known shard prefixes and lists each. `FakeMetadataStore` defaults
+  to a permissive recursive prefix match; flip `listMode = 'one-level'` to pin
+  behavior against the real device semantics (see `content-store-gc.test.ts`).
+- **`MetadataStore.write` does not auto-mkdir parents.** A caller writing into a
+  not-yet-created subdirectory must `mkdir` it first (`ContentStore.put` ensures the
+  shard dir once per shard per session). The fake's `mkdir` is a no-op (dirs are
+  implicit in the flat map), so this is a device-only requirement not exercised by
+  the fake — a manual-smoke/integration concern.
 
 Full DOM/vault mocking of the real adapters is out of scope; the Go-server
 integration contract (`__tests__/integration/`) guards the wire, and real-adapter

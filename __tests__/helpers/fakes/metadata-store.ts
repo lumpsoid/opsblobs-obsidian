@@ -14,6 +14,11 @@ export class FakeMetadataStore implements MetadataStore {
   private mtimes = new Map<string, number>();
   /** Default mtime for files written without an explicit one. */
   clock = 0;
+  /** `list()` semantics. The Obsidian adapter returns only files *directly*
+   *  under a dir (it discards `.folders`); the fake defaults to the more
+   *  permissive recursive prefix match, but a test can flip it to `'one-level'`
+   *  to pin behavior against the real device semantics (e.g. sharded content). */
+  listMode: 'recursive' | 'one-level' = 'recursive';
 
   /** Layer-2 I/O tallies (perf-baseline spec §4). Pure increments — always on, free.
    *  A bench brackets an operation with `snapshotIoCounters` + `diffIoCounters`. */
@@ -60,7 +65,12 @@ export class FakeMetadataStore implements MetadataStore {
   async list(dir: string): Promise<string[]> {
     this.io.lists++;
     const prefix = dir.endsWith('/') ? dir : dir + '/';
-    return Array.from(this.files.keys()).filter(p => p.startsWith(prefix));
+    return Array.from(this.files.keys()).filter(p => {
+      if (!p.startsWith(prefix)) return false;
+      // One-level: exclude anything nested in a subdirectory of `dir`.
+      if (this.listMode === 'one-level') return !p.slice(prefix.length).includes('/');
+      return true;
+    });
   }
 
   async stat(path: string): Promise<{ mtime: number } | null> {
