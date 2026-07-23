@@ -261,6 +261,21 @@ export class SyncSettingTab extends PluginSettingTab {
       .addText(t => {
         t.setValue(this.settings.deviceId).setDisabled(true);
       });
+
+    new Setting(diag)
+      .setName('Performance logging')
+      .setDesc(
+        'Log per-phase timings of each sync round and of startup to the console and ' +
+          '.vault-sync/perf-log.txt. For measuring on-device performance; leave off for ' +
+          'everyday use.',
+      )
+      .addToggle(t => {
+        t.setValue(this.settings.perfLog)
+          .onChange(async v => {
+            this.settings.perfLog = v;
+            await this.save();
+          });
+      });
   }
 
   // ─── Sync (everyday controls) ───────────────────────────────────────────────

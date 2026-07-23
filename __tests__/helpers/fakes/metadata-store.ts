@@ -7,6 +7,7 @@
 //  (default 0); `setMtime` lets a test age a blob past the retention window.
 
 import { MetadataStore } from '../../../src/ports/metadata-store';
+import { IoCounters, newIoCounters } from './io-counters';
 
 export class FakeMetadataStore implements MetadataStore {
   private files = new Map<string, string>();
@@ -14,21 +15,31 @@ export class FakeMetadataStore implements MetadataStore {
   /** Default mtime for files written without an explicit one. */
   clock = 0;
 
+  /** Layer-2 I/O tallies (perf-baseline spec §4). Pure increments — always on, free.
+   *  A bench brackets an operation with `snapshotIoCounters` + `diffIoCounters`. */
+  readonly io: IoCounters = newIoCounters();
+
   async read(path: string): Promise<string | null> {
+    this.io.reads++;
     return this.files.has(path) ? this.files.get(path)! : null;
   }
 
   async write(path: string, data: string): Promise<void> {
+    this.io.writes++;
+    this.io.bytesWritten += data.length;
     this.files.set(path, data);
     if (!this.mtimes.has(path)) this.mtimes.set(path, this.clock);
   }
 
   async append(path: string, data: string): Promise<void> {
+    this.io.appends++;
+    this.io.bytesAppended += data.length;
     this.files.set(path, (this.files.get(path) ?? '') + data);
     if (!this.mtimes.has(path)) this.mtimes.set(path, this.clock);
   }
 
   async exists(path: string): Promise<boolean> {
+    this.io.exists++;
     if (this.files.has(path)) return true;
     // A directory "exists" if any file lives under it.
     const prefix = path.endsWith('/') ? path : path + '/';
@@ -41,16 +52,19 @@ export class FakeMetadataStore implements MetadataStore {
   }
 
   async remove(path: string): Promise<void> {
+    this.io.removes++;
     this.files.delete(path);
     this.mtimes.delete(path);
   }
 
   async list(dir: string): Promise<string[]> {
+    this.io.lists++;
     const prefix = dir.endsWith('/') ? dir : dir + '/';
     return Array.from(this.files.keys()).filter(p => p.startsWith(prefix));
   }
 
   async stat(path: string): Promise<{ mtime: number } | null> {
+    this.io.stats++;
     if (!this.files.has(path)) return null;
     return { mtime: this.mtimes.get(path) ?? 0 };
   }

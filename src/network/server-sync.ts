@@ -20,6 +20,7 @@ import { hlcCompare } from '../core/hlc';
 import { mergeVaultStates } from '../merge/state-merge';
 import { VersionDag } from '../core/version-dag';
 import { VaultCrypto } from './encryption';
+import { PhaseTimer, PhaseTimingSink } from './perf-timer';
 
 // ─── Wire records (server-facing; all ciphertext/hashes, no plaintext) ──────────
 
@@ -136,6 +137,10 @@ export interface ServerSyncOptions {
   /** Page size for the pull loop (server may cap lower). */
   opsLimit?: number;
   onProgress?: (label: string) => void;
+  /** Diagnostic per-phase wall-clock sink (perf baseline, Layer 3). When omitted
+   *  (the default) `runSync` installs no timer and does no timing work — inert. The
+   *  plugin wires this only when the `perfLog` setting is on. */
+  perfLog?: PhaseTimingSink;
 }
 
 const DEFAULT_OPS_LIMIT = 500;
@@ -180,6 +185,7 @@ export class ServerSyncClient {
   private readonly hlc: HybridLogicalClock;
   private readonly opsLimit: number;
   private readonly onProgress?: (label: string) => void;
+  private readonly perfLog?: PhaseTimingSink;
 
   constructor(opts: ServerSyncOptions) {
     this.api = opts.api;
@@ -188,6 +194,7 @@ export class ServerSyncClient {
     this.hlc = opts.hlc;
     this.opsLimit = opts.opsLimit ?? DEFAULT_OPS_LIMIT;
     this.onProgress = opts.onProgress;
+    this.perfLog = opts.perfLog;
   }
 
   /**
@@ -207,6 +214,11 @@ export class ServerSyncClient {
    */
   async runSync(): Promise<SyncRoundSummary> {
     if (!this.crypto.isReady()) throw new Error('Vault key not derived');
+
+    // Per-phase timing (perf baseline, Layer 3): only installed when the plugin
+    // passed a `perfLog` sink (the diagnostic setting is on). `undefined` otherwise,
+    // so every `timer?.lap(...)` below is a no-op — zero overhead by default.
+    const timer = this.perfLog ? new PhaseTimer(this.perfLog) : undefined;
 
     // ── 0. Passphrase / key-agreement guard ─────────────────────────────────
     // Before we decrypt a single pulled op or push under our key, confirm this
@@ -236,14 +248,17 @@ export class ServerSyncClient {
       this.onProgress?.('Rebuilding sync history…');
       await this.host.saveCursor(0);
     }
+    timer?.lap('keycheck+dag-guard');
 
     const local = await this.host.buildLocalState();
     const startCursor = await this.host.loadCursor();
     const pushed = local.pendingOps.length;
+    timer?.lap('buildLocalState');
 
     // ── 1. Pull remote ops since our cursor ──────────────────────────────────
     this.onProgress?.('Pulling changes…');
     const { ops: pulled, cursor: pulledCursor } = await this.pullAll(startCursor);
+    timer?.lap('pull');
 
     // ── 2. Reconstruct the remote projection and fetch the content it needs ──
     // Exclude our own re-pulled ops — projecting them would make a fresh local
@@ -251,6 +266,7 @@ export class ServerSyncClient {
     // reconstructRemoteState docs).
     const remote = reconstructRemoteState(pulled.map(p => p.op), local.deviceId);
     const missingContent = await this.fetchRemoteBlobs(remote, local);
+    timer?.lap('fetchBlobs');
 
     // ── 2b. Claim the key-check record if the vault has none yet ─────────────
     // Stamp it once our key is established: either we successfully decrypted the
@@ -270,6 +286,7 @@ export class ServerSyncClient {
       await this.pushPendingOps(local, startCursor);
       await this.host.clearPendingOps();
     }
+    timer?.lap('push');
 
     // ── 4. Merge remote into local and apply ─────────────────────────────────
     // Record this round's causal edges into the op-id DAG FIRST — both our authored
@@ -278,9 +295,11 @@ export class ServerSyncClient {
     // three-way base (LCA) and fast-forward from graph structure. The returned DAG
     // is handed to the merge.
     const dag = await this.host.recordVersionEdges([...local.pendingOps, ...pulled.map(p => p.op)]);
+    timer?.lap('recordVersionEdges');
 
     this.onProgress?.('Merging…');
     const merge = mergeVaultStates(local, remote, dag);
+    timer?.lap('merge');
     // Advance the clock past the merged HLC *before* applying: a user-resolved
     // conflict mints an op inside applyMerge, and it must dominate the remote
     // content it supersedes so peers accept the resolution (last-writer-wins)
@@ -288,6 +307,7 @@ export class ServerSyncClient {
     // resolution be timestamped below the remote it resolves.
     this.hlc.setCurrent(merge.mergedHlc);
     const { deferred, deferredConflicts } = await this.host.applyMerge(merge.actions, local, remote);
+    timer?.lap('applyMerge');
 
     // ── 4b. Multi-head reconciliation sweep (causal audit Finding B) ─────────
     // `reconstructRemoteState` collapses concurrent remote heads for one file to the
@@ -304,6 +324,7 @@ export class ServerSyncClient {
     // conflict) are skipped: their cursor is held so the whole round re-pulls, and
     // reconciling them here would write over the very in-window edit F5 protects.
     await this.reconcileConcurrentHeads(pulled, dag, local.deviceId, missingContent, deferred);
+    timer?.lap('reconcileConcurrentHeads');
 
     // ── 5. Advance the cursor past everything we consumed ────────────────────
     // Persist the *pull* cursor, not the append's headCursor: another device may
@@ -323,6 +344,8 @@ export class ServerSyncClient {
     // re-merges against the edit we just re-captured. Its content WAS available
     // (not F3's case), so cap the cursor at this round's start.
     await this.host.saveCursor(safeCursor(pulled, pulledCursor, missingContent, startCursor, deferred.size > 0));
+    timer?.lap('saveCursor');
+    timer?.end('total');
 
     return {
       pushed,

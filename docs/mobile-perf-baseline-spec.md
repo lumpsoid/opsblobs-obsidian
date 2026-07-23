@@ -239,14 +239,21 @@ unbounded cache is a mobile crash waiting to happen regardless of the absolute n
 
 ## 9. Deliverables checklist
 
-- [ ] `TestDevice`-based large-vault seeding helpers (loop `seedFile`/`seedExistingFile`; a
-      `FakeSyncServer` seeded to H ops).
-- [ ] Instrumented fakes with I/O + byte counters (L2).
-- [ ] Bench runner `npm run bench` (L1 timing + alloc via `--expose-gc`; L2 counts) → results JSON + Markdown.
-- [ ] Scenarios B1–B9 implemented against the profiles in §2.
-- [ ] `perfLog` setting + per-phase timing in `runSync()`/startup (L3), inert by default.
-- [ ] On-device manual pass on a mid-range and a low-end phone; numbers recorded.
-- [ ] `docs/perf-baseline-<date>.md` committed with the full table + device/commit provenance.
+- [x] `TestDevice`-based large-vault seeding helpers (loop `seedFile`/`seedExistingFile`; a
+      `FakeSyncServer` seeded to H ops). — `bench/harness.ts` (`seedVault`,
+      `seedExistingVault`, `pushOffline`).
+- [x] Instrumented fakes with I/O + byte counters (L2). — `__tests__/helpers/fakes/io-counters.ts`
+      wired into `FakeMetadataStore`/`FakeVaultFiles` (`.io`).
+- [x] Bench runner `npm run bench` (L1 timing + alloc via `--expose-gc`; L2 counts) → results JSON + Markdown.
+      — `bench/run.ts` + `bench/harness.ts`; CPU-op counts via external monkey-patch (no production edit).
+      Output: `bench/results/latest.{json,md}`.
+- [x] Scenarios B1–B9 implemented against the profiles in §2. — `bench/run.ts`.
+- [x] `perfLog` setting + per-phase timing in `runSync()`/startup (L3), inert by default. — `SyncSettings.perfLog`,
+      `src/network/perf-timer.ts`, laps in `runSync()`, startup brackets + settings toggle in `main.ts`/`settings-tab.ts`.
+      Covered by `__tests__/perf-timing.test.ts`.
+- [ ] On-device manual pass on a mid-range and a low-end phone; numbers recorded. — **PENDING** (manual).
+- [x] `docs/perf-baseline-<date>.md` committed with the full table + device/commit provenance. —
+      `docs/perf-baseline-2026-07-23.md` (Layer 1/2 filled; Layer 3 device columns pending the manual pass).
 
 ---
 

@@ -9,7 +9,13 @@ if you want to view the source, please visit the github repository of this plugi
 */
 `;
 
-const prod = (process.argv[2] === "production");
+// Build mode from argv[2]:
+//   (none)       → watch, unminified + inline sourcemap  (`npm run dev`)
+//   "dev"        → one-shot, unminified + inline sourcemap (`npm run build:dev`)
+//   "production" → one-shot, minified, no sourcemap        (`npm run build`)
+const mode = process.argv[2];
+const prod = mode === "production";
+const oneShot = prod || mode === "dev";
 
 const context = await esbuild.context({
 	banner: {
@@ -41,7 +47,7 @@ const context = await esbuild.context({
 	minify: prod,
 });
 
-if (prod) {
+if (oneShot) {
 	await context.rebuild();
 	process.exit(0);
 } else {

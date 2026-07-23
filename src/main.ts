@@ -15,6 +15,7 @@ import { ObsidianMetadataStore } from './network/obsidian-metadata-store';
 import { ObsidianVaultWatcher } from './network/obsidian-vault-watcher';
 import { VaultCrypto, saltForVault } from './network/encryption';
 import { ServerSyncClient, SyncRoundSummary } from './network/server-sync';
+import { PhaseTimer, PhaseTimingSink, heapNote } from './network/perf-timer';
 import { KeyMismatchError } from './network/sync-errors';
 import { HttpServerApi } from './network/server-http';
 import { CursorStore } from './network/cursor-store';
@@ -147,9 +148,13 @@ export default class VaultSyncPlugin extends Plugin {
     // Load persisted state
     this.syncState = new SyncStateStore(metadata);
     await this.syncState.load();
-    await this.contentStore.init();
-    await this.registry.load();
-    await this.opLogger.load();
+    // Cold-load of the persisted stores (perf baseline B3, Layer 3): timed as one
+    // `startup:load` phase when the `perfLog` diagnostic is on, untimed otherwise.
+    await this.timedStartup('load', async () => {
+      await this.contentStore.init();
+      await this.registry.load();
+      await this.opLogger.load();
+    });
 
     // The obsidian-free orchestrator: owns the capture sequence, the round
     // outcome bookkeeping, the manual/auto conflict branching, and reset/rebaseline.
@@ -184,7 +189,12 @@ export default class VaultSyncPlugin extends Plugin {
         // Without this the existing vault would never be pushed; only post-enable
         // edits would sync. (The engine also guards an empty listing as a
         // belt-and-suspenders phantom-delete backstop.)
-        await this.opLogger.captureOfflineChanges();
+        // The first-enable capture — the O(F·B) hash + up to O(F²) registry rewrite
+        // over every pre-existing file (perf baseline B3). On a large vault this can
+        // run for many minutes on mobile, so under perfLog it streams scan progress
+        // (not just a single on-completion timing, which a still-running phase never
+        // reaches).
+        await this.captureOfflineWithPerf();
         // Start listening for vault changes.
         this.opLogger.startListening();
       })();
@@ -382,7 +392,53 @@ export default class VaultSyncPlugin extends Plugin {
       host,
       hlc: this.hlc,
       onProgress: (label) => this.setStatusBarText(label, 'syncing'),
+      // Per-phase round timings (perf baseline, Layer 3) — `undefined` unless the
+      // `perfLog` diagnostic is on, so the client installs no timer by default.
+      perfLog: this.perfSink('round'),
     });
+  }
+
+  /**
+   * A per-phase timing sink for the `perfLog` diagnostic (perf baseline, Layer 3),
+   * or `undefined` when the setting is off — so callers install no timer at all and
+   * the instrumented code stays inert. Emits each phase to the console and appends a
+   * line to `.vault-sync/perf-log.txt` for a post-hoc read on-device. Fully guarded:
+   * a diagnostics write must never break a sync.
+   */
+  private perfSink(scope: string): PhaseTimingSink | undefined {
+    if (!this.settings.perfLog) return undefined;
+    return (phase, ms) => {
+      const line = `${Date.now()} ${scope} ${phase} ${ms.toFixed(1)}ms`;
+      console.log(`[vault-sync perf] ${line}`);
+      void this.metadata.append('.vault-sync/perf-log.txt', line + '\n').catch(() => {});
+    };
+  }
+
+  /** Time a single startup phase under the `perfLog` diagnostic (Layer 3), or run it
+   *  untimed when off. Brackets just the awaited work, so idle time (e.g. waiting on
+   *  `onLayoutReady`) is never mis-attributed. */
+  private async timedStartup<T>(phase: string, fn: () => Promise<T>): Promise<T> {
+    const sink = this.perfSink('startup');
+    if (!sink) return fn();
+    const t = new PhaseTimer(sink);
+    try {
+      return await fn();
+    } finally {
+      t.end(phase);
+    }
+  }
+
+  /** Run the first-enable capture, streaming scan progress to the `perfLog` diagnostic
+   *  (Layer 3) so a long-running pass on a large vault yields the throughput curve
+   *  instead of a single line that only prints if/when it finishes. Untimed and with
+   *  no progress callback when the diagnostic is off. */
+  private async captureOfflineWithPerf(): Promise<void> {
+    const sink = this.perfSink('startup');
+    if (!sink) { await this.opLogger.captureOfflineChanges(); return; }
+    const t0 = performance.now();
+    await this.opLogger.captureOfflineChanges((scanned, total) =>
+      sink(`captureOfflineChanges ${scanned}/${total}${heapNote()}`, performance.now() - t0));
+    sink(`captureOfflineChanges total${heapNote()}`, performance.now() - t0);
   }
 
   /** Build and run one sync round, returning its summary. The coordinator drives

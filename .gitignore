@@ -26,3 +26,4 @@ test-vault
 
 # Test coverage output
 coverage/
+perf-vault-*/

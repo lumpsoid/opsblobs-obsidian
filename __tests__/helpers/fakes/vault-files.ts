@@ -7,10 +7,16 @@
 //  without Obsidian.
 
 import { VaultFiles, VaultFileRef } from '../../../src/ports/vault-files';
+import { IoCounters, newIoCounters } from './io-counters';
 
 export class FakeVaultFiles implements VaultFiles {
   private files = new Map<string, Uint8Array>();
   private listingReady = true;
+
+  /** Layer-2 I/O tallies (perf-baseline spec §4) for the *vault* side — above all
+   *  the per-round `read` count `buildLocalState` issues (one per live file, the
+   *  suspected O(F) re-read). Pure increments; always on, free. */
+  readonly io: IoCounters = newIoCounters();
 
   /** Test hook: reproduce Obsidian's cold-start window where `getFiles()` is not
    *  yet populated even though the files are on disk (readable). While `false`,
@@ -21,19 +27,24 @@ export class FakeVaultFiles implements VaultFiles {
   }
 
   list(): VaultFileRef[] {
+    this.io.lists++;
     if (!this.listingReady) return [];
     return Array.from(this.files.keys()).map(path => ({ path }));
   }
 
   async read(path: string): Promise<Uint8Array | null> {
+    this.io.reads++;
     return this.files.has(path) ? this.files.get(path)! : null;
   }
 
   async write(path: string, content: Uint8Array): Promise<void> {
+    this.io.writes++;
+    this.io.bytesWritten += content.length;
     this.files.set(path, content);
   }
 
   async move(fromPath: string, toPath: string): Promise<void> {
+    this.io.renames++;
     const content = this.files.get(fromPath);
     if (content === undefined) return;
     this.files.delete(fromPath);
@@ -41,10 +52,12 @@ export class FakeVaultFiles implements VaultFiles {
   }
 
   async trash(path: string): Promise<void> {
+    this.io.removes++;
     this.files.delete(path);
   }
 
   async exists(path: string): Promise<boolean> {
+    this.io.exists++;
     return this.files.has(path);
   }
 }

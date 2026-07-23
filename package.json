@@ -7,10 +7,14 @@
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+		"build:dev": "node esbuild.config.mjs dev",
 		"test": "vitest run",
 		"test:watch": "vitest",
 		"test:coverage": "vitest run --coverage",
 		"test:integration": "vitest run --config vitest.integration.config.ts",
+		"bench": "node --expose-gc --import jiti/register bench/run.ts",
+		"gen:vault": "node bench/gen-vault.mjs",
+		"deploy:android": "scripts/deploy-android.sh",
 		"version": "node version-bump.mjs && git add manifest.json versions.json",
 		"lint": "eslint ."
 	},

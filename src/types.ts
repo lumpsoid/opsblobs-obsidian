@@ -162,6 +162,14 @@ export interface SyncSettings {
   deleteConflictStrategy: 'ask' | 'keep_deleted' | 'keep_modified';
   syncObsidianConfig: boolean;
   ancestorRetentionDays: number;
+
+  // ── Diagnostics ─────────────────────────────────────────────────────────
+  // Emit per-phase sync-round + startup timings to the console (and a log file
+  // under `.vault-sync/`) for the mobile perf baseline (docs/mobile-perf-baseline-spec.md
+  // Layer 3). Off by default and fully inert when off — the only production hook
+  // is a guarded `performance.now()` bracket that isn't even installed unless this
+  // is set. A manual, pre-release on-device measurement aid, not an everyday toggle.
+  perfLog: boolean;
 }
 
 export const DEFAULT_SETTINGS: SyncSettings = {
@@ -183,4 +191,5 @@ export const DEFAULT_SETTINGS: SyncSettings = {
   deleteConflictStrategy: 'ask',
   syncObsidianConfig: false,
   ancestorRetentionDays: 30,
+  perfLog: false,
 };

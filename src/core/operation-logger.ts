@@ -29,6 +29,10 @@ export interface HlcPersister {
 const OPLOG_DIR = '.vault-sync';
 const OPLOG_PATH = '.vault-sync/oplog.json';
 
+/** How often `captureOfflineChanges` fires its optional progress callback (every N
+ *  files scanned) — perf diagnostics only. */
+const CAPTURE_PROGRESS_EVERY = 100;
+
 export class OperationLogger {
   private pendingOps: Operation[] = [];
   private debounceTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
@@ -86,12 +90,24 @@ export class OperationLogger {
    * after `load()` and *before* `startListening()` — it mutates the registry and
    * content store but never the vault, so it fires no vault events of its own.
    */
-  async captureOfflineChanges(): Promise<void> {
+  /**
+   * @param onProgress Optional scan-progress callback (perf diagnostics, Layer 3):
+   *  invoked every {@link CAPTURE_PROGRESS_EVERY} files with `(scanned, total)`. On a
+   *  large vault this pass is O(F·B) hashing + up to O(F²) registry rewrites, so it can
+   *  run for many minutes on mobile; the callback surfaces liveness + the throughput
+   *  curve even when it hasn't finished (a phase timed only on completion reports
+   *  nothing). Inert when omitted — no work is done in the hot path beyond a modulo.
+   */
+  async captureOfflineChanges(onProgress?: (scanned: number, total: number) => void): Promise<void> {
     let changed = false;
     const onDisk = new Set<string>();
 
     // ── Live files: untracked → create, content drifted → update ─────────────
-    for (const ref of this.files.list()) {
+    const live = this.files.list();
+    const total = live.length;
+    let scanned = 0;
+    for (const ref of live) {
+      if (onProgress && ++scanned % CAPTURE_PROGRESS_EVERY === 0) onProgress(scanned, total);
       const path = ref.path;
       if (this.isExcluded(path)) continue;
       onDisk.add(path);
@@ -129,6 +145,8 @@ export class OperationLogger {
       }
       changed = true;
     }
+    // Final tick so the last (sub-batch) files register in the progress log.
+    if (onProgress && total > 0) onProgress(total, total);
 
     // ── Registry entries whose file vanished while offline → delete ──────────
     // Guard against a phantom mass-delete. `files.list()` can come back empty
