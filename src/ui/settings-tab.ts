@@ -6,6 +6,12 @@
 //  pairing flow is gone: a device is configured by a server URL, a vault ID +
 //  token, and a vault passphrase. The passphrase-derived key never leaves the
 //  device; its fingerprint lets two devices confirm they share the same key.
+//
+//  Layout is onboarding-first (UX audit §1.1): a Setup section groups the four
+//  required fields under a live readiness checklist so a first-run user sees
+//  exactly what is still missing; everyday sync controls follow; developer knobs
+//  and maintenance/destructive actions are tucked behind Advanced / Danger-zone
+//  disclosures so they never crowd the basics.
 
 import { App, Plugin, PluginSettingTab, Setting } from 'obsidian';
 import { SyncSettings } from '../types';
@@ -27,6 +33,11 @@ export interface SettingsHost extends Plugin {
 }
 
 export class SyncSettingTab extends PluginSettingTab {
+  /** The live readiness line under the Setup heading. Re-rendered in place by
+   *  {@link updateReadiness} whenever a required field changes, so the checklist
+   *  tracks typing without a full settings re-display. */
+  private readinessEl: HTMLElement | null = null;
+
   constructor(app: App, private host: SettingsHost) {
     super(app, host);
   }
@@ -43,30 +54,22 @@ export class SyncSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    // ── Device identity ───────────────────────────────────────────────────
-    new Setting(containerEl).setName('This device').setHeading();
+    this.renderSetup(containerEl);
+    this.renderDevice(containerEl);
+    this.renderSync(containerEl);
+    this.renderAdvanced(containerEl);
+    this.renderDangerZone(containerEl);
+  }
 
-    new Setting(containerEl)
-      .setName('Device name')
-      .setDesc('A friendly name for this device.')
-      .addText(t => {
-        t.setValue(this.settings.deviceName)
-          .setPlaceholder('My MacBook')
-          .onChange(async v => {
-            this.settings.deviceName = v;
-            await this.save();
-          });
-      });
+  // ─── Setup (required fields + readiness) ────────────────────────────────────
 
-    new Setting(containerEl)
-      .setName('Device ID')
-      .setDesc('Unique identifier for this device (read-only).')
-      .addText(t => {
-        t.setValue(this.settings.deviceId).setDisabled(true);
-      });
+  private renderSetup(containerEl: HTMLElement): void {
+    new Setting(containerEl).setName('Setup').setHeading();
 
-    // ── Server ────────────────────────────────────────────────────────────
-    new Setting(containerEl).setName('Server').setHeading();
+    // The live checklist sits directly under the heading so the very first thing a
+    // user sees is what still needs filling in and in what order.
+    this.readinessEl = containerEl.createEl('div', { cls: 'vault-sync-readiness' });
+    this.updateReadiness();
 
     new Setting(containerEl)
       .setName('Server URL')
@@ -77,6 +80,7 @@ export class SyncSettingTab extends PluginSettingTab {
           .onChange(async v => {
             this.settings.serverUrl = v.trim();
             await this.save();
+            this.updateReadiness();
           });
       });
 
@@ -89,41 +93,23 @@ export class SyncSettingTab extends PluginSettingTab {
           .onChange(async v => {
             this.settings.vaultId = v.trim();
             await this.save();
+            this.updateReadiness();
           });
       });
 
     new Setting(containerEl)
       .setName('Access token')
-      .setDesc('Bearer token authorizing this device for the vault.')
+      .setDesc('Token authorizing this device for the vault.')
       .addText(t => {
         t.setValue(this.settings.serverToken)
           .setPlaceholder('token…')
           .onChange(async v => {
             this.settings.serverToken = v.trim();
             await this.save();
+            this.updateReadiness();
           });
         t.inputEl.type = 'password';
       });
-
-    const testSetting = new Setting(containerEl)
-      .setName('Test connection')
-      .setDesc('Check the server URL, token, vault, and passphrase without syncing anything.');
-    testSetting.addButton(btn => {
-      btn.setButtonText('Test').onClick(async () => {
-        btn.setButtonText('Testing…').setDisabled(true);
-        testSetting.setDesc('Testing…');
-        try {
-          testSetting.setDesc(await this.host.testConnection());
-        } catch (e) {
-          testSetting.setDesc(`✗ ${(e as Error).message}`);
-        } finally {
-          btn.setButtonText('Test').setDisabled(false);
-        }
-      });
-    });
-
-    // ── Encryption ────────────────────────────────────────────────────────
-    new Setting(containerEl).setName('Encryption').setHeading();
 
     containerEl.createEl('p', {
       text: 'The passphrase derives the key that encrypts everything before it leaves this device. ' +
@@ -141,6 +127,7 @@ export class SyncSettingTab extends PluginSettingTab {
           .onChange(async v => {
             this.settings.vaultPassphrase = v;
             await this.save();
+            this.updateReadiness();
           });
         t.inputEl.type = 'password';
       });
@@ -159,8 +146,84 @@ export class SyncSettingTab extends PluginSettingTab {
       });
     });
 
-    // ── Sync behavior ─────────────────────────────────────────────────────
-    new Setting(containerEl).setName('Sync behavior').setHeading();
+    const testSetting = new Setting(containerEl)
+      .setName('Test connection')
+      .setDesc('Check the server URL, token, vault, and passphrase without syncing anything.');
+    testSetting.addButton(btn => {
+      btn.setButtonText('Test').onClick(async () => {
+        btn.setButtonText('Testing…').setDisabled(true);
+        testSetting.setDesc('Testing…');
+        try {
+          testSetting.setDesc(await this.host.testConnection());
+        } catch (e) {
+          testSetting.setDesc(`✗ ${(e as Error).message}`);
+        } finally {
+          btn.setButtonText('Test').setDisabled(false);
+        }
+      });
+    });
+  }
+
+  /** Repaint the readiness checklist in place from current settings. Cheap — a
+   *  handful of spans — and called on every keystroke into a required field. */
+  private updateReadiness(): void {
+    if (!this.readinessEl) return;
+    const s = this.settings;
+    this.readinessEl.empty();
+
+    this.readinessEl.createSpan({ cls: 'vault-sync-readiness-label', text: 'Setup progress: ' });
+    const fields: Array<[string, boolean]> = [
+      ['Server URL', Boolean(s.serverUrl)],
+      ['Vault ID', Boolean(s.vaultId)],
+      ['Access token', Boolean(s.serverToken)],
+      ['Passphrase', Boolean(s.vaultPassphrase)],
+    ];
+    fields.forEach(([label, ok], i) => {
+      if (i > 0) this.readinessEl!.createSpan({ cls: 'vault-sync-readiness-sep', text: ' · ' });
+      this.readinessEl!.createSpan({
+        cls: `vault-sync-check ${ok ? 'is-ok' : 'is-missing'}`,
+        text: `${ok ? '✓' : '✗'} ${label}`,
+      });
+    });
+
+    const allSet = fields.every(([, ok]) => ok);
+    this.readinessEl.createEl('div', {
+      cls: 'setting-item-description',
+      text: allSet
+        ? 'All required fields are set — press Test connection, then Sync now.'
+        : 'Fill the fields marked ✗ to finish setup. All four are required, in this order.',
+    });
+  }
+
+  // ─── This device ────────────────────────────────────────────────────────────
+
+  private renderDevice(containerEl: HTMLElement): void {
+    new Setting(containerEl).setName('This device').setHeading();
+
+    new Setting(containerEl)
+      .setName('Device name')
+      .setDesc('A friendly name for this device.')
+      .addText(t => {
+        t.setValue(this.settings.deviceName)
+          .setPlaceholder('My phone / laptop')
+          .onChange(async v => {
+            this.settings.deviceName = v;
+            await this.save();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName('Device ID')
+      .setDesc('Unique identifier for this device (read-only).')
+      .addText(t => {
+        t.setValue(this.settings.deviceId).setDisabled(true);
+      });
+  }
+
+  // ─── Sync (everyday controls) ───────────────────────────────────────────────
+
+  private renderSync(containerEl: HTMLElement): void {
+    new Setting(containerEl).setName('Sync').setHeading();
 
     new Setting(containerEl)
       .setName('View sync status')
@@ -171,7 +234,7 @@ export class SyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Sync now')
-      .setDesc('Run a full pull → merge → push round against the server.')
+      .setDesc('Run a full sync against the server.')
       .addButton(btn => {
         btn.setButtonText('Sync now').setCta().onClick(async () => {
           btn.setButtonText('Syncing…').setDisabled(true);
@@ -198,19 +261,6 @@ export class SyncSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
-      .setName('Debounce delay')
-      .setDesc('Wait this many milliseconds after a file stops changing before recording an operation.')
-      .addSlider(s => {
-        s.setLimits(500, 5000, 100)
-          .setValue(this.settings.debounceMs)
-          .setDynamicTooltip()
-          .onChange(async v => {
-            this.settings.debounceMs = v;
-            await this.save();
-          });
-      });
-
-    new Setting(containerEl)
       .setName('Delete conflict strategy')
       .setDesc('What to do when one device deletes a file and the other modifies it.')
       .addDropdown(d => {
@@ -223,8 +273,15 @@ export class SyncSettingTab extends PluginSettingTab {
             await this.save();
           });
       });
+  }
 
-    new Setting(containerEl)
+  // ─── Advanced (collapsed) ───────────────────────────────────────────────────
+
+  private renderAdvanced(containerEl: HTMLElement): void {
+    const details = containerEl.createEl('details', { cls: 'vault-sync-disclosure' });
+    details.createEl('summary', { text: 'Advanced' });
+
+    new Setting(details)
       .setName('Sync Obsidian config')
       .setDesc('Sync files inside .obsidian/ (snippets, templates). Workspace layout is always excluded.')
       .addToggle(t => {
@@ -235,29 +292,20 @@ export class SyncSettingTab extends PluginSettingTab {
           });
       });
 
-    // ── Exclusions ────────────────────────────────────────────────────────
-    new Setting(containerEl).setName('Excluded paths').setHeading();
-    containerEl.createEl('p', {
-      text: 'Files and folders to exclude from sync (glob patterns, one per line).',
-      cls: 'setting-item-description',
-    });
-
-    new Setting(containerEl)
-      .addTextArea(ta => {
-        ta.setValue(this.settings.excludedPatterns.join('\n'))
-          .setPlaceholder('.obsidian/workspace.json\n.vault-sync/**')
+    new Setting(details)
+      .setName('Debounce delay')
+      .setDesc('Wait this many milliseconds after a file stops changing before recording a change.')
+      .addSlider(s => {
+        s.setLimits(500, 5000, 100)
+          .setValue(this.settings.debounceMs)
+          .setDynamicTooltip()
           .onChange(async v => {
-            this.settings.excludedPatterns = v.split('\n').map(s => s.trim()).filter(Boolean);
+            this.settings.debounceMs = v;
             await this.save();
           });
-        ta.inputEl.rows = 5;
-        ta.inputEl.addClass('vault-sync-exclusions');
       });
 
-    // ── Storage ───────────────────────────────────────────────────────────
-    new Setting(containerEl).setName('Storage').setHeading();
-
-    new Setting(containerEl)
+    new Setting(details)
       .setName('Ancestor retention')
       .setDesc('Keep ancestor content for this many days before garbage collection.')
       .addSlider(s => {
@@ -270,7 +318,30 @@ export class SyncSettingTab extends PluginSettingTab {
           });
       });
 
-    new Setting(containerEl)
+    details.createEl('p', {
+      text: 'Excluded paths — files and folders to keep out of sync (glob patterns, one per line).',
+      cls: 'setting-item-description',
+    });
+    new Setting(details)
+      .addTextArea(ta => {
+        ta.setValue(this.settings.excludedPatterns.join('\n'))
+          .setPlaceholder('.obsidian/workspace.json\n.vault-sync/**')
+          .onChange(async v => {
+            this.settings.excludedPatterns = v.split('\n').map(s => s.trim()).filter(Boolean);
+            await this.save();
+          });
+        ta.inputEl.rows = 5;
+        ta.inputEl.addClass('vault-sync-exclusions');
+      });
+  }
+
+  // ─── Danger zone (collapsed) ────────────────────────────────────────────────
+
+  private renderDangerZone(containerEl: HTMLElement): void {
+    const details = containerEl.createEl('details', { cls: 'vault-sync-disclosure' });
+    details.createEl('summary', { text: 'Maintenance & danger zone' });
+
+    new Setting(details)
       .setName('Clear sync cache')
       .setDesc('Remove content-store blobs the registry no longer references. ' +
         'Safe — only affects three-way merge quality, not vault content.')
@@ -283,7 +354,7 @@ export class SyncSettingTab extends PluginSettingTab {
         });
       });
 
-    new Setting(containerEl)
+    new Setting(details)
       .setName('Re-check for conflicts')
       .setDesc('Re-pull the whole server history and recompute every merge, then sync. ' +
         'Use this to bring back a conflict you skipped or dismissed by accident. ' +
@@ -297,7 +368,7 @@ export class SyncSettingTab extends PluginSettingTab {
         });
       });
 
-    new Setting(containerEl)
+    new Setting(details)
       .setName('Reset sync state')
       .setDesc('Rebuild the file registry from the vault and re-capture every file as ' +
         'pending operations. Use if sync metadata is corrupted. Un-synced changes are ' +
@@ -311,7 +382,7 @@ export class SyncSettingTab extends PluginSettingTab {
         });
       });
 
-    new Setting(containerEl)
+    new Setting(details)
       .setName('Re-baseline this device to the server')
       .setDesc('Push every file on this device to the server as the authoritative version — ' +
         'use to rebuild or recover the server from a device you trust. If another device ' +
