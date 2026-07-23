@@ -324,12 +324,17 @@ whole **F-op backlog at once** — a one-time post-convergence cost R1 never tar
 
 B1 now runs one **drain round** after convergence (advancing the cursor past the
 backlog) before the measured edit, so `pull` drops to **0 ops**. The true steady-state
-round (laptop, backlog drained):
+round:
 
-| B1 roundMs (laptop) | XS(50) | S(500) | M(2000) | L(10000) |
+| B1 roundMs | XS(50) | S(500) | M(2000) | L(10000) |
 |---|--:|--:|--:|--:|
-| backlog-drain artifact | 21 | 129 | 190 | 2346 (ARM) |
-| **steady state (drained)** | **3.8** | **9.9** | **18.3** | **122.5** |
+| backlog-drain artifact (L was ARM) | 21 | 129 | 190 | 2346 |
+| **steady state, laptop** | **3.8** | **9.9** | **18.3** | **122.5** |
+| **steady state, native ARM** | — | — | — | **308** |
+
+The **native-ARM L steady-state round is 308 ms** (Termux, drained B1) — not the
+2346 ms the backlog artifact showed, and ~2.5× the laptop's 122 ms (in line with the
+~3× ARM CPU penalty). Counts flat on-device: sha256=2, fileReads=1.
 
 Phase split of the drained L round (118 ms laptop total): captureOfflineChanges
 **30 ms** (O(F) stat scan) · buildLocalState **38 ms** (gated, no hashing) · DAG
@@ -438,7 +443,8 @@ so both would reproduce in the WebView.
       `buildLocalState`; B1 sha256 F+1 → 2, fileReads F → 1, counts flat-in-F confirmed
       native-ARM. Decomposition closed R2 as not-warranted and found B1 was measuring the
       post-convergence backlog-drain round, not steady state (now drained; see "The R1
-      fix" above). Steady-state native-ARM roundMs at L still to re-record on device.
+      fix" above). Steady-state native-ARM L round = **308 ms** (Termux), not the 2346 ms
+      artifact. Fully recorded.
 - [x] **Native-ARM (Termux) full sweep** — B1–B9 at XS/S/M on the phone's real cores
       (recorded above; ~3× CPU penalty confirmed, routine budgets pass, diff3 low-unique
       + steady-state memCache flagged as the CPU hazards).
