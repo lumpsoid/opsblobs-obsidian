@@ -10,7 +10,7 @@
 //
 //  Not obsidian-coupled, so it doubles as the P7 integration harness.
 
-import { ServerApi, OpRecord, PullOpsResult, AppendOp, AppendResult } from './server-sync';
+import { ServerApi, OpRecord, PullOpsResult, AppendOp, AppendResult, BlobUpload } from './server-sync';
 
 /** Thrown for a `422` — the append referenced a blob that was never uploaded. */
 export class MissingBlobError extends Error {
@@ -60,6 +60,13 @@ export class FakeSyncServer implements ServerApi {
   async putBlob(hash: string, bytes: Uint8Array): Promise<void> {
     // Idempotent by hash — first write wins, re-puts are no-ops.
     if (!this.blobs.has(hash)) this.blobs.set(hash, bytes);
+  }
+
+  async putBlobBatch(blobs: BlobUpload[]): Promise<void> {
+    // Same idempotent, content-addressed store as putBlob — one call, many blobs.
+    for (const b of blobs) {
+      if (!this.blobs.has(b.hash)) this.blobs.set(b.hash, b.bytes);
+    }
   }
 
   async getBlob(hash: string): Promise<Uint8Array | null> {

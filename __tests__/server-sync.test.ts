@@ -15,6 +15,7 @@ import {
   PullOpsResult,
   AppendOp,
   AppendResult,
+  BlobUpload,
   StaleCursorError,
   reconstructRemoteState,
 } from '../src/network/server-sync';
@@ -35,6 +36,7 @@ class BlobGatedServer implements ServerApi {
   appendOps(baseCursor: number, ops: AppendOp[]): Promise<AppendResult> { return this.inner.appendOps(baseCursor, ops); }
   checkBlobs(hashes: string[]): Promise<{ missing: string[] }> { return this.inner.checkBlobs(hashes); }
   putBlob(hash: string, bytes: Uint8Array): Promise<void> { return this.inner.putBlob(hash, bytes); }
+  putBlobBatch(blobs: BlobUpload[]): Promise<void> { return this.inner.putBlobBatch(blobs); }
   async getBlob(hash: string): Promise<Uint8Array | null> {
     return this.blobAvailable ? this.inner.getBlob(hash) : null;
   }
@@ -55,6 +57,7 @@ class StaleOnceServer implements ServerApi {
   }
   checkBlobs(hashes: string[]): Promise<{ missing: string[] }> { return this.inner.checkBlobs(hashes); }
   putBlob(hash: string, bytes: Uint8Array): Promise<void> { return this.inner.putBlob(hash, bytes); }
+  putBlobBatch(blobs: BlobUpload[]): Promise<void> { return this.inner.putBlobBatch(blobs); }
   getBlob(hash: string): Promise<Uint8Array | null> { return this.inner.getBlob(hash); }
 }
 
@@ -72,13 +75,16 @@ class BatchRecordingServer implements ServerApi {
   }
   checkBlobs(hashes: string[]): Promise<{ missing: string[] }> { return this.inner.checkBlobs(hashes); }
   putBlob(hash: string, bytes: Uint8Array): Promise<void> { return this.inner.putBlob(hash, bytes); }
+  putBlobBatch(blobs: BlobUpload[]): Promise<void> { return this.inner.putBlobBatch(blobs); }
   getBlob(hash: string): Promise<Uint8Array | null> { return this.inner.getBlob(hash); }
 }
 
-/** Wraps a FakeSyncServer recording the peak number of `putBlob` calls in flight at
- *  once, so a test can assert the upload pool never exceeds its concurrency cap (and
- *  actually overlaps up to it). A `setTimeout(0)` inside each `putBlob` holds every
- *  started upload open past the microtask drain, so the peak reflects real overlap. */
+/** Wraps a FakeSyncServer recording the peak number of blob-upload *requests* in
+ *  flight at once — counting a `putBlobBatch` (the primary path) and a `putBlob`
+ *  (large-blob / key-check path) each as one in-flight request — so a test can
+ *  assert the upload pool never exceeds its concurrency cap (and actually overlaps
+ *  up to it). A `setTimeout(0)` inside each holds the started request open past the
+ *  microtask drain, so the peak reflects real overlap. */
 class ConcurrencyProbeServer implements ServerApi {
   inFlight = 0;
   maxInFlight = 0;
@@ -87,12 +93,21 @@ class ConcurrencyProbeServer implements ServerApi {
   appendOps(baseCursor: number, ops: AppendOp[]): Promise<AppendResult> { return this.inner.appendOps(baseCursor, ops); }
   checkBlobs(hashes: string[]): Promise<{ missing: string[] }> { return this.inner.checkBlobs(hashes); }
   getBlob(hash: string): Promise<Uint8Array | null> { return this.inner.getBlob(hash); }
-  async putBlob(hash: string, bytes: Uint8Array): Promise<void> {
+  private async track<T>(run: () => Promise<T>): Promise<T> {
     this.inFlight++;
     this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
     await new Promise(r => setTimeout(r, 0)); // hold the slot open so overlap is observable
-    await this.inner.putBlob(hash, bytes);
-    this.inFlight--;
+    try {
+      return await run();
+    } finally {
+      this.inFlight--;
+    }
+  }
+  putBlob(hash: string, bytes: Uint8Array): Promise<void> {
+    return this.track(() => this.inner.putBlob(hash, bytes));
+  }
+  putBlobBatch(blobs: BlobUpload[]): Promise<void> {
+    return this.track(() => this.inner.putBlobBatch(blobs));
   }
 }
 
@@ -276,15 +291,19 @@ describe('ServerSyncClient — full round against the fake', () => {
     for (let i = 0; i < 10; i++) await deviceA.seedFile(`n${i}.md`, `body ${i}`, 1000 + i);
 
     const clientA = new ServerSyncClient({
-      api: probe, crypto: vc, host: deviceA.host, hlc: deviceA.hlc, blobUploadConcurrency: 3,
+      // Pack ≤2 blobs per batch so the 10 blobs form 5 batch requests — enough to
+      // overlap and exercise the pool. (With the default cap of 256 they'd be one
+      // request, and concurrency wouldn't be observable.)
+      api: probe, crypto: vc, host: deviceA.host, hlc: deviceA.hlc,
+      blobUploadConcurrency: 3, blobBatchMaxCount: 2,
     });
     await clientA.runSync();
 
-    // Overlapped up to — but never beyond — the cap. (10 blobs, cap 3 → peak is exactly 3.)
+    // Overlapped up to — but never beyond — the cap. (5 batch requests, cap 3 → peak is 3.)
     expect(probe.maxInFlight).toBe(3);
     expect(probe.maxInFlight).toBeLessThanOrEqual(3);
-    // The pool awaits every PUT before the append, so all blobs are present when the ops
-    // land — the fake 422s (MissingBlobError) if any op referenced an un-uploaded blob.
+    // The pool awaits every upload before the append, so all blobs are present when the
+    // ops land — the fake 422s (MissingBlobError) if any op referenced an un-uploaded blob.
     expect(inner.opCount).toBe(10);
     expect(inner.blobCount).toBe(11); // 10 content blobs + the vault key-check record
     expect(deviceA.pendingOps).toHaveLength(0);

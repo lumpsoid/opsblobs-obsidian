@@ -14,7 +14,9 @@ import {
   PullOpsResult,
   AppendOp,
   AppendResult,
+  BlobUpload,
 } from './server-sync';
+import { bytesToBase64 } from '../core/encoding';
 import {
   StaleCursorError,
   AuthError,
@@ -111,6 +113,19 @@ export class HttpServerApi implements ServerApi {
     }, this.metaTimeout);
     if (resp.status !== 200) throw this.statusError(resp.status, 'checking the server');
     return resp.json as { missing: string[] };
+  }
+
+  async putBlobBatch(blobs: BlobUpload[]): Promise<void> {
+    const body = JSON.stringify({
+      blobs: blobs.map(b => ({ hash: b.hash, data: bytesToBase64(b.bytes) })),
+    });
+    const resp = await this.request('uploading your files', {
+      url: `${this.vaultBase()}/blobs:batch`,
+      method: 'POST',
+      headers: { ...this.authHeader(), 'Content-Type': 'application/json' },
+      body,
+    }, this.blobTimeout);
+    if (resp.status !== 200) throw this.statusError(resp.status, 'uploading your files');
   }
 
   async putBlob(hash: string, bytes: Uint8Array): Promise<void> {

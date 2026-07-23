@@ -3,13 +3,14 @@
 // ─────────────────────────────────────────────
 //
 //  A test-side twin of src/network/server-http.ts (HttpServerApi). That prod
-//  class speaks the same five endpoints over Obsidian's `requestUrl`, which is
+//  class speaks the same endpoints over Obsidian's `requestUrl`, which is
 //  unavailable under vitest/Node — so this one uses global `fetch` instead. The
 //  wire contract it implements is identical; the shared contract suite runs the
 //  same scenarios through this against the real Go server that it runs through
 //  FakeSyncServer, which is what keeps the fake honest.
 
-import { ServerApi, PullOpsResult, AppendOp, AppendResult } from '../../src/network/server-sync';
+import { ServerApi, PullOpsResult, AppendOp, AppendResult, BlobUpload } from '../../src/network/server-sync';
+import { bytesToBase64 } from '../../src/core/encoding';
 
 export class FetchServerApi implements ServerApi {
   constructor(
@@ -55,6 +56,15 @@ export class FetchServerApi implements ServerApi {
     });
     if (resp.status !== 200) throw new Error(`POST /blobs:check failed: ${resp.status}`);
     return (await resp.json()) as { missing: string[] };
+  }
+
+  async putBlobBatch(blobs: BlobUpload[]): Promise<void> {
+    const resp = await fetch(`${this.vaultBase()}/blobs:batch`, {
+      method: 'POST',
+      headers: { ...this.auth(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ blobs: blobs.map(b => ({ hash: b.hash, data: bytesToBase64(b.bytes) })) }),
+    });
+    if (resp.status !== 200) throw new Error(`POST /blobs:batch failed: ${resp.status}`);
   }
 
   async putBlob(hash: string, bytes: Uint8Array): Promise<void> {

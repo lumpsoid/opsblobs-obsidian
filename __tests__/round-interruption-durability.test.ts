@@ -25,6 +25,7 @@ import {
   PullOpsResult,
   AppendOp,
   AppendResult,
+  BlobUpload,
 } from '../src/network/server-sync';
 import { FakeSyncServer } from '../src/network/fake-server';
 import { VaultCrypto } from '../src/network/encryption';
@@ -61,20 +62,21 @@ class CrashOnFirstClearHost implements VaultSyncHost {
 
 /**
  * Wraps a FakeSyncServer so the FIRST `appendOps` throws — modelling a crash
- * *after* the blob was uploaded (`putBlob` already ran) but *before* the op was
- * appended. A restart must not re-upload a duplicate blob (`blobs:check` sees it)
- * and must land the op exactly once. Every other call delegates.
+ * *after* the blobs were uploaded (`putBlobBatch` already ran) but *before* the op
+ * was appended. A restart must not re-upload a duplicate blob (`blobs:check` sees
+ * it) and must land the op exactly once. Every other call delegates.
  */
 class CrashOnFirstAppendServer implements ServerApi {
   private armed = true;
   constructor(private readonly inner: FakeSyncServer) {}
   pullOps(since: number, limit: number): Promise<PullOpsResult> { return this.inner.pullOps(since, limit); }
   async appendOps(baseCursor: number, ops: AppendOp[]): Promise<AppendResult> {
-    if (this.armed) { this.armed = false; throw new Error('simulated crash after putBlob, before appendOps'); }
+    if (this.armed) { this.armed = false; throw new Error('simulated crash after putBlobBatch, before appendOps'); }
     return this.inner.appendOps(baseCursor, ops);
   }
   checkBlobs(hashes: string[]): Promise<{ missing: string[] }> { return this.inner.checkBlobs(hashes); }
   putBlob(hash: string, bytes: Uint8Array): Promise<void> { return this.inner.putBlob(hash, bytes); }
+  putBlobBatch(blobs: BlobUpload[]): Promise<void> { return this.inner.putBlobBatch(blobs); }
   getBlob(hash: string): Promise<Uint8Array | null> { return this.inner.getBlob(hash); }
 }
 

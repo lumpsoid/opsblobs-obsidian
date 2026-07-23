@@ -70,8 +70,14 @@ export {
   DecryptError,
 } from './sync-errors';
 
+/** One blob in a batch upload: its (blinded) hash and the *encrypted* envelope. */
+export interface BlobUpload {
+  hash: string;
+  bytes: Uint8Array;
+}
+
 /**
- * The five spec endpoints (§4–§5). Implemented over `requestUrl` in prod
+ * The spec endpoints (§4–§5). Implemented over `requestUrl` in prod
  * (HttpServerApi) and in memory for tests (FakeSyncServer). Blob bytes are the
  * *encrypted* envelope; hashes are already blinded by the caller.
  */
@@ -79,6 +85,12 @@ export interface ServerApi {
   pullOps(since: number, limit: number): Promise<PullOpsResult>;
   appendOps(baseCursor: number, ops: AppendOp[]): Promise<AppendResult>;
   checkBlobs(hashes: string[]): Promise<{ missing: string[] }>;
+  /** Upload many blobs in one request (spec §5.5) — the primary upload path,
+   *  collapsing a first sync's thousands of one-blob round-trips into ⌈N/batch⌉. */
+  putBlobBatch(blobs: BlobUpload[]): Promise<void>;
+  /** Upload a single blob. Used for the two cases batching doesn't serve: the
+   *  lone key-check blob, and a large attachment whose bytes would bloat a
+   *  base64 JSON batch — sent as raw `application/octet-stream` instead. */
   putBlob(hash: string, bytes: Uint8Array): Promise<void>;
   getBlob(hash: string): Promise<Uint8Array | null>;
 }
@@ -157,6 +169,18 @@ export interface ServerSyncOptions {
    *  pool overlaps the round-trips without swamping a mobile `requestUrl`. Test hook;
    *  defaults to {@link DEFAULT_BLOB_UPLOAD_CONCURRENCY}. */
   blobUploadConcurrency?: number;
+  /** Max blobs packed into one `blobs:batch` request. Must be ≤ the server's
+   *  env-configured `MaxBlobsPerBatch`. Test hook; defaults to
+   *  {@link DEFAULT_BLOB_BATCH_MAX_COUNT}. */
+  blobBatchMaxCount?: number;
+  /** Max total (plaintext) bytes packed into one batch. The base64 JSON body is
+   *  ~1.34× this, so the default leaves headroom under the server's
+   *  `MaxBlobBatchSize`. Test hook; defaults to {@link DEFAULT_BLOB_BATCH_MAX_BYTES}. */
+  blobBatchMaxBytes?: number;
+  /** Blobs larger than this (plaintext bytes) are uploaded individually via
+   *  `putBlob` rather than batched, so a big attachment can't bloat a batch. Test
+   *  hook; defaults to {@link DEFAULT_BLOB_BATCH_THRESHOLD}. */
+  blobBatchThreshold?: number;
   onProgress?: (label: string) => void;
   /** Diagnostic per-phase wall-clock sink (perf baseline, Layer 3). When omitted
    *  (the default) `runSync` installs no timer and does no timing work — inert. The
@@ -179,6 +203,22 @@ const DEFAULT_MAX_OPS_PER_APPEND = 1000;
  *  modest (near the classic ~6 connections-per-host ceiling) so a mobile `requestUrl`
  *  and the per-blob AES-GCM encrypt aren't swamped. */
 const DEFAULT_BLOB_UPLOAD_CONCURRENCY = 8;
+
+/** Default max blobs per `blobs:batch` request. Matches the server's default
+ *  `MaxBlobsPerBatch` (256); a fresh vault's thousands of tiny notes upload in
+ *  ⌈N/256⌉ requests instead of N one-blob PUTs, the dominant first-sync cost. */
+const DEFAULT_BLOB_BATCH_MAX_COUNT = 256;
+
+/** Default max total plaintext bytes per batch. The base64 JSON body is ~1.34×
+ *  this, so 16 MiB stays comfortably under the server's default 32 MiB
+ *  `MaxBlobBatchSize` even with per-blob AEAD + JSON overhead. */
+const DEFAULT_BLOB_BATCH_MAX_BYTES = 16 * 1024 * 1024;
+
+/** Default cutoff (plaintext bytes) above which a blob is PUT individually rather
+ *  than batched. Batching pays off for many small blobs; a large attachment is
+ *  already one round-trip's worth of bytes, so it gains nothing and would only
+ *  crowd out small blobs from a batch. */
+const DEFAULT_BLOB_BATCH_THRESHOLD = 512 * 1024;
 
 /** What a sync round did, surfaced to the plugin so the observable sync-state
  *  (S2) can record it. `deferred`/`stranded` are the fileless raw sets the round
@@ -221,6 +261,9 @@ export class ServerSyncClient {
   private readonly opsLimit: number;
   private readonly maxOpsPerAppend: number;
   private readonly blobUploadConcurrency: number;
+  private readonly blobBatchMaxCount: number;
+  private readonly blobBatchMaxBytes: number;
+  private readonly blobBatchThreshold: number;
   private readonly onProgress?: (label: string) => void;
   private readonly perfLog?: PhaseTimingSink;
 
@@ -235,6 +278,9 @@ export class ServerSyncClient {
       1,
       opts.blobUploadConcurrency ?? DEFAULT_BLOB_UPLOAD_CONCURRENCY,
     );
+    this.blobBatchMaxCount = Math.max(1, opts.blobBatchMaxCount ?? DEFAULT_BLOB_BATCH_MAX_COUNT);
+    this.blobBatchMaxBytes = Math.max(1, opts.blobBatchMaxBytes ?? DEFAULT_BLOB_BATCH_MAX_BYTES);
+    this.blobBatchThreshold = Math.max(0, opts.blobBatchThreshold ?? DEFAULT_BLOB_BATCH_THRESHOLD);
     this.onProgress = opts.onProgress;
     this.perfLog = opts.perfLog;
   }
@@ -574,37 +620,100 @@ export class ServerSyncClient {
   }
 
   /**
-   * Encrypt and `PUT` each missing blob, with at most `blobUploadConcurrency` uploads
-   * in flight. Each `PUT` is one round-trip, so a fresh-vault baseline (thousands of
-   * blobs) is latency-bound; overlapping a bounded pool cuts wall-clock ~linearly in
-   * the concurrency factor without swamping a mobile `requestUrl`.
+   * Encrypt and upload every missing blob, with at most `blobUploadConcurrency`
+   * requests in flight. A fresh vault is thousands of tiny notes, and one PUT per
+   * blob makes that baseline latency-bound (one round-trip each). So small blobs
+   * are packed into `blobs:batch` requests (up to `blobBatchMaxCount` /
+   * `blobBatchMaxBytes` each) and large blobs still PUT individually; both are
+   * dispatched through one bounded pool. A batch of B blobs is a single round-trip
+   * instead of B, which is the dominant first-sync win.
    *
-   * Safety: this resolves only once *all* uploads settle, preserving the blobs-before-
-   * append ordering the server requires (a 422 otherwise). A `PUT` is idempotent by
-   * hash (200/201 both OK), so if one rejects — aborting the round via `Promise.all` —
-   * the whole push re-runs next round and the blobs already stored dedupe server-side.
-   * Order within the pool is irrelevant: no op is appended until every blob has landed.
+   * Safety: this resolves only once *all* requests settle, preserving the blobs-
+   * before-append ordering the server requires (a 422 otherwise). Every upload is
+   * idempotent by hash, so if one rejects — aborting the round via `Promise.all` —
+   * the whole push re-runs next round and stored blobs dedupe server-side. Order is
+   * irrelevant: no op is appended until every blob has landed.
    */
   private async uploadBlobs(missing: string[], blobs: Map<string, Uint8Array>): Promise<void> {
     if (missing.length === 0) return;
     const total = missing.length;
-    let next = 0;
     let done = 0;
+    const bump = (n: number): void => {
+      done += n;
+      if (total > this.blobUploadConcurrency) {
+        this.onProgress?.(`Uploading files ${done}/${total}…`);
+      }
+    };
+
+    // Build the in-flight unit list: each batch is one request, each large blob is
+    // one PUT. Batching is the primary path; large blobs split out to raw PUTs.
+    const units: Array<() => Promise<void>> = [];
+    const { batches, singles } = this.planBlobUpload(missing, blobs);
+    for (const batch of batches) {
+      units.push(() => this.uploadBlobBatch(batch, blobs).then(() => bump(batch.length)));
+    }
+    for (const hash of singles) {
+      units.push(() => this.uploadOneBlob(hash, blobs).then(() => bump(1)));
+    }
+
+    let next = 0;
     const worker = async (): Promise<void> => {
       for (;;) {
         const i = next++;
-        if (i >= total) return;
-        const hash = missing[i]!;
-        const envelope = await this.crypto.encryptBlob(blobs.get(hash)!);
-        await this.api.putBlob(hash, envelope);
-        done++;
-        if (total > this.blobUploadConcurrency) {
-          this.onProgress?.(`Uploading files ${done}/${total}…`);
-        }
+        if (i >= units.length) return;
+        await units[i]!();
       }
     };
-    const workers = Math.min(this.blobUploadConcurrency, total);
+    const workers = Math.min(this.blobUploadConcurrency, units.length);
     await Promise.all(Array.from({ length: workers }, () => worker()));
+  }
+
+  /**
+   * Partition the missing hashes into batches of small blobs plus a list of large
+   * blobs to PUT individually, packing by *plaintext* size (the encrypted envelope
+   * adds only a small fixed AEAD overhead, absorbed by the byte-budget headroom).
+   * A new batch starts once the current one hits `blobBatchMaxCount` blobs or would
+   * exceed `blobBatchMaxBytes`.
+   */
+  private planBlobUpload(
+    missing: string[],
+    blobs: Map<string, Uint8Array>,
+  ): { batches: string[][]; singles: string[] } {
+    const batches: string[][] = [];
+    const singles: string[] = [];
+    let cur: string[] = [];
+    let curBytes = 0;
+    for (const hash of missing) {
+      const size = blobs.get(hash)!.length;
+      if (size > this.blobBatchThreshold) {
+        singles.push(hash);
+        continue;
+      }
+      if (cur.length > 0 && (cur.length >= this.blobBatchMaxCount || curBytes + size > this.blobBatchMaxBytes)) {
+        batches.push(cur);
+        cur = [];
+        curBytes = 0;
+      }
+      cur.push(hash);
+      curBytes += size;
+    }
+    if (cur.length > 0) batches.push(cur);
+    return { batches, singles };
+  }
+
+  /** Encrypt a batch's blobs and upload them in one request. */
+  private async uploadBlobBatch(hashes: string[], blobs: Map<string, Uint8Array>): Promise<void> {
+    const entries: BlobUpload[] = [];
+    for (const hash of hashes) {
+      entries.push({ hash, bytes: await this.crypto.encryptBlob(blobs.get(hash)!) });
+    }
+    await this.api.putBlobBatch(entries);
+  }
+
+  /** Encrypt and PUT a single blob. */
+  private async uploadOneBlob(hash: string, blobs: Map<string, Uint8Array>): Promise<void> {
+    const envelope = await this.crypto.encryptBlob(blobs.get(hash)!);
+    await this.api.putBlob(hash, envelope);
   }
 
   /**

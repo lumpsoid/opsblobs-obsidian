@@ -199,6 +199,29 @@ so a checkpoint-driven blob GC (§6) must treat this reserved key as always-live
 an *availability* degradation (→ the pre-guard status quo), consistent with the §9-non-goal on log
 completeness.
 
+### 5.5 Upload many blobs in one request (idempotent, batch)
+
+```
+POST /v1/vaults/{vaultId}/blobs:batch
+Content-Type: application/json
+{ "blobs": [ { "hash": "<hash>", "data": "<base64 encrypted bytes>" }, … ] }
+```
+**200** → `{ "count": <n> }` (blobs stored; `n == len(blobs)` on success).
+
+The **primary upload path.** A fresh vault is thousands of tiny notes, and one `PUT` per blob
+(§5.2) makes that first sync latency-bound — one HTTP round-trip each (~7 min for 8k blobs
+observed). This collapses them into ⌈N/`MaxBlobsPerBatch`⌉ requests, each committing all its blob
+metadata in a single transaction. `data` is **standard base64** (with padding) of the same
+encrypted envelope §5.2 carries raw; the server stores blobs identically and can't verify the bytes
+hash to `{hash}` [D5]. Idempotent by hash (re-storing an existing blob is a no-op), so a client
+safely retries the whole batch.
+
+Bounds: at most `MaxBlobsPerBatch` blobs (default **256**) and `MaxBlobBatchSize` total request
+bytes (default **32 MiB**) per call — over either → **413**; each blob is still bounded by
+`MaxBlobSize`. A malformed hash or non-base64 `data` → **400**. `§5.2`'s single `PUT` remains for
+the lone key-check blob (§5.4) and for large attachments, whose bytes would bloat a base64 JSON
+batch (the client PUTs any blob over its `blobBatchThreshold` individually).
+
 ---
 
 ## 6. Checkpoint endpoints (optional, phase 2)
