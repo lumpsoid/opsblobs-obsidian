@@ -147,6 +147,11 @@ export interface ServerSyncOptions {
   hlc: HybridLogicalClock;
   /** Page size for the pull loop (server may cap lower). */
   opsLimit?: number;
+  /** Max ops per `POST /ops` batch. A large offline backlog is split across this
+   *  many-op appends so it can't exceed the server's per-POST cap (§9.6) and 413.
+   *  Must be ≤ the server's env-configured `MaxOpsPerPost`. Test hook; defaults to
+   *  {@link DEFAULT_MAX_OPS_PER_APPEND}. */
+  maxOpsPerAppend?: number;
   onProgress?: (label: string) => void;
   /** Diagnostic per-phase wall-clock sink (perf baseline, Layer 3). When omitted
    *  (the default) `runSync` installs no timer and does no timing work — inert. The
@@ -155,6 +160,13 @@ export interface ServerSyncOptions {
 }
 
 const DEFAULT_OPS_LIMIT = 500;
+
+/** Default batch size for the append loop. A whole-vault offline capture (e.g. a
+ *  fresh vault's first sync) can queue thousands of pending ops; posting them in
+ *  one `POST /ops` exceeds the server's per-POST op cap and is rejected 413
+ *  (`ErrBatchTooLarge`, spec §9.6). Chunk the append into batches of at most this
+ *  many ops. Keep this ≤ the server's env-configured `MaxOpsPerPost`. */
+const DEFAULT_MAX_OPS_PER_APPEND = 1000;
 
 /** What a sync round did, surfaced to the plugin so the observable sync-state
  *  (S2) can record it. `deferred`/`stranded` are the fileless raw sets the round
@@ -195,6 +207,7 @@ export class ServerSyncClient {
   private readonly host: VaultSyncHost;
   private readonly hlc: HybridLogicalClock;
   private readonly opsLimit: number;
+  private readonly maxOpsPerAppend: number;
   private readonly onProgress?: (label: string) => void;
   private readonly perfLog?: PhaseTimingSink;
 
@@ -204,6 +217,7 @@ export class ServerSyncClient {
     this.host = opts.host;
     this.hlc = opts.hlc;
     this.opsLimit = opts.opsLimit ?? DEFAULT_OPS_LIMIT;
+    this.maxOpsPerAppend = Math.max(1, opts.maxOpsPerAppend ?? DEFAULT_MAX_OPS_PER_APPEND);
     this.onProgress = opts.onProgress;
     this.perfLog = opts.perfLog;
   }
@@ -491,6 +505,13 @@ export class ServerSyncClient {
   /**
    * Upload the content for our pending ops (deduped via `blobs:check`), then
    * append the ops. Blobs must land before ops or the server 422s the append.
+   *
+   * The append is split into batches of at most `maxOpsPerAppend` ops so a large
+   * offline backlog (a fresh vault's whole-vault capture can be thousands of ops)
+   * never exceeds the server's per-POST op cap and 413s (§9.6). Batching is safe:
+   * each op is idempotent by `clientOpId`, and the caller only `clearPendingOps`
+   * once this returns — so a failure partway through re-sends every batch next
+   * round, and the batches already stored dedupe server-side.
    */
   private async pushPendingOps(local: VaultState, baseCursor: number): Promise<void> {
     // Map blinded hash → plaintext content for every op that carries content.
@@ -521,18 +542,35 @@ export class ServerSyncClient {
       }
     }
 
-    // Append with `baseCursor` advisory (spec §9.3). A server MAY 409 a too-stale
-    // writer; since we always append with our pull cursor — which is stale the
-    // moment anyone else appends — a 409 must be recovered, not fatal, or sync
-    // wedges (F4). Refresh the cursor by re-pulling to the current head and
-    // re-append; the append is idempotent by `clientOpId`, so a partial prior
-    // attempt can't duplicate. Ops others slipped in during the 409 window sit at
-    // seq > head and are re-pulled next round (we don't merge them mid-retry).
+    // Append in batches so a big backlog can't 413 (see the method doc). Thread the
+    // head cursor the server returns as the next batch's advisory baseCursor — it's
+    // the freshest value, so it minimises the stale-writer (409) window between
+    // batches. Only narrate per-batch progress when there's more than one batch.
+    let cursor = baseCursor;
+    const total = records.length;
+    for (let i = 0; i < total; i += this.maxOpsPerAppend) {
+      const batch = records.slice(i, i + this.maxOpsPerAppend);
+      if (total > this.maxOpsPerAppend) {
+        this.onProgress?.(`Uploading changes ${i + batch.length}/${total}…`);
+      }
+      cursor = await this.appendBatch(batch, cursor);
+    }
+  }
+
+  /**
+   * Append one batch at `baseCursor` (advisory, spec §9.3), recovering a too-stale
+   * 409 by re-pulling to the current head and retrying — bounded (F4), never a
+   * wedge. The append is idempotent by `clientOpId`, so a retry (or a batch
+   * re-sent after a mid-push failure) can't duplicate. Ops others slipped in
+   * during the 409 window sit at seq > head and are re-pulled next round (we don't
+   * merge them mid-retry). Returns the server's head cursor after the append.
+   */
+  private async appendBatch(batch: AppendOp[], baseCursor: number): Promise<number> {
     let cursor = baseCursor;
     for (let attempt = 0; ; attempt++) {
       try {
-        await this.api.appendOps(cursor, records);
-        return;
+        const { headCursor } = await this.api.appendOps(cursor, batch);
+        return headCursor;
       } catch (err) {
         if (!(err instanceof StaleCursorError)) throw err;
         if (attempt >= MAX_STALE_APPEND_RETRIES) {

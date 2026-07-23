@@ -58,6 +58,23 @@ class StaleOnceServer implements ServerApi {
   getBlob(hash: string): Promise<Uint8Array | null> { return this.inner.getBlob(hash); }
 }
 
+/** Wraps a FakeSyncServer recording the op-count of every `appendOps` call, so a
+ *  test can assert a backlog larger than the per-POST cap was split into batches
+ *  (spec §9.6 — a single oversized POST would 413/`ErrBatchTooLarge`). The fake
+ *  itself enforces no cap; this just observes the shape the client sent. */
+class BatchRecordingServer implements ServerApi {
+  batchSizes: number[] = [];
+  constructor(private readonly inner: FakeSyncServer) {}
+  pullOps(since: number, limit: number): Promise<PullOpsResult> { return this.inner.pullOps(since, limit); }
+  appendOps(baseCursor: number, ops: AppendOp[]): Promise<AppendResult> {
+    this.batchSizes.push(ops.length);
+    return this.inner.appendOps(baseCursor, ops);
+  }
+  checkBlobs(hashes: string[]): Promise<{ missing: string[] }> { return this.inner.checkBlobs(hashes); }
+  putBlob(hash: string, bytes: Uint8Array): Promise<void> { return this.inner.putBlob(hash, bytes); }
+  getBlob(hash: string): Promise<Uint8Array | null> { return this.inner.getBlob(hash); }
+}
+
 function client(api: FakeSyncServer, crypto: VaultCrypto, device: TestDevice): ServerSyncClient {
   // The client shares the device's HLC so `setCurrent(mergedHlc)` + `now()` land
   // on the same clock the host and applicator read.
@@ -209,6 +226,25 @@ describe('ServerSyncClient — full round against the fake', () => {
     expect(deviceA.pendingOps).toHaveLength(0);
     const onDisk = await deviceA.files.read('a.md');
     expect(onDisk && new TextDecoder().decode(onDisk)).toBe('hello');
+  });
+
+  test('a backlog larger than maxOpsPerAppend is split into per-POST batches (§9.6, no 413)', async () => {
+    const inner = new FakeSyncServer();
+    const rec = new BatchRecordingServer(inner);
+    const deviceA = await device('dev-a');
+    // Five pending create ops with a batch cap of 2 → appends of 2, 2, 1 — none
+    // over the cap that would otherwise 413 as one oversized POST.
+    for (let i = 0; i < 5; i++) await deviceA.seedFile(`n${i}.md`, `body ${i}`, 1000 + i);
+    expect(deviceA.pendingOps).toHaveLength(5);
+
+    const clientA = new ServerSyncClient({
+      api: rec, crypto: vc, host: deviceA.host, hlc: deviceA.hlc, maxOpsPerAppend: 2,
+    });
+    await clientA.runSync();
+
+    expect(rec.batchSizes).toEqual([2, 2, 1]); // chunked; every batch within the cap
+    expect(inner.opCount).toBe(5);             // all ops landed, each exactly once
+    expect(deviceA.pendingOps).toHaveLength(0); // cleared only after the whole push
   });
 
   test('a temporarily-unavailable blob is retried; the cursor never strands the op (F3)', async () => {
