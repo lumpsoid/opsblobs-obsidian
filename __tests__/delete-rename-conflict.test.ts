@@ -73,7 +73,7 @@ describe('concurrent delete vs rename', () => {
     const { A, B, id, client } = await setup();
     // Only B (the device that surfaces the conflict) resolves. A has no resolver
     // — it must adopt B's decision, not raise its own prompt.
-    B.resolveDeleteConflict = () => 'restore';
+    B.resolveDeleteConflict = () => 'keep_modified';
 
     await client(B).runSync();   // B hits the conflict, keeps my-1
     expect(B.applied.some(a => a.type === 'delete_conflict')).toBe(true);

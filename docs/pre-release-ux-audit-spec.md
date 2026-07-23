@@ -86,8 +86,7 @@ to the finding it resolves.
    unlock-failure copy now names the next step.
 
 **Still open (P2):** an optional friendlier marker *header line* (§2); a binary-conflict
-*thumbnail* preview (the binary card now shows size + device + time inline, no raw UUID); the
-delete-strategy setting-value rename.
+*thumbnail* preview (the binary card now shows size + device + time inline, no raw UUID).
 
 **2026-07-23 — P2 polish pass** (de-emoji sweep + Device ID moved):
 
@@ -101,6 +100,11 @@ delete-strategy setting-value rename.
 2. **Device ID → Diagnostics (§4).** The read-only raw-UUID Device ID row moved out of the
    top-level "This device" block into a collapsed **Diagnostics** `<details>` disclosure, so the
    basics aren't cluttered by a value with no everyday use. Device *name* stays in "This device".
+3. **Delete-strategy value unified (§2, code-hygiene).** The same outcome had two names —
+   the config value `keep_modified` and the applicator action `restore` — bridged by an identity-ish
+   `resolveDeleteStrategy` map. Unified on `keep_modified` everywhere; the now-vacuous map (and its
+   test) were deleted and `main.ts` passes the setting through directly. No user-visible change; no
+   migration needed (pre-release, no persisted configs in the wild).
 
 **2026-07-23 — Unified conflicts, "full inline" (§3) — DECIDED & SHIPPED.** The two conflict
 experiences are unified into **one surface, the Conflicts panel**. Delete/binary conflicts no longer
@@ -236,10 +240,16 @@ Additional copy findings:
 - **P2 — product casing:** "Vault Sync" (product) vs "Vault sync status"
   (`sync-status-modal.ts:37`) vs "Vault sync complete" (`sync-coordinator.ts:137`). Normalize
   to "Vault Sync".
-- **P2 — delete-strategy triple naming:** UI "Always keep the modified version" → setting
-  value `keep_modified` (`types.ts`) → policy result `restore` (`conflict-policy.ts:21`).
-  Internal names are fine; ensure the *UI label* is the only thing users see (it is) — but
-  align the setting value name to reduce contributor confusion (P2, code-hygiene).
+- **P2 — delete-strategy triple naming. ✅ DONE.** Was: UI "Always keep the modified version" →
+  setting value `keep_modified` (`types.ts`) → policy result `restore` (`conflict-policy.ts`). The
+  divergence came from two vocabularies meeting at a translation seam: the **config** enum
+  (`keep_modified`/`keep_deleted`, named for the user's standing choice) and the **applicator
+  action** enum (`restore`/`keep_deleted`, named for what the applicator does — re-write/undelete
+  the file). `keep_deleted` read the same from both ends so it never drifted; only `keep_modified`↔
+  `restore` did, and the `restore` word had leaked out of the applicator into the panel button, the
+  persisted decision type, and the coordinator handler. **Fixed:** unified on `keep_modified`
+  everywhere; the seam collapsed to identity so `resolveDeleteStrategy` (`conflict-policy.ts`) and
+  its test were deleted and `main.ts` passes `settings.deleteConflictStrategy` straight through.
 - **P2 — "Bearer token" jargon** (`settings-tab.ts:96`). Call it "Access token" (the label
   already does) and drop "Bearer" from the description. **✅ DONE** (dropped in the §1.1 reorg;
   description now "Token authorizing this device for the vault.").
@@ -417,9 +427,9 @@ has **zero `@media` queries** (grep confirms). Findings:
 **P2 — polish**
 - [x] De-emoji sweep: status bar / sync-progress / Test-connection / marker notice glyphs → color +
       word label (§5). *(readiness `✓`/`✗` kept — glyph+color is accessible, not color-only.)*
-- [ ] Casing/naming normalization; device *name* instead of UUID everywhere (§2, §3, §5). *(the raw
-      UUID is gone from the binary card and Device ID is now behind Diagnostics; casing is "Vault
-      Sync" throughout — only the delete-strategy setting-value rename remains.)*
+- [x] Casing/naming normalization; device *name* instead of UUID everywhere (§2, §3, §5). *(raw UUID
+      gone from the binary card + Device ID behind Diagnostics; casing is "Vault Sync" throughout;
+      the delete-strategy `restore`/`keep_modified` split is unified on `keep_modified`.)*
 - [ ] Binary conflict thumbnail; neutral device-name placeholder (§3, §6). *(neutral "My phone /
       laptop" placeholder done in §1.1; the raw UUID is gone from the binary card (now a device
       label); image thumbnail still open.)*

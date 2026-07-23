@@ -184,8 +184,8 @@ describe('SyncCoordinator', () => {
     expect(await h.coordinator.decideDeleteConflict('keep_deleted', action)).toBe('keep_deleted');
 
     // A decision the user recorded in the panel is consumed (even under 'ask').
-    await h.syncState.recordDecision('f3', { kind: 'delete', decision: 'restore' });
-    expect(await h.coordinator.decideDeleteConflict('ask', action)).toBe('restore');
+    await h.syncState.recordDecision('f3', { kind: 'delete', decision: 'keep_modified' });
+    expect(await h.coordinator.decideDeleteConflict('ask', action)).toBe('keep_modified');
   });
 
   test('binary conflict: a recorded decision is consumed; else defer to the panel', async () => {

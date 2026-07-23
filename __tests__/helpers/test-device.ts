@@ -41,7 +41,7 @@ export interface TestDeviceOptions {
 
 /** How a device resolves a delete/modify(-or-rename) conflict. */
 export type DeleteConflictResolver =
-  (action: Extract<MergeAction, { type: 'delete_conflict' }>) => 'keep_deleted' | 'restore' | DeferConflict;
+  (action: Extract<MergeAction, { type: 'delete_conflict' }>) => 'keep_deleted' | 'keep_modified' | DeferConflict;
 
 /** How a device resolves a concurrent binary-file conflict (whole-version pick). */
 export type BinaryConflictResolver =

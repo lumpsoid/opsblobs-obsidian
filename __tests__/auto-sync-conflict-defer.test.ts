@@ -84,7 +84,7 @@ describe('auto-sync defers choice-based conflicts instead of consuming them (S5)
 
     // ── A subsequent MANUAL round DOES present the same conflict and resolves it. ──
     let interactiveCalls = 0;
-    A.resolveDeleteConflict = () => { interactiveCalls++; return 'restore'; };
+    A.resolveDeleteConflict = () => { interactiveCalls++; return 'keep_modified'; };
 
     await client(A).runSync();
     expect(interactiveCalls).toBe(1);              // the deferred conflict came back

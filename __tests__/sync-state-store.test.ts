@@ -77,10 +77,10 @@ describe('SyncStateStore', () => {
     expect(store.getDecision('f2')).toBeUndefined();
 
     // Persisted across a reload.
-    await store.recordDecision('f3', { kind: 'delete', decision: 'restore' });
+    await store.recordDecision('f3', { kind: 'delete', decision: 'keep_modified' });
     const reloaded = new SyncStateStore(meta);
     await reloaded.load();
-    expect(reloaded.getDecision('f3')).toEqual({ kind: 'delete', decision: 'restore' });
+    expect(reloaded.getDecision('f3')).toEqual({ kind: 'delete', decision: 'keep_modified' });
   });
 
   test('setError / clearError round-trip', async () => {

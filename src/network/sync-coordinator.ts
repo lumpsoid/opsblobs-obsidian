@@ -198,9 +198,9 @@ export class SyncCoordinator {
    * to the panel (record a descriptor).
    */
   async decideDeleteConflict(
-    strategy: 'ask' | 'keep_deleted' | 'restore',
+    strategy: 'ask' | 'keep_deleted' | 'keep_modified',
     action: Extract<MergeAction, { type: 'delete_conflict' }>,
-  ): Promise<'keep_deleted' | 'restore' | DeferConflict> {
+  ): Promise<'keep_deleted' | 'keep_modified' | DeferConflict> {
     const rec = this.syncState.getDecision(action.fileId);
     if (rec?.kind === 'delete') return rec.decision;
     if (strategy !== 'ask') return strategy;

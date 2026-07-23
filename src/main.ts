@@ -9,7 +9,6 @@ import { FileRegistry } from './core/file-registry';
 import { ContentStore } from './core/content-store';
 import { randomUuid } from './core/encoding';
 import { OperationLogger } from './core/operation-logger';
-import { resolveDeleteStrategy } from './core/conflict-policy';
 import { SyncApplicator } from './network/sync-applicator';
 import { ObsidianVaultFiles } from './network/obsidian-vault-files';
 import { ObsidianMetadataStore } from './network/obsidian-metadata-store';
@@ -139,7 +138,7 @@ export default class VaultSyncPlugin extends Plugin {
       // is wired here anymore — the panel is the resolution surface.
       (action) =>
         this.coordinator.decideDeleteConflict(
-          resolveDeleteStrategy(this.settings.deleteConflictStrategy),
+          this.settings.deleteConflictStrategy,
           action,
         ),
       (action) => this.coordinator.decideBinaryConflict(action),

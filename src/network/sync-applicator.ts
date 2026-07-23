@@ -23,7 +23,7 @@ import { HybridLogicalClock } from '../core/hlc';
 export const DEFER_CONFLICT = Symbol('defer-conflict');
 export type DeferConflict = typeof DEFER_CONFLICT;
 
-export type DeleteConflictHandler = (action: Extract<MergeAction, { type: 'delete_conflict' }>) => Promise<'keep_deleted' | 'restore' | DeferConflict>;
+export type DeleteConflictHandler = (action: Extract<MergeAction, { type: 'delete_conflict' }>) => Promise<'keep_deleted' | 'keep_modified' | DeferConflict>;
 export type BinaryConflictHandler = (action: Extract<MergeAction, { type: 'binary_conflict' }>) => Promise<'keep_local' | 'keep_remote' | DeferConflict>;
 
 /** A clean merge or user-resolved conflict that must be re-emitted as an op so it
@@ -279,14 +279,14 @@ export class SyncApplicator {
         // tag it a conflict so the plugin surfaces it (reason 'conflict') as needing a
         // manual sync — the derived replacement for the old outstanding badge (Step 7).
         if (decision === DEFER_CONFLICT) { deferred.add(action.fileId); deferredConflicts.add(action.fileId); return null; }
-        // A real decision (restore or keep_deleted) settles the conflict below.
+        // A real decision (keep_modified or keep_deleted) settles the conflict below.
         // Timestamp the decision *now* so it dominates the delete/edit it reconciles
         // (runSync already advanced the clock past the merged HLC). It is re-emitted
         // as a two-parent merge node so a peer holding either side fast-forwards
         // onto the decision instead of independently re-prompting.
         const hlcTs = this.hlc.now();
         const hash = await hashContent(action.content);
-        if (decision === 'restore') {
+        if (decision === 'keep_modified') {
           // state-merge already declined (no_op) to raise a delete_conflict whose
           // surviving bytes are missing (F1), so `action.content` is real — an
           // empty payload is a genuinely-empty file to restore, not a truncation.

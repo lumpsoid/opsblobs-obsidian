@@ -63,7 +63,7 @@ export interface ConflictDescriptor {
  *  panel and consumed by the next sync round's applicator (which mints the merge
  *  node). Keyed by fileId in {@link SyncState.pendingDecisions}. */
 export type ConflictDecision =
-  | { kind: 'delete'; decision: 'keep_deleted' | 'restore' }
+  | { kind: 'delete'; decision: 'keep_deleted' | 'keep_modified' }
   | { kind: 'binary'; decision: 'keep_local' | 'keep_remote' };
 
 /** An op whose content blob couldn't be fetched this round (F3). Its file is

@@ -156,7 +156,7 @@ export class ConflictsView extends ItemView {
         'modified version?',
       );
       new ButtonComponent(actions).setButtonText('Keep modified version').setCta()
-        .onClick(() => resolve({ kind: 'delete', decision: 'restore' }));
+        .onClick(() => resolve({ kind: 'delete', decision: 'keep_modified' }));
       new ButtonComponent(actions).setButtonText('Keep deleted')
         .onClick(() => resolve({ kind: 'delete', decision: 'keep_deleted' }));
     } else {
