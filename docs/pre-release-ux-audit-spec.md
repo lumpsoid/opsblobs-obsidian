@@ -248,12 +248,13 @@ The typed error family (`sync-errors.ts`) is **good** — messages name the knob
 `manifest.json` `isDesktopOnly: false`, but there is **no mobile adaptation** — `styles.css`
 has **zero `@media` queries** (grep confirms). Findings:
 
-- **P0 — 3-column diff in a phone sidebar.** `styles.css:65`
-  `.vault-sync-hunk-panes { grid-template-columns: 1fr 1fr 1fr; }` forces Mine/Common/Theirs
-  side-by-side at `font-size: 0.78rem` (`:73`) inside the right sidebar (a slide-over drawer on
-  mobile, `main.ts:611` `getRightLeaf`). Real diffs are effectively unreadable on a phone.
-  **Fix:** stack panes vertically below a width breakpoint; single-column, full-width hunks on
-  mobile.
+- **P0 — 3-column diff on a narrow screen. ✅ RESOLVED.** `.vault-sync-hunk-panes` forced
+  Mine/Common/Theirs side-by-side at `font-size: 0.78rem`, unreadable on a phone. **Fixed:** a
+  `@media (max-width: 700px)` block in `styles.css` stacks the panes to a single full-width
+  column (bottom dividers instead of right ones, height cap lifted, slightly larger type).
+  Additionally the conflicts view moved from the right sidebar to a **main-area tab**
+  (`activateConflictsView` now uses `workspace.getLeaf('tab')`), so it is no longer a cramped
+  slide-over drawer on mobile at all.
 - **P1 — touch targets below ~44px.** Per-hunk "Mine/Theirs/Both" + global "All …" + footer
   buttons at default sizing with `gap: 0.4rem` (`:75`). **Fix:** larger tap targets and
   spacing under the mobile breakpoint.
@@ -270,27 +271,35 @@ has **zero `@media` queries** (grep confirms). Findings:
 
 ## 7. Prioritized remediation checklist
 
-**P0 — release-blocking**
-- [ ] Onboarding: group the 4 required fields + readiness checklist; separate Advanced (§1.1).
-- [ ] Fix "configure first" toasts to name the actual missing field(s) + open settings (§1.2).
-- [ ] First-class "Add another device" explanation (Vault ID + passphrase + token) (§1.3).
-- [ ] Conflicts discoverable after a round (persistent actionable entry point) (§3).
-- [ ] Setup-class errors shown durably, not just a fading toast (§5).
-- [ ] Mobile: stack conflict panes vertically below a breakpoint (§6).
+**P0 — release-blocking** — ✅ all clear
+
+- [x] Onboarding: group the 4 required fields + readiness checklist; separate Advanced (§1.1).
+- [x] Fix "configure first" toasts to name the actual missing field(s) + open settings (§1.2).
+- [x] First-class "Add another device" explanation (Vault ID + passphrase + token) (§1.3).
+- [x] Conflicts discoverable after a round (persistent actionable entry point) (§3).
+- [x] Setup-class errors shown durably, not just a fading toast (§5).
+- [x] Mobile: stack conflict panes vertically below a breakpoint (§6).
 - [x] Delete `conflict-modal.ts` (or reconcile) (§0).
 
 **P1 — strongly recommended**
 - [ ] One vocabulary per concept across panel + inline markers + settings (§2).
 - [ ] Unify the conflict mental model; dismiss = defer, never a silent pick (§3).
 - [ ] "Common version" pane label + gloss; resolved-result preview (§3).
-- [ ] Settings IA: Advanced disclosure + a Danger zone for re-baseline (§4).
+- [x] Settings IA: Advanced disclosure + a Danger zone for re-baseline (§4). *(landed with §1.1: an
+      "Advanced" and a "Maintenance & danger zone" `<details>` disclosure. The distinct
+      danger-styling + double-confirm escalation for re-baseline is still open.)*
 - [ ] Plain-language `{operation}` phrases; ribbon error-click → details (§5).
-- [ ] Mobile touch targets + command-palette route guaranteed (§6).
+- [ ] Mobile touch targets + command-palette route guaranteed (§6). *(command-palette route
+      confirmed; touch targets still open.)*
 
 **P2 — polish**
 - [ ] Casing/naming normalization; device *name* instead of UUID everywhere (§2, §3, §5).
-- [ ] Binary conflict thumbnail; neutral device-name placeholder (§3, §6).
+- [ ] Binary conflict thumbnail; neutral device-name placeholder (§3, §6). *(neutral "My phone /
+      laptop" placeholder done in §1.1; thumbnail still open.)*
 - [ ] Clear-cache confirm consistency; move Device ID to diagnostics (§4).
+
+> **P0 status (2026-07-23):** all seven P0 items landed. Remaining work is P1/P2 plus the
+> manual-smoke matrix (§8) on desktop + a real mobile device.
 
 ---
 

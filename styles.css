@@ -76,3 +76,15 @@ a.vault-sync-notice-link { display: inline-block; margin-top: 0.4rem; text-decor
 .vault-sync-pane-code code { white-space: inherit; overflow-wrap: anywhere; word-break: break-word; }
 .vault-sync-hunk-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; padding: 0.4rem 0.75rem; }
 .vault-sync-conflict-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; padding: 0.6rem 0.75rem; background: var(--background-secondary); border-top: 1px solid var(--background-modifier-border); }
+
+/* Mobile / narrow width — the 3-way compare (UX audit §6). Three columns in a
+   phone-width view are unreadable, so stack the Mine/Common/Theirs panes vertically:
+   each becomes full-width with a bottom divider instead of a right one, and the code
+   blocks lose their height cap so a short hunk isn't boxed into a scroll area. */
+@media (max-width: 700px) {
+  .vault-sync-hunk-panes { grid-template-columns: 1fr; }
+  .vault-sync-pane { border-right: none; }
+  .vault-sync-pane:not(:last-child) { border-bottom: 1px solid var(--background-modifier-border); }
+  .vault-sync-pane-code { font-size: 0.85rem; max-height: none; }
+  .vault-sync-pane-label { font-size: 0.8rem; }
+}
