@@ -76,6 +76,9 @@ a.vault-sync-notice-link { display: inline-block; margin-top: 0.4rem; text-decor
 .vault-sync-status-list li { overflow-wrap: anywhere; word-break: break-word; }
 /* "Needs your attention" rows — flagged by color, not an emoji (UX audit §5, no-emoji UI) */
 .vault-sync-status-attention { color: var(--text-warning); font-weight: 600; }
+/* First-enable "Building sync index" progress bar */
+.vault-sync-indexing-bar { height: 8px; margin: 0.25rem 0 0.35rem; border-radius: 4px; background: var(--background-modifier-border); overflow: hidden; }
+.vault-sync-indexing-fill { height: 100%; background: var(--interactive-accent); border-radius: 4px; transition: width 0.3s ease; }
 
 /* Conflicts panel (conflicts-view.ts — sync v2 Step 6) */
 .vault-sync-conflicts-view { padding: 0.75rem; overflow-y: auto; }

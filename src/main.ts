@@ -62,6 +62,10 @@ export default class VaultSyncPlugin extends Plugin {
   private statusBarText = '';
   private syncInProgress = false;
   private autoSyncHandle: number | null = null;
+  /** Live progress of the first-enable capture (building the local DAG), or null when
+   *  it isn't running. Surfaced in the status modal so a minutes-long first pass shows
+   *  how far along it is. Only set for a *large* capture (see CAPTURE_PROGRESS_UI_MIN). */
+  private indexingProgress: { scanned: number; total: number } | null = null;
 
   /** Subscribers (the conflicts panel) to notify when the two-headed set may have
    *  changed — an op recorded/cleared, or a sync round finished. `opLogger.onChange`
@@ -451,11 +455,16 @@ export default class VaultSyncPlugin extends Plugin {
         // The status bar is the always-visible surface; reflect indexing progress
         // there so the vault doesn't look frozen during a minutes-long capture.
         this.setStatusBarText(`Indexing ${scanned}/${total}…`, 'syncing');
+        // The status modal is the inspectable surface — expose the same progress so a
+        // user who opens it mid-capture sees how far along the first sync's DAG build is.
+        this.indexingProgress = { scanned, total };
       }
       // Diagnostics (Layer 3): per-phase heap + timing only when perfLog is on.
       sink?.(`captureOfflineChanges ${scanned}/${total}${heapNote()}`, performance.now() - t0);
     });
     sink?.(`captureOfflineChanges total${heapNote()}`, performance.now() - t0);
+    // Capture done — the modal's indexing section clears itself once this reads null.
+    this.indexingProgress = null;
     if (announced) {
       new Notice('Vault Sync: vault prepared.', 4000);
       this.updateStatusBar();
@@ -795,6 +804,7 @@ export default class VaultSyncPlugin extends Plugin {
       deviceName: this.settings.deviceName,
       pendingPaths: this.opLogger.getPendingOps().map(op => op.path),
       state: this.syncState.get(),
+      getIndexingProgress: () => this.indexingProgress,
       onOpenConflicts: () => { void this.activateConflictsView(); },
     }).open();
   }

@@ -12,6 +12,14 @@
 import { App, Modal, Setting } from 'obsidian';
 import { SyncState } from '../network/sync-state-store';
 
+/** Progress of the first-enable capture — the initial pass that scans the local vault
+ *  into the registry/op log so there's a DAG to sync from. On a large vault this runs
+ *  for minutes, so the modal surfaces how far along it is instead of looking idle. */
+export interface IndexingProgress {
+  scanned: number;
+  total: number;
+}
+
 /** The read-only snapshot the modal renders, plus the one action it can trigger. */
 export interface SyncStatusSnapshot {
   serverUrl: string;
@@ -21,12 +29,20 @@ export interface SyncStatusSnapshot {
   deviceName: string;
   pendingPaths: string[];
   state: SyncState;
+  /** Live progress of the first-enable capture, or null when it isn't running. Read on
+   *  each refresh tick (not captured once) so the bar advances while the modal is open. */
+  getIndexingProgress: () => IndexingProgress | null;
   /** Open the Conflicts panel — where delete/binary conflicts are resolved (§3).
    *  Closes the modal first. */
   onOpenConflicts: () => void;
 }
 
 export class SyncStatusModal extends Modal {
+  /** Container for the indexing section, re-rendered on a timer while the first-enable
+   *  capture runs so its progress bar advances live. */
+  private indexingEl: HTMLElement | null = null;
+  private indexingTimer: number | null = null;
+
   constructor(app: App, private snap: SyncStatusSnapshot) {
     super(app);
   }
@@ -35,6 +51,15 @@ export class SyncStatusModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.createEl('h2', { text: 'Vault Sync status' });
+
+    // ── Building sync index (first-enable capture) ────────────────────────────
+    // Rendered at the top: while it's running nothing else can sync yet, so it's the
+    // most relevant thing. Self-updates on a timer and removes itself when done.
+    this.indexingEl = contentEl.createDiv();
+    this.renderIndexing();
+    if (this.snap.getIndexingProgress()) {
+      this.indexingTimer = window.setInterval(() => this.renderIndexing(), 2000);
+    }
 
     const s = this.snap.state;
 
@@ -135,7 +160,42 @@ export class SyncStatusModal extends Modal {
   }
 
   onClose() {
+    if (this.indexingTimer !== null) {
+      window.clearInterval(this.indexingTimer);
+      this.indexingTimer = null;
+    }
     this.contentEl.empty();
+  }
+
+  /** (Re)render the indexing section from live progress. Empties when the capture isn't
+   *  running — so the section shows during the first sync and vanishes once it finishes,
+   *  at which point the timer is stopped. */
+  private renderIndexing(): void {
+    const el = this.indexingEl;
+    if (!el) return;
+    const p = this.snap.getIndexingProgress();
+    el.empty();
+    if (!p) {
+      // Capture finished (or never large enough to report) — nothing more to poll for.
+      if (this.indexingTimer !== null) {
+        window.clearInterval(this.indexingTimer);
+        this.indexingTimer = null;
+      }
+      return;
+    }
+    const pct = p.total > 0 ? Math.min(100, Math.round((p.scanned / p.total) * 100)) : 0;
+    el.createEl('h3', { text: 'Building sync index' });
+    el.createEl('p', {
+      text: 'Scanning your vault to prepare it for its first sync. This runs once and ' +
+        'syncing starts as soon as it finishes.',
+      cls: 'setting-item-description',
+    });
+    const bar = el.createDiv({ cls: 'vault-sync-indexing-bar' });
+    bar.createDiv({ cls: 'vault-sync-indexing-fill' }).style.width = `${pct}%`;
+    el.createEl('div', {
+      text: `${p.scanned} of ${p.total} files (${pct}%)`,
+      cls: 'setting-item-description',
+    });
   }
 
   private pathList(paths: string[]): void {
