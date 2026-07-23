@@ -33,6 +33,10 @@ import { ConflictsView, CONFLICTS_VIEW_TYPE, ConflictsViewHost } from './ui/conf
 import { listTwoHeadedConflicts, ConflictListItem } from './core/conflict-inventory';
 
 // ─── Ribbon icon SVG ────────────────────────────────────────────────────────
+/** Above this file count, a first-enable capture surfaces indexing progress in the
+ *  status bar (and a notice) so a minutes-long pass doesn't look like a freeze. */
+const CAPTURE_PROGRESS_UI_MIN = 500;
+
 const SYNC_ICON_ID = 'vault-sync-icon';
 const SYNC_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"/></svg>`;
 
@@ -434,11 +438,28 @@ export default class VaultSyncPlugin extends Plugin {
    *  no progress callback when the diagnostic is off. */
   private async captureOfflineWithPerf(): Promise<void> {
     const sink = this.perfSink('startup');
-    if (!sink) { await this.opLogger.captureOfflineChanges(); return; }
     const t0 = performance.now();
-    await this.opLogger.captureOfflineChanges((scanned, total) =>
-      sink(`captureOfflineChanges ${scanned}/${total}${heapNote()}`, performance.now() - t0));
-    sink(`captureOfflineChanges total${heapNote()}`, performance.now() - t0);
+    // Only surface a progress UI for a *large* first-enable — a routine capture (a
+    // handful of changed files) fires the callback at most once and should stay quiet.
+    let announced = false;
+    await this.opLogger.captureOfflineChanges((scanned, total) => {
+      if (total > CAPTURE_PROGRESS_UI_MIN) {
+        if (!announced) {
+          announced = true;
+          new Notice(`Vault Sync: preparing ${total} files for first sync — this can take a moment.`, 8000);
+        }
+        // The status bar is the always-visible surface; reflect indexing progress
+        // there so the vault doesn't look frozen during a minutes-long capture.
+        this.setStatusBarText(`Indexing ${scanned}/${total}…`, 'syncing');
+      }
+      // Diagnostics (Layer 3): per-phase heap + timing only when perfLog is on.
+      sink?.(`captureOfflineChanges ${scanned}/${total}${heapNote()}`, performance.now() - t0);
+    });
+    sink?.(`captureOfflineChanges total${heapNote()}`, performance.now() - t0);
+    if (announced) {
+      new Notice('Vault Sync: vault prepared.', 4000);
+      this.updateStatusBar();
+    }
   }
 
   /** Build and run one sync round, returning its summary. The coordinator drives
