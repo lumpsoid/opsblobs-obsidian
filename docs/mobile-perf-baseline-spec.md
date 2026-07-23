@@ -242,6 +242,19 @@ wide-concurrency profile: drive C independent heads of one file into a single ro
 the fold loop re-runs `buildLocalState()` + `recordVersionEdges()` per fold
 (`server-sync.ts:554-557`) — superlinear in C. Measure at C = 3, 5, 10.
 
+> **Status / next (2026-07-23).** The B2 investigation already removed the *spin* half of this
+> cost (a non-collapsing conflict fold re-ran `buildLocalState` `~pulled` times — fixed, 62× on
+> B2; see the B2 measured-note + Appendix A #5). What remains for B7 is the **per-*genuine*-fold**
+> rebuild: even folding C real concurrent leaves, the loop calls `buildLocalState()` (full vault
+> re-read + re-hash + base-staging) **and** `recordVersionEdges()` **once per fold**, so a
+> C-head file costs O(C·(F·B + G)). **Next optimization:** fold against reusable in-memory state
+> — thread the loaded `VaultState`/DAG through the loop and mutate it per fold (or rebuild only
+> the single file that changed), instead of a full `buildLocalState` each iteration. This is the
+> remaining open item on hot-path #5; measure with B7 (C = 3/5/10) before and after. Ties into
+> hot-path #6 (the DAG snapshot is reloaded 3–4× per round + once per fold — cache it per round).
+> Gate on device data (§9): B7's wide-concurrency workload is rarer than the capture/steady-state
+> paths, so land it only if the on-device pass shows folds materially on the hot path.
+
 **B8 — diff3 large-file merge vs B and line-uniqueness.**
 big-file and low-unique-line profiles, both-modified so `threeWayMerge` runs. *Hypothesis:*
 normal files are ~O(L); a repetitive/low-unique file falls into `myersLCS`'s **O(L_a·L_b)**
