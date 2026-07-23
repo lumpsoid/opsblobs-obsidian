@@ -281,6 +281,71 @@ as a *hypothesis* for the on-device pass to confirm.
 
 ---
 
+## Native-ARM (Termux) full sweep — on-device CPU/heap
+
+The Layer-3 section above is a *partial* WebView run (first-enable capture only). This
+is the complement: the **whole B1–B9 sweep**, run on the phone's real ARM cores via
+**Termux native Node** — so it captures the genuine mobile CPU and heap for every
+scenario at once, unattended, in ~3 minutes. It is the fastest way we have to get a
+real-silicon number for the *algorithms*.
+
+| | |
+|---|---|
+| Commit | current branch HEAD (post-`b5d1204` — B7 shows the bg-vault variant) |
+| Machine-readable | `bench/results/2026-07-23_termux-arm_xs-s-m.json` |
+| Host | Android phone, **Termux native Node v26 (ARM64)** — *not* the Obsidian WebView |
+| fs | in-memory fakes (Maps) — **not** the Capacitor filesystem |
+| Runtime | 189 s, profiles XS/S/M, K-sweep `[20,50]` (no `BENCH_FULL`) |
+
+**What this is and isn't (read before trusting a number):** native Node V8 on the phone
+is *close to but not* the Obsidian WebView (Android's WebView is also V8 but runs under
+app memory caps + lifecycle throttling; iOS is JavaScriptCore, untestable via Termux).
+And fs is the in-memory fakes, so **Capacitor filesystem latency is not measured here** —
+that is still the WebView Layer-3 pass's job. So treat every wall-time below as a **floor
+for the WebView, CPU-only**: the real in-app figure is this, plus the WebView tax, plus
+real fs. Its value is the *ratio* it pins (below) and the two CPU cliffs it exposes.
+
+**The ~3× hardware penalty is confirmed on real silicon.** Across the paths whose code is
+unchanged between the laptop `post-capture-fix` baseline and this run — B1, B3, B4, B9 —
+the phone lands at a consistent **2.4–3.7×** the laptop wall-time. §4 hypothesised
+"~3–5× slower single-thread" for mobile; the native-ARM half of that is now measured, not
+assumed. (Ignore B2/B2b for this ratio: the laptop baseline above predates the
+reconcile-spin fix, so its B2 rows time the old 62×-slower spin — on this HEAD the phone
+does B2 K=50 in **711 ms**, not a regression.)
+
+### Phone absolute wall-times vs the §6 budgets (native ARM, CPU-only floor)
+| Operation | Phone | §6 budget | verdict |
+|---|--:|---|---|
+| B1 routine sync, S (500) | 121 ms | < 400 ms | **passes** |
+| B1 routine sync, M (2000) | 484 ms | < 1 s | **passes** (WebView + real fs could push M to the line) |
+| B3 first-enable, S | 125 ms | < 1 s | **passes** |
+| B3 first-enable, M | 914 ms | < 4 s | **passes** — the capture-batching fix holds on device (B5 M: 27 MB, writesPerFile 1.0, matching the laptop post-fix) |
+| B4 cold pull, H≈1020 | 173 ms | < 5 s | **passes** |
+
+### The two CPU cliffs the sweep exposes
+1. **diff3 low-unique O(L²) is a multi-second UI freeze (B8, A8).** On the phone a
+   repetitive/low-unique file merges at **4,000 lines → 2.38 s**, **8,000 lines →
+   6.72 s** (5–7.6× the laptop). A normal unique-line 1 MB file is fine (**226 ms**). This
+   is the most concrete "would actually hurt a user" result: a single generated/tabular
+   file merge stalls the mobile UI for seconds.
+2. **The unbounded `memCache` grows on-device too (B6, A3).** Post-GC retained heap over
+   50 rounds: XS **+0.5 MB**, S **+2.3 MB**, M **+8.3 MB** (RSS flat/negative → it's live
+   heap, the never-cleared steady-state cache). Slow at these sizes, but monotonic — the
+   one hard qualitative bar, confirmed broken on the real device.
+
+### B7 (bg-vault) on-device
+The per-fold `buildLocalState` rebuild, now measured with a 200-file background vault:
+C=3 → **862 ms**, C=5 → **949 ms**, C=10 → **1,366 ms**. Real on mobile, but
+wide-concurrency stays rare — the §9 gate on shipping the fold optimization holds.
+
+**Bottom line from the phone:** the *routine* paths (B1/B3/B4) pass their budgets even
+with the ~3× ARM penalty — the capture and DAG fixes already landed are doing their job.
+The two remaining CPU hazards are the **diff3 low-unique cliff** (a real, seconds-long
+freeze) and the **steady-state `memCache`** (slow monotonic growth). Neither is fs-bound,
+so both would reproduce in the WebView.
+
+---
+
 ## Still to do (spec §9)
 
 - [x] **First on-device run** — B3 first-enable capture, ~8.4k-file Android vault
@@ -289,6 +354,9 @@ as a *hypothesis* for the on-device pass to confirm.
       (O(F²) registry re-serialization), turned into a GC cliff on-device.
 - [x] **Fix the O(F²) capture** — registry batching + memCache clearing (74× fewer
       bytes at M); crash-safety checkpointing.
+- [x] **Native-ARM (Termux) full sweep** — B1–B9 at XS/S/M on the phone's real cores
+      (recorded above; ~3× CPU penalty confirmed, routine budgets pass, diff3 low-unique
+      + steady-state memCache flagged as the CPU hazards).
 - [ ] **Re-confirm on device** — with the fix + `heapMB` line, verify the cliff is gone
       (or moved far out) on the 8.4k-file vault; pin the GC ceiling.
 - [ ] **Full Layer-3 matrix** — B1/B3/B4 at profiles S and M on a mid-range and a

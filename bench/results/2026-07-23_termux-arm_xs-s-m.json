@@ -1,0 +1,456 @@
+{
+  "date": "2026-07-23",
+  "stamp": "2026-07-23_xs-s-m",
+  "generatedElapsedSec": 189.2,
+  "node": "v26.4.0",
+  "profiles": [
+    {
+      "name": "XS",
+      "F": 50,
+      "B": 2048
+    },
+    {
+      "name": "S",
+      "F": 500,
+      "B": 4096
+    },
+    {
+      "name": "M",
+      "F": 2000,
+      "B": 6144
+    }
+  ],
+  "rows": [
+    {
+      "scenario": "B1",
+      "variant": "XS F=50",
+      "counts": {
+        "fileReads": 50,
+        "sha256": 51,
+        "metaWrites": 5,
+        "bytesWritten": 113
+      },
+      "timing": {
+        "roundMs": 17.485881000000063,
+        "heapMB": 1.021424
+      },
+      "note": "hashes/read ≈ F? (F=50)"
+    },
+    {
+      "scenario": "B1",
+      "variant": "S F=500",
+      "counts": {
+        "fileReads": 500,
+        "sha256": 501,
+        "metaWrites": 5,
+        "bytesWritten": 114
+      },
+      "timing": {
+        "roundMs": 120.65755199999967,
+        "heapMB": 8.619768
+      },
+      "note": "hashes/read ≈ F? (F=500)"
+    },
+    {
+      "scenario": "B1",
+      "variant": "M F=2000",
+      "counts": {
+        "fileReads": 2000,
+        "sha256": 2001,
+        "metaWrites": 5,
+        "bytesWritten": 115
+      },
+      "timing": {
+        "roundMs": 483.9099120000028,
+        "heapMB": 8.383016
+      },
+      "note": "hashes/read ≈ F? (F=2000)"
+    },
+    {
+      "scenario": "B2",
+      "variant": "deep-history K=20 H≈400",
+      "counts": {
+        "dagMergeBase": 40,
+        "dagIsAncestor": 270,
+        "dagReachable": 440,
+        "sha256": 521
+      },
+      "timing": {
+        "mergeRoundMs": 411.61792000000423,
+        "heapMB": 10.173096
+      },
+      "note": "mergeBase super-linear in lineage depth?"
+    },
+    {
+      "scenario": "B2",
+      "variant": "deep-history K=50 H≈1000",
+      "counts": {
+        "dagMergeBase": 40,
+        "dagIsAncestor": 270,
+        "dagReachable": 440,
+        "sha256": 521
+      },
+      "timing": {
+        "mergeRoundMs": 711.0524499999956,
+        "heapMB": 21.765832
+      },
+      "note": "mergeBase super-linear in lineage depth?"
+    },
+    {
+      "scenario": "B2b",
+      "variant": "deep-shared-backbone K=20 H≈400",
+      "counts": {
+        "dagMergeBase": 40,
+        "dagIsAncestor": 270,
+        "isAncPerBase": 6.75,
+        "dagReachable": 440,
+        "fileReads": 460
+      },
+      "timing": {
+        "mergeRoundMs": 379.29874700000073,
+        "heapMB": 19.966968
+      },
+      "note": "common ≈ K → mergeBase O(common²) filter bites: isAncPerBase climbs ~2K, mergeBase/reads flat"
+    },
+    {
+      "scenario": "B2b",
+      "variant": "deep-shared-backbone K=50 H≈1000",
+      "counts": {
+        "dagMergeBase": 40,
+        "dagIsAncestor": 270,
+        "isAncPerBase": 6.75,
+        "dagReachable": 440,
+        "fileReads": 460
+      },
+      "timing": {
+        "mergeRoundMs": 721.1967369999984,
+        "heapMB": 13.19668
+      },
+      "note": "common ≈ K → mergeBase O(common²) filter bites: isAncPerBase climbs ~2K, mergeBase/reads flat"
+    },
+    {
+      "scenario": "B3",
+      "variant": "XS F=50",
+      "counts": {
+        "sha256": 50,
+        "fileReads": 50,
+        "metaWrites": 53,
+        "registryBytes": 183465,
+        "fsSyscalls": 159
+      },
+      "timing": {
+        "captureMs": 16.307536000000255,
+        "heapMB": 4.176952
+      },
+      "note": "O(F·B) hash + up to O(F²) registry bytes"
+    },
+    {
+      "scenario": "B3",
+      "variant": "S F=500",
+      "counts": {
+        "sha256": 500,
+        "fileReads": 500,
+        "metaWrites": 509,
+        "registryBytes": 3728697,
+        "fsSyscalls": 1527
+      },
+      "timing": {
+        "captureMs": 124.92000299999927,
+        "heapMB": 25.534848
+      },
+      "note": "O(F·B) hash + up to O(F²) registry bytes"
+    },
+    {
+      "scenario": "B3",
+      "variant": "M F=2000",
+      "counts": {
+        "sha256": 2000,
+        "fileReads": 2000,
+        "metaWrites": 2032,
+        "registryBytes": 27042484,
+        "fsSyscalls": 6096
+      },
+      "timing": {
+        "captureMs": 913.6195880000014,
+        "heapMB": 49.139296
+      },
+      "note": "O(F·B) hash + up to O(F²) registry bytes"
+    },
+    {
+      "scenario": "B4",
+      "variant": "join H≈420 (ops=420)",
+      "counts": {
+        "aesDecrypt": 441,
+        "sha256": 61,
+        "metaWrites": 43,
+        "metaAppends": 1
+      },
+      "timing": {
+        "coldPullMs": 76.80363000000216,
+        "heapMB": 10.607024
+      },
+      "note": "O(H) decrypts + O(H) in-memory ops on first join"
+    },
+    {
+      "scenario": "B4",
+      "variant": "join H≈1020 (ops=1020)",
+      "counts": {
+        "aesDecrypt": 1041,
+        "sha256": 61,
+        "metaWrites": 44,
+        "metaAppends": 1
+      },
+      "timing": {
+        "coldPullMs": 173.23242200000095,
+        "heapMB": 23.532168
+      },
+      "note": "O(H) decrypts + O(H) in-memory ops on first join"
+    },
+    {
+      "scenario": "B5",
+      "variant": "XS batch-capture F=50",
+      "counts": {
+        "metaWrites": 53,
+        "metaAppends": 0,
+        "metaRemoves": 0,
+        "fsSyscalls": 159,
+        "bytesWritten": 183465,
+        "bytesAppended": 0,
+        "writesPerFile": 1.1
+      },
+      "timing": {},
+      "note": "registry rewrites O(F) per file → O(F²) per batch; journal is delta-sized"
+    },
+    {
+      "scenario": "B5",
+      "variant": "S batch-capture F=500",
+      "counts": {
+        "metaWrites": 509,
+        "metaAppends": 0,
+        "metaRemoves": 0,
+        "fsSyscalls": 1527,
+        "bytesWritten": 3728697,
+        "bytesAppended": 0,
+        "writesPerFile": 1
+      },
+      "timing": {},
+      "note": "registry rewrites O(F) per file → O(F²) per batch; journal is delta-sized"
+    },
+    {
+      "scenario": "B5",
+      "variant": "M batch-capture F=2000",
+      "counts": {
+        "metaWrites": 2032,
+        "metaAppends": 0,
+        "metaRemoves": 0,
+        "fsSyscalls": 6096,
+        "bytesWritten": 27042484,
+        "bytesAppended": 0,
+        "writesPerFile": 1
+      },
+      "timing": {},
+      "note": "registry rewrites O(F) per file → O(F²) per batch; journal is delta-sized"
+    },
+    {
+      "scenario": "B6",
+      "variant": "XS 50 rounds",
+      "counts": {},
+      "timing": {
+        "heapStartMB": 15.820232,
+        "heapEndMB": 16.316768,
+        "heapGrowthMB": 0.496535999999999,
+        "rssGrowthMB": -0.33587199999999484
+      },
+      "note": "ContentStore.memCache never cleared → post-GC heap grows toward total distinct content"
+    },
+    {
+      "scenario": "B6",
+      "variant": "S 50 rounds",
+      "counts": {},
+      "timing": {
+        "heapStartMB": 19.724176,
+        "heapEndMB": 22.056008,
+        "heapGrowthMB": 2.3318319999999986,
+        "rssGrowthMB": -0.04096000000001254
+      },
+      "note": "ContentStore.memCache never cleared → post-GC heap grows toward total distinct content"
+    },
+    {
+      "scenario": "B6",
+      "variant": "M 50 rounds",
+      "counts": {},
+      "timing": {
+        "heapStartMB": 37.469,
+        "heapEndMB": 45.78252,
+        "heapGrowthMB": 8.313519999999997,
+        "rssGrowthMB": -26.009599999999978
+      },
+      "note": "ContentStore.memCache never cleared → post-GC heap grows toward total distinct content"
+    },
+    {
+      "scenario": "B7",
+      "variant": "wide-concurrency C=3 (bg F=200)",
+      "counts": {
+        "fileReads": 604,
+        "readsPerFold": 302,
+        "dagLeaves": 279,
+        "dagMergeBase": 3,
+        "sha256": 1010
+      },
+      "timing": {
+        "foldRoundMs": 861.7258300000103,
+        "heapMB": 33.870088
+      },
+      "note": "fold loop re-runs buildLocalState (whole-vault re-read) per fold → fileReads ≈ folds·(F+1), superlinear in C·F"
+    },
+    {
+      "scenario": "B7",
+      "variant": "wide-concurrency C=5 (bg F=200)",
+      "counts": {
+        "fileReads": 1006,
+        "readsPerFold": 251.5,
+        "dagLeaves": 741,
+        "dagMergeBase": 5,
+        "sha256": 1414
+      },
+      "timing": {
+        "foldRoundMs": 949.3045250000141,
+        "heapMB": 30.075832
+      },
+      "note": "fold loop re-runs buildLocalState (whole-vault re-read) per fold → fileReads ≈ folds·(F+1), superlinear in C·F"
+    },
+    {
+      "scenario": "B7",
+      "variant": "wide-concurrency C=10 (bg F=200)",
+      "counts": {
+        "fileReads": 2011,
+        "readsPerFold": 223.4,
+        "dagLeaves": 1191,
+        "dagMergeBase": 10,
+        "sha256": 2424
+      },
+      "timing": {
+        "foldRoundMs": 1365.8190520000062,
+        "heapMB": 20.079856
+      },
+      "note": "fold loop re-runs buildLocalState (whole-vault re-read) per fold → fileReads ≈ folds·(F+1), superlinear in C·F"
+    },
+    {
+      "scenario": "B8",
+      "variant": "big-file 64KB unique",
+      "counts": {
+        "conflicts": 4
+      },
+      "timing": {
+        "mergeMs": 11.63053399999626
+      },
+      "note": "normal file ≈ O(L)"
+    },
+    {
+      "scenario": "B8",
+      "variant": "big-file 256KB unique",
+      "counts": {
+        "conflicts": 14
+      },
+      "timing": {
+        "mergeMs": 61.27754700000514
+      },
+      "note": "normal file ≈ O(L)"
+    },
+    {
+      "scenario": "B8",
+      "variant": "big-file 1024KB unique",
+      "counts": {
+        "conflicts": 53
+      },
+      "timing": {
+        "mergeMs": 225.5580239999981
+      },
+      "note": "normal file ≈ O(L)"
+    },
+    {
+      "scenario": "B8",
+      "variant": "low-unique 1000 lines",
+      "counts": {
+        "conflicts": 0
+      },
+      "timing": {
+        "mergeMs": 58.037435000005644
+      },
+      "note": "Myers O(L_a·L_b) DP cliff"
+    },
+    {
+      "scenario": "B8",
+      "variant": "low-unique 4000 lines",
+      "counts": {
+        "conflicts": 0
+      },
+      "timing": {
+        "mergeMs": 2381.2636730000086
+      },
+      "note": "Myers O(L_a·L_b) DP cliff"
+    },
+    {
+      "scenario": "B8",
+      "variant": "low-unique 8000 lines",
+      "counts": {
+        "conflicts": 0
+      },
+      "timing": {
+        "mergeMs": 6720.660485
+      },
+      "note": "Myers O(L_a·L_b) DP cliff"
+    },
+    {
+      "scenario": "B9",
+      "variant": "PBKDF2 derive (one-time)",
+      "counts": {},
+      "timing": {
+        "deriveMs": 77.64615899999626
+      },
+      "note": "fixed one-time cost"
+    },
+    {
+      "scenario": "B9",
+      "variant": "AES-GCM per op",
+      "counts": {},
+      "timing": {
+        "encryptOpMs": 0.26806599998963065
+      },
+      "note": "per-op seal"
+    },
+    {
+      "scenario": "B9",
+      "variant": "blob 64KB",
+      "counts": {},
+      "timing": {
+        "encryptBlobMs": 0.5552979999920353,
+        "blindHashMs": 0.13448000000789762,
+        "sha256Ms": 0.2623289999901317
+      },
+      "note": "per-blob AES-GCM + SHA-256 over B bytes"
+    },
+    {
+      "scenario": "B9",
+      "variant": "blob 1024KB",
+      "counts": {},
+      "timing": {
+        "encryptBlobMs": 8.855306000012206,
+        "blindHashMs": 0.5575759999919683,
+        "sha256Ms": 3.064657000009902
+      },
+      "note": "per-blob AES-GCM + SHA-256 over B bytes"
+    },
+    {
+      "scenario": "B9",
+      "variant": "blob 5120KB",
+      "counts": {},
+      "timing": {
+        "encryptBlobMs": 20.318196999985958,
+        "blindHashMs": 0.2757980000169482,
+        "sha256Ms": 7.9810790000192355
+      },
+      "note": "per-blob AES-GCM + SHA-256 over B bytes"
+    }
+  ]
+}
