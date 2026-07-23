@@ -105,10 +105,23 @@ async function b1(p: Profile): Promise<void> {
   const dev = await TestDevice.create('b1');
   await seedVault(dev, p.F, p.B);
   await makeClient(server, crypto, dev).runSync();     // converge
+  // Warm the stat cache: `seedVault` drives ONLINE creates, which record a head but
+  // no mtime/size, so the FIRST capture is an O(F) stat-recording pass. A synced
+  // vault is past that — one warm capture records every file's stat, modelling the
+  // steady state the round optimization targets. Outside the profiled region.
+  await dev.opLogger.captureOfflineChanges();
 
-  // A one-file edit, then a full round. The hypothesis: hashes/reads ≈ F, not ≈ 1.
+  // A one-file edit, then the real per-edit sync sequence: the coordinator always
+  // runs `captureOfflineChanges` (the mtime/size drift scan) *before* the round
+  // (sync-coordinator.ts:110-114), so profile that prelude + the round together —
+  // measuring the round alone models a sequence production never runs. Post R1 both
+  // the capture pass and the round's buildLocalState share the mtime/size gate, so
+  // the whole sequence hashes ≈1 (the one edited file), not ≈F.
   await dev.editFile('notes/note-0.md', makeText(p.B, 'f0-edit'), 5_000_000);
-  const r = await profileOp(dev, () => makeClient(server, crypto, dev).runSync().then(() => {}));
+  const r = await profileOp(dev, async () => {
+    await dev.opLogger.captureOfflineChanges();
+    await makeClient(server, crypto, dev).runSync();
+  });
 
   record({
     scenario: 'B1', variant: `${p.name} F=${p.F}`,
@@ -117,7 +130,7 @@ async function b1(p: Profile): Promise<void> {
       metaWrites: r.io.meta.writes, bytesWritten: r.io.meta.bytesWritten,
     },
     timing: { roundMs: r.ms, heapMB: r.heapMB },
-    note: `hashes/read ≈ F? (F=${p.F})`,
+    note: `capture+round hashes ≈ 1, not F (F=${p.F})`,
   });
 }
 
