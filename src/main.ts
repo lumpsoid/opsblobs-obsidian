@@ -431,7 +431,7 @@ export default class VaultSyncPlugin extends Plugin {
     if (!this.crypto.isReady()) {
       await this.tryDeriveVaultKey();
       if (!this.crypto.isReady()) {
-        if (source === 'manual') new Notice('Vault Sync: could not derive the vault key from the passphrase.');
+        if (source === 'manual') new Notice("Vault Sync: couldn't unlock the vault with this passphrase — check it in settings.");
         return;
       }
     }
@@ -700,6 +700,7 @@ export default class VaultSyncPlugin extends Plugin {
       serverUrl: this.settings.serverUrl,
       fingerprint: this.vaultKeyFingerprint(),
       deviceId: this.settings.deviceId,
+      deviceName: this.settings.deviceName,
       pendingPaths: this.opLogger.getPendingOps().map(op => op.path),
       state: this.syncState.get(),
       onResolveConflicts: () => { void this.recheckConflicts(); },

@@ -31,16 +31,17 @@ describe('renderConflictMarkers (zdiff3 inline markers)', () => {
     expect(lines[0]).toBe('1');
     expect(lines[lines.length - 2]).toBe('3'); // trailing '' from the final newline
 
-    // The block carries all three sides in zdiff3 order.
-    expect(marked).toContain(`${CONFLICT_MARK_OURS} ours`);
+    // The block carries all three sides in zdiff3 order, in the user-facing vocabulary
+    // (UX audit §2): Mine / Original / Theirs.
+    expect(marked).toContain(`${CONFLICT_MARK_OURS} Mine`);
     expect(marked).toContain('AAA');
-    expect(marked).toContain(`${CONFLICT_MARK_BASE} base`);
-    expect(marked).toContain('2'); // the base line between the markers
+    expect(marked).toContain(`${CONFLICT_MARK_BASE} Original`);
+    expect(marked).toContain('2'); // the original line between the markers
     expect(marked).toContain(CONFLICT_MARK_SEP);
     expect(marked).toContain('BBB');
-    expect(marked).toContain(`${CONFLICT_MARK_THEIRS} theirs`);
+    expect(marked).toContain(`${CONFLICT_MARK_THEIRS} Theirs`);
 
-    // ours precedes base precedes sep precedes theirs.
+    // Mine precedes Original precedes sep precedes Theirs.
     expect(marked.indexOf('AAA')).toBeLessThan(marked.indexOf(CONFLICT_MARK_BASE));
     expect(marked.indexOf(CONFLICT_MARK_BASE)).toBeLessThan(marked.indexOf(CONFLICT_MARK_SEP));
     expect(marked.indexOf(CONFLICT_MARK_SEP)).toBeLessThan(marked.indexOf('BBB'));

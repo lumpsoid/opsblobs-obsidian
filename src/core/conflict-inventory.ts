@@ -23,7 +23,7 @@ export interface ConflictHead {
 
 /** A file the user still needs to resolve: its identity, current path, and the two
  *  (or more) open heads with provenance. `heads[0]` is the local side at conflict
- *  time (`<<<<<<< ours`), `heads[1]` the remote (`>>>>>>> theirs`) — the order the
+ *  time (`<<<<<<< Mine`), `heads[1]` the remote (`>>>>>>> Theirs`) — the order the
  *  applicator recorded in `conflictParents`. */
 export interface ConflictListItem {
   fileId: string;

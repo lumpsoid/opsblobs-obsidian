@@ -61,14 +61,15 @@ to the finding it resolves.
    self-retry. Both still record to the status modal. `openSettings` is injected into the
    coordinator so it stays obsidian-free.
 
-**Open / deferred decisions:**
-
-- **Vocabulary for the two conflicting sides (§2, P1) — UNDECIDED.** Leaning toward standardizing
-  on **"Mine" / "Theirs"** (panel already uses it; user-preferred for casual users) with the
-  ancestor renamed from "Base" to a plainer term, and the inline note markers possibly relabeled
-  (parsing is by sigil, so relabeling is safe + back-compatible). The delete/modify modal likely
-  stays outcome-based ("Keep modified" / "Keep deleted"), where "Mine/Theirs" is ambiguous. Not
-  yet chosen or implemented.
+**2026-07-23 — P1 vocabulary decision (§2) — DECIDED & SHIPPING.** The two conflicting sides are
+**"Mine" / "Theirs"** everywhere users see them (panel panes, inline note markers, status copy);
+the common ancestor is **"Original"** (panel pane label + the `||||||| Original` inline marker).
+Marker *parsing* is by sigil prefix, so relabeling `ours`/`base`/`theirs` → `Mine`/`Original`/
+`Theirs` is back-compatible — notes written by an older build still parse. The delete/modify and
+binary modals stay **outcome-based** ("Keep modified" / "Keep deleted" / "Keep this device's
+version"), where "Mine/Theirs" is ambiguous. Key-derivation jargon ("derive"/"derived") becomes
+**"unlock"** (verb) / **"ready"/"unlocked"** (state) in user-facing strings; code comments keep the
+precise term. Product-name casing normalized to **"Vault Sync"**.
 
 ---
 

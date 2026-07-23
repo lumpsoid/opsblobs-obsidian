@@ -19,6 +19,8 @@ export interface SyncStatusSnapshot {
   serverUrl: string;
   fingerprint: string | null;
   deviceId: string;
+  /** This device's friendly name (settings) — shown instead of the raw UUID (§5). */
+  deviceName: string;
   pendingPaths: string[];
   state: SyncState;
   /** Re-pull the whole history and recompute merges, bringing back a skipped
@@ -34,7 +36,7 @@ export class SyncStatusModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl('h2', { text: 'Vault sync status' });
+    contentEl.createEl('h2', { text: 'Vault Sync status' });
 
     const s = this.snap.state;
 
@@ -70,7 +72,11 @@ export class SyncStatusModal extends Modal {
         cls: 'setting-item-description',
       });
       for (const c of conflicts) {
-        contentEl.createEl('div', { text: `⚠️ ${c.path} — since ${this.rel(c.at)}`, cls: 'setting-item-description' });
+        // Flagged by color, not an emoji (no-emoji UI decision, §5).
+        contentEl.createEl('div', {
+          text: `${c.path} — since ${this.rel(c.at)}`,
+          cls: 'setting-item-description vault-sync-status-attention',
+        });
       }
       new Setting(contentEl)
         .setName('Resolve deferred conflicts')
@@ -96,12 +102,16 @@ export class SyncStatusModal extends Modal {
 
     // ── Stranded (missing content) ────────────────────────────────────────────
     if (s.stranded.length > 0) {
-      contentEl.createEl('h3', { text: `Waiting on content (${s.stranded.length})` });
+      // The stranded items are content blobs identified only by hash — a raw hex
+      // fragment means nothing to the user (§5), so we report the count and what it
+      // means rather than listing opaque ids.
+      const n = s.stranded.length;
+      contentEl.createEl('h3', { text: `Waiting on content (${n})` });
       contentEl.createEl('p', {
-        text: 'A change was received but its content blob was not available yet. It retries automatically on the next sync.',
+        text: `${n} incoming change${n !== 1 ? 's were' : ' was'} received but the file content ` +
+          "hasn't arrived from the server yet. This retries automatically on the next sync.",
         cls: 'setting-item-description',
       });
-      this.pathList(s.stranded.map(h => h.contentHash.slice(0, 12) + '…'));
     }
 
     // ── Last error ────────────────────────────────────────────────────────────
@@ -117,11 +127,11 @@ export class SyncStatusModal extends Modal {
       cls: 'setting-item-description',
     });
     contentEl.createEl('div', {
-      text: `Vault key: ${this.snap.fingerprint ? `ready (${this.snap.fingerprint})` : 'not derived'}`,
+      text: `Vault key: ${this.snap.fingerprint ? `unlocked (${this.snap.fingerprint})` : 'locked'}`,
       cls: 'setting-item-description',
     });
     contentEl.createEl('div', {
-      text: `Device ID: ${this.snap.deviceId.slice(0, 8)}…`,
+      text: `This device: ${this.snap.deviceName || 'unnamed'}`,
       cls: 'setting-item-description',
     });
   }

@@ -422,18 +422,20 @@ export const CONFLICT_MARK_BASE = '|||||||';
 export const CONFLICT_MARK_SEP = '=======';
 export const CONFLICT_MARK_THEIRS = '>>>>>>>';
 
-/** Emit the marker block for one conflict chunk in zdiff3 form: ours / base /
- *  theirs. The base section (`|||||||`) is what makes it *zdiff3* rather than plain
- *  diff3 — it shows the common ancestor so the user can see what each side changed. */
+/** Emit the marker block for one conflict chunk in zdiff3 form: Mine / Original /
+ *  Theirs. The Original section (`|||||||`) is what makes it *zdiff3* rather than plain
+ *  diff3 — it shows the common starting version so the user can see what each side
+ *  changed. The labels are the user-facing vocabulary (UX audit §2); recognition is by
+ *  the sigil prefix alone, so an older note labelled `ours`/`base`/`theirs` still parses. */
 function renderMarkerBlock(chunk: ConflictChunk): string[] {
   return [
-    `${CONFLICT_MARK_OURS} ours`,
+    `${CONFLICT_MARK_OURS} Mine`,
     ...chunk.local,
-    `${CONFLICT_MARK_BASE} base`,
+    `${CONFLICT_MARK_BASE} Original`,
     ...chunk.ancestor,
     CONFLICT_MARK_SEP,
     ...chunk.remote,
-    `${CONFLICT_MARK_THEIRS} theirs`,
+    `${CONFLICT_MARK_THEIRS} Theirs`,
   ];
 }
 

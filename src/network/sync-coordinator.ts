@@ -140,7 +140,7 @@ export class SyncCoordinator {
       await this.syncState.clearError();
       await this.markSynced();
 
-      if (source === 'manual') this.notifier.info('Vault sync complete');
+      if (source === 'manual') this.notifier.info('Sync complete');
       return { ok: true, summary };
     } catch (err) {
       const error = err as Error;

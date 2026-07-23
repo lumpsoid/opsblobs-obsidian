@@ -90,7 +90,7 @@ describe('SyncCoordinator', () => {
   test('manual sync toasts success; auto sync stays silent', async () => {
     const manual = await harness();
     await manual.coordinator.sync('manual');
-    expect(manual.notifier.info).toHaveBeenCalledWith('Vault sync complete');
+    expect(manual.notifier.info).toHaveBeenCalledWith('Sync complete');
 
     const auto = await harness();
     await auto.coordinator.sync('auto');

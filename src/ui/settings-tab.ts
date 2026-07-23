@@ -112,7 +112,7 @@ export class SyncSettingTab extends PluginSettingTab {
       });
 
     containerEl.createEl('p', {
-      text: 'The passphrase derives the key that encrypts everything before it leaves this device. ' +
+      text: 'Your passphrase unlocks the key that encrypts everything before it leaves this device. ' +
         'The server never sees it. Use the same passphrase on every device — the fingerprint below ' +
         'must match across devices.',
       cls: 'setting-item-description',
@@ -135,13 +135,21 @@ export class SyncSettingTab extends PluginSettingTab {
     const fingerprintSetting = new Setting(containerEl)
       .setName('Key fingerprint')
       .setDesc(this.fingerprintDesc());
+    // Copy affordance (UX audit §1.4): the fingerprint's whole job is to be compared
+    // across devices, so make it one tap to copy instead of hand-transcribing a hex string.
+    fingerprintSetting.addExtraButton(btn => {
+      btn.setIcon('copy').setTooltip('Copy fingerprint').onClick(() => {
+        const fp = this.host.vaultKeyFingerprint();
+        if (fp) void navigator.clipboard?.writeText(fp);
+      });
+    });
     fingerprintSetting.addButton(btn => {
-      btn.setButtonText('Derive & verify').onClick(async () => {
+      btn.setButtonText('Unlock & verify').onClick(async () => {
         try {
           await this.host.applyVaultKey();
           fingerprintSetting.setDesc(this.fingerprintDesc());
         } catch (e) {
-          fingerprintSetting.setDesc(`Could not derive key: ${(e as Error).message}`);
+          fingerprintSetting.setDesc(`Couldn't unlock the vault: ${(e as Error).message}`);
         }
       });
     });
@@ -185,7 +193,7 @@ export class SyncSettingTab extends PluginSettingTab {
         '(each device can use its own token).',
     });
     body.createEl('p', {
-      text: 'Then press “Derive & verify” on both devices and compare the Key fingerprint: it ' +
+      text: 'Then press “Unlock & verify” on both devices and compare the Key fingerprint: it ' +
         'must be identical. If it differs, the passphrases don’t match and sync will refuse to ' +
         'mix the two — fix the passphrase before syncing. Finally press Test connection, then Sync.',
     });
@@ -333,8 +341,9 @@ export class SyncSettingTab extends PluginSettingTab {
       });
 
     new Setting(details)
-      .setName('Ancestor retention')
-      .setDesc('Keep ancestor content for this many days before garbage collection.')
+      .setName('Original-version retention')
+      .setDesc('Keep the original (pre-edit) version of a file for this many days, so three-way ' +
+        'merges stay accurate. Older copies are cleaned up automatically.')
       .addSlider(s => {
         s.setLimits(7, 90, 1)
           .setValue(this.settings.ancestorRetentionDays)
@@ -429,7 +438,8 @@ export class SyncSettingTab extends PluginSettingTab {
   private fingerprintDesc(): string {
     const fp = this.host.vaultKeyFingerprint();
     return fp
-      ? `Key ready — fingerprint ${fp}. This must match on every device.`
-      : 'No key derived yet. Enter a passphrase and vault ID, then derive.';
+      ? `Key ready — fingerprint ${fp}. Compare it across devices: it must be identical. ` +
+        'If it differs, the passphrases don’t match and sync will refuse to mix them.'
+      : 'Not unlocked yet. Enter a passphrase and vault ID, then press Unlock & verify.';
   }
 }
