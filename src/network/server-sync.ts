@@ -152,6 +152,11 @@ export interface ServerSyncOptions {
    *  Must be ≤ the server's env-configured `MaxOpsPerPost`. Test hook; defaults to
    *  {@link DEFAULT_MAX_OPS_PER_APPEND}. */
   maxOpsPerAppend?: number;
+  /** Max blob `PUT`s in flight at once. A fresh vault's first sync uploads one blob
+   *  per note; doing them serially is latency-bound (one round-trip each). A bounded
+   *  pool overlaps the round-trips without swamping a mobile `requestUrl`. Test hook;
+   *  defaults to {@link DEFAULT_BLOB_UPLOAD_CONCURRENCY}. */
+  blobUploadConcurrency?: number;
   onProgress?: (label: string) => void;
   /** Diagnostic per-phase wall-clock sink (perf baseline, Layer 3). When omitted
    *  (the default) `runSync` installs no timer and does no timing work — inert. The
@@ -167,6 +172,13 @@ const DEFAULT_OPS_LIMIT = 500;
  *  (`ErrBatchTooLarge`, spec §9.6). Chunk the append into batches of at most this
  *  many ops. Keep this ≤ the server's env-configured `MaxOpsPerPost`. */
 const DEFAULT_MAX_OPS_PER_APPEND = 1000;
+
+/** Default number of concurrent blob `PUT`s. Each upload is one HTTP round-trip, so a
+ *  fresh vault's baseline (thousands of blobs) is dominated by latency, not bandwidth —
+ *  overlapping a handful of round-trips cuts wall-clock ~linearly in this factor. Kept
+ *  modest (near the classic ~6 connections-per-host ceiling) so a mobile `requestUrl`
+ *  and the per-blob AES-GCM encrypt aren't swamped. */
+const DEFAULT_BLOB_UPLOAD_CONCURRENCY = 8;
 
 /** What a sync round did, surfaced to the plugin so the observable sync-state
  *  (S2) can record it. `deferred`/`stranded` are the fileless raw sets the round
@@ -208,6 +220,7 @@ export class ServerSyncClient {
   private readonly hlc: HybridLogicalClock;
   private readonly opsLimit: number;
   private readonly maxOpsPerAppend: number;
+  private readonly blobUploadConcurrency: number;
   private readonly onProgress?: (label: string) => void;
   private readonly perfLog?: PhaseTimingSink;
 
@@ -218,6 +231,10 @@ export class ServerSyncClient {
     this.hlc = opts.hlc;
     this.opsLimit = opts.opsLimit ?? DEFAULT_OPS_LIMIT;
     this.maxOpsPerAppend = Math.max(1, opts.maxOpsPerAppend ?? DEFAULT_MAX_OPS_PER_APPEND);
+    this.blobUploadConcurrency = Math.max(
+      1,
+      opts.blobUploadConcurrency ?? DEFAULT_BLOB_UPLOAD_CONCURRENCY,
+    );
     this.onProgress = opts.onProgress;
     this.perfLog = opts.perfLog;
   }
@@ -504,7 +521,9 @@ export class ServerSyncClient {
 
   /**
    * Upload the content for our pending ops (deduped via `blobs:check`), then
-   * append the ops. Blobs must land before ops or the server 422s the append.
+   * append the ops. Blobs must land before ops or the server 422s the append —
+   * `uploadBlobs` awaits *every* `PUT` before we reach the append loop, so the
+   * bounded-concurrency pool doesn't weaken that ordering.
    *
    * The append is split into batches of at most `maxOpsPerAppend` ops so a large
    * offline backlog (a fresh vault's whole-vault capture can be thousands of ops)
@@ -536,10 +555,7 @@ export class ServerSyncClient {
     const blinded = [...blobs.keys()];
     if (blinded.length > 0) {
       const { missing } = await this.api.checkBlobs(blinded);
-      for (const hash of missing) {
-        const envelope = await this.crypto.encryptBlob(blobs.get(hash)!);
-        await this.api.putBlob(hash, envelope);
-      }
+      await this.uploadBlobs(missing, blobs);
     }
 
     // Append in batches so a big backlog can't 413 (see the method doc). Thread the
@@ -555,6 +571,40 @@ export class ServerSyncClient {
       }
       cursor = await this.appendBatch(batch, cursor);
     }
+  }
+
+  /**
+   * Encrypt and `PUT` each missing blob, with at most `blobUploadConcurrency` uploads
+   * in flight. Each `PUT` is one round-trip, so a fresh-vault baseline (thousands of
+   * blobs) is latency-bound; overlapping a bounded pool cuts wall-clock ~linearly in
+   * the concurrency factor without swamping a mobile `requestUrl`.
+   *
+   * Safety: this resolves only once *all* uploads settle, preserving the blobs-before-
+   * append ordering the server requires (a 422 otherwise). A `PUT` is idempotent by
+   * hash (200/201 both OK), so if one rejects — aborting the round via `Promise.all` —
+   * the whole push re-runs next round and the blobs already stored dedupe server-side.
+   * Order within the pool is irrelevant: no op is appended until every blob has landed.
+   */
+  private async uploadBlobs(missing: string[], blobs: Map<string, Uint8Array>): Promise<void> {
+    if (missing.length === 0) return;
+    const total = missing.length;
+    let next = 0;
+    let done = 0;
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const i = next++;
+        if (i >= total) return;
+        const hash = missing[i]!;
+        const envelope = await this.crypto.encryptBlob(blobs.get(hash)!);
+        await this.api.putBlob(hash, envelope);
+        done++;
+        if (total > this.blobUploadConcurrency) {
+          this.onProgress?.(`Uploading files ${done}/${total}…`);
+        }
+      }
+    };
+    const workers = Math.min(this.blobUploadConcurrency, total);
+    await Promise.all(Array.from({ length: workers }, () => worker()));
   }
 
   /**
