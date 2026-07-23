@@ -14,7 +14,9 @@ export class ObsidianVaultFiles implements VaultFiles {
   constructor(private app: App) {}
 
   list(): VaultFileRef[] {
-    return this.app.vault.getFiles().map(f => ({ path: f.path }));
+    // `TFile.stat` is already loaded on every file in the index, so carrying its
+    // mtime/size costs no extra syscall — it feeds the offline-capture stat gate (O1).
+    return this.app.vault.getFiles().map(f => ({ path: f.path, mtime: f.stat.mtime, size: f.stat.size }));
   }
 
   async read(path: string): Promise<Uint8Array | null> {

@@ -42,6 +42,20 @@ export interface FileEntry {
   // *projected remote* entry never carries it (a local-only working-copy notion,
   // like `lastSyncedPath`).
   conflictParents?: string[] | null;
+  // Cheap change-detection cache: the file's on-disk `mtime` (ms) and byte `size`
+  // the last time we hashed its content (O1). `captureOfflineChanges` skips the
+  // re-read + re-hash of any tracked file whose current stat still matches this
+  // pair, turning an every-sync O(F) drift scan into O(touched). LOCAL-ONLY and
+  // self-healing: a *projected remote* entry never carries it (like
+  // `lastSyncedPath`/`conflictParents`), and a stale/absent value costs at most one
+  // redundant re-hash — which then records the fresh stat and gates the file forever
+  // after. `mtime + size` is a *heuristic* for "unchanged": an offline edit that
+  // preserves BOTH bytes-for-byte is missed and never syncs (the exact fast-path
+  // heuristic rsync/git/Obsidian-sync rely on); **Rebuild sync metadata** forces a
+  // full re-hash for anyone who suspects a miss. See
+  // docs/capture-optimization-spec.md §3. Absent until content is first hashed.
+  mtime?: number;
+  size?: number;
 }
 
 export type OperationType = 'create' | 'update' | 'delete' | 'move';

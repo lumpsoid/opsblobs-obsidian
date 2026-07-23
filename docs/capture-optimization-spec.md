@@ -213,8 +213,26 @@ registry suite passes unchanged.
 
 Ranked by impact-per-effort; land and measure each before the next.
 
-- [ ] **O1 — mtime/size gate.** `FileEntry` + `VaultFileRef` fields, capture gate,
-      record-on-hash, event-handler stat. Tests. *(Biggest win: every-sync capture.)*
+- [x] **O1 — mtime/size gate.** *Landed.* `VaultFileStat`/`VaultFileRef` carry stat
+      (from `TFile.stat`, no extra syscall); `FileEntry` gains optional, **local-only**
+      `mtime`/`size` (optional not required — a *projected remote* entry has no local
+      stat, mirroring `lastSyncedPath`/`conflictParents`; §0's "no migration" is about
+      not writing migration *code*, and an absent value self-heals in one re-hash). The
+      capture loop gates the read+hash on `mtime === && size ===`; on a hash-equal
+      miss it self-heals the stat (no op), so a file the applicator rewrote is gated
+      after one pass. `FileRegistry.registerFile`/`updateContentHash` take the stat +
+      new `recordStat`. The live create-handler leaves the cache absent (bare-path
+      event) and self-heals — no watcher/port widening needed. Tests:
+      `__tests__/capture-stat-gate.test.ts` (repeat capture ⇒ 0 reads; size-half of the
+      gate; self-heal; reload-persistence) — all over the real stack.
+      *Measurement:* the O1 win is a **no-op/repeat** capture, which the existing bench
+      matrix does not cover (B3/B5 are first-enable = all-new files, B1 is
+      `buildLocalState`), so it's proven exactly by the unit tests (`io.reads → 0`).
+      Bench confirms **no regression**: B3/B5 reads/hashes/writes/timing unchanged vs
+      the post-capture-fix baseline; registryBytes +~1.3% (the two extra serialized
+      fields — same O(), tiny constant). NB `buildLocalState`'s own O(F) re-hash (B1)
+      is a **separate** path O1 does not touch — a follow-up if a no-op *round* must
+      also go O(touched).
 - [ ] **O2 — content dir sharding.** `ContentStore` path/list/gc. Tests.
       *(Removes the first-enable step.)*
 - [ ] **O3 — registry journal** *(only if B5 still superlinear on device).*

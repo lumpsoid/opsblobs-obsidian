@@ -129,18 +129,43 @@ export class OperationLogger {
       if (this.isExcluded(path)) continue;
       onDisk.add(path);
 
+      const entry = this.registry.getByPath(path);
+
+      // ── O1 stat gate ─────────────────────────────────────────────────────────
+      // A tracked file whose on-disk mtime AND size are unchanged since we last
+      // hashed it cannot have changed content — so skip the read, the hash, and the
+      // content-store put entirely. This is what turns the drift scan that runs
+      // before EVERY sync from O(F) into O(touched): the headline win.
+      //
+      // TRADE-OFF (docs/capture-optimization-spec.md §3): `mtime + size` is a
+      // heuristic. An *offline* edit that leaves BOTH the size and the mtime
+      // bit-for-bit unchanged would be missed here and never sync. This is the exact
+      // fast-path rsync/git/Obsidian-sync rely on, and it is safe because every
+      // *online* edit is caught by the `modify` event independent of this gate — the
+      // gate only decides whether to re-hash on a cold pass. **Rebuild sync
+      // metadata** forces a full re-hash for anyone who suspects a missed edit.
+      if (entry && entry.mtime === ref.mtime && entry.size === ref.size) continue;
+
       const content = await this.files.read(path);
       if (content === null) continue;
       const hash = await hashContent(content);
-      const entry = this.registry.getByPath(path);
 
-      if (entry && entry.contentHash === hash) continue; // already captured/synced
+      if (entry && entry.contentHash === hash) {
+        // Content is unchanged but the stat drifted (a sync wrote this file, or the
+        // entry predates the gate / was adopted from a peer without a local stat).
+        // Record the fresh stat so the gate elides this file next pass — no op,
+        // nothing changed. Self-heals a stale/absent mtime in a single re-hash.
+        if (entry.mtime !== ref.mtime || entry.size !== ref.size) {
+          await this.registry.recordStat(path, ref.mtime, ref.size);
+        }
+        continue;
+      }
 
       await this.contentStore.put(hash, content);
       const hlcTs = this.hlc.now();
 
       if (!entry) {
-        const id = await this.registry.registerFile({ path }, hlcTs, hash);
+        const id = await this.registry.registerFile(path, hlcTs, hash, ref);
         const op = Ops.create(id, path, hash, hlcTs);
         this.pendingOps.push(op);
         await this.registry.setHeadVersion(id, op.id);
@@ -153,7 +178,7 @@ export class OperationLogger {
         // captured before setHeadVersion advances it — NOT the prior content hash.
         const wasPlaceholder = entry.contentHash === '';
         const parentVersion = entry.headVersionId ?? undefined;
-        await this.registry.updateContentHash(path, hash, hlcTs);
+        await this.registry.updateContentHash(path, hash, hlcTs, ref);
         const op = wasPlaceholder
           ? Ops.create(entry.id, path, hash, hlcTs)
           : Ops.update(entry.id, path, hash, hlcTs, parentVersion);
@@ -265,7 +290,7 @@ export class OperationLogger {
       const hlcTs = this.hlc.now();
 
       if (!entry) {
-        const id = await this.registry.registerFile({ path }, hlcTs, hash);
+        const id = await this.registry.registerFile(path, hlcTs, hash, ref);
         const op = Ops.create(id, path, hash, hlcTs);
         this.pendingOps.push(op);
         await this.registry.setHeadVersion(id, op.id);
@@ -277,7 +302,7 @@ export class OperationLogger {
         const wasPlaceholder = entry.contentHash === '';
         const parentVersion = entry.headVersionId ?? undefined; // the update's causal parent = current head version
         if (entry.contentHash !== hash) {
-          await this.registry.updateContentHash(path, hash, hlcTs);
+          await this.registry.updateContentHash(path, hash, hlcTs, ref);
         }
         const op = wasPlaceholder
           ? Ops.create(entry.id, path, hash, hlcTs)
@@ -354,7 +379,11 @@ export class OperationLogger {
     if (content === null) return;
     const hash = await hashContent(content);
 
-    const id = await this.registry.registerFile({ path }, hlcTs, hash);
+    // No stat is threaded from the live create event (the watcher forwards a bare
+    // path), so the entry's gate cache is left absent — the next capture re-hashes
+    // this one file once and self-heals it. Cheap: a just-created file is a
+    // "touched" file the O(touched) budget already accounts for.
+    const id = await this.registry.registerFile(path, hlcTs, hash);
     await this.contentStore.put(hash, content);
 
     const op = Ops.create(id, path, hash, hlcTs);

@@ -10,7 +10,12 @@ import { VaultFiles, VaultFileRef } from '../../../src/ports/vault-files';
 import { IoCounters, newIoCounters } from './io-counters';
 
 export class FakeVaultFiles implements VaultFiles {
-  private files = new Map<string, Uint8Array>();
+  // path → { bytes, mtime }. mtime is a monotonic counter bumped on every write,
+  // modelling a real fs's "modified time" (Obsidian's `TFile.stat.mtime`): an edit
+  // advances it, an untouched file keeps it, a move carries it over — exactly what
+  // the O1 capture stat-gate keys on. `size` is derived from the bytes' length.
+  private files = new Map<string, { content: Uint8Array; mtime: number }>();
+  private clock = 0;
   private listingReady = true;
 
   /** Layer-2 I/O tallies (perf-baseline spec §4) for the *vault* side — above all
@@ -29,26 +34,44 @@ export class FakeVaultFiles implements VaultFiles {
   list(): VaultFileRef[] {
     this.io.lists++;
     if (!this.listingReady) return [];
-    return Array.from(this.files.keys()).map(path => ({ path }));
+    return Array.from(this.files.entries()).map(([path, f]) => ({
+      path,
+      mtime: f.mtime,
+      size: f.content.length,
+    }));
+  }
+
+  /** Test hook: overwrite a file's bytes WITHOUT advancing its mtime — models the
+   *  (astronomically rare) case a real fs leaves mtime unchanged across a same-instant
+   *  write, so a test can prove the O1 capture stat-gate still catches the change via
+   *  `size`. A no-op'd mtime on an *unknown* path just gets a fresh tick. */
+  async writeKeepingMtime(path: string, content: Uint8Array): Promise<void> {
+    const prev = this.files.get(path);
+    this.io.writes++;
+    this.io.bytesWritten += content.length;
+    this.files.set(path, { content, mtime: prev?.mtime ?? ++this.clock });
   }
 
   async read(path: string): Promise<Uint8Array | null> {
     this.io.reads++;
-    return this.files.has(path) ? this.files.get(path)! : null;
+    return this.files.get(path)?.content ?? null;
   }
 
   async write(path: string, content: Uint8Array): Promise<void> {
     this.io.writes++;
     this.io.bytesWritten += content.length;
-    this.files.set(path, content);
+    // Every write advances the file's mtime (a fresh monotonic tick), so the
+    // capture stat-gate re-hashes it next pass; an unwritten file keeps its mtime.
+    this.files.set(path, { content, mtime: ++this.clock });
   }
 
   async move(fromPath: string, toPath: string): Promise<void> {
     this.io.renames++;
-    const content = this.files.get(fromPath);
-    if (content === undefined) return;
+    const f = this.files.get(fromPath);
+    if (f === undefined) return;
+    // A move preserves content *and* mtime (a rename isn't a content change).
     this.files.delete(fromPath);
-    this.files.set(toPath, content);
+    this.files.set(toPath, f);
   }
 
   async trash(path: string): Promise<void> {

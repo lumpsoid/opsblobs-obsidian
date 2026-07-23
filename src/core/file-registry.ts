@@ -8,7 +8,7 @@
 
 import { FileEntry, HLC, SyncSettings } from '../types';
 import { MetadataStore } from '../ports/metadata-store';
-import { VaultFiles, VaultFileRef } from '../ports/vault-files';
+import { VaultFiles, VaultFileStat } from '../ports/vault-files';
 import { VersionDag } from './version-dag';
 import { hlcCompare, hlcToString } from './hlc';
 import { isExcluded } from './exclusion-policy';
@@ -88,9 +88,11 @@ export class FileRegistry {
 
   // ─── Mutation ─────────────────────────────────────────────────────────────
 
-  /** Register a newly created file. Returns the assigned UUID. */
-  async registerFile(ref: VaultFileRef, hlc: HLC, contentHash: string): Promise<string> {
-    const existing = this.pathIndex.get(ref.path);
+  /** Register a newly created file. Returns the assigned UUID. `stat` (present when
+   *  the caller hashed the file off a listing) seeds the O1 capture stat-gate cache;
+   *  omitted by the live create-handler, which self-heals on the next capture. */
+  async registerFile(path: string, hlc: HLC, contentHash: string, stat?: VaultFileStat): Promise<string> {
+    const existing = this.pathIndex.get(path);
     if (existing) {
       // A create event for a path we still track as a TOMBSTONE is a re-create: the
       // file was deleted, then a new file was made at the same path. Resurrect the
@@ -106,6 +108,7 @@ export class FileRegistry {
         entry.deleted = false;
         entry.contentHash = contentHash;
         entry.hlcTimestamp = hlc;
+        if (stat) { entry.mtime = stat.mtime; entry.size = stat.size; }
         await this.save();
       }
       return existing;   // already tracked (live), or resurrected just now
@@ -114,7 +117,7 @@ export class FileRegistry {
     const id = this.generateUUID();
     const entry: FileEntry = {
       id,
-      path: ref.path,
+      path,
       contentHash,
       hlcTimestamp: hlc,
       deleted: false,
@@ -122,9 +125,10 @@ export class FileRegistry {
       // head via setHeadVersion once the OperationLogger has minted it.
       lastSyncedPath: null,
       headVersionId: null,
+      ...(stat ? { mtime: stat.mtime, size: stat.size } : {}),
     };
     this.entries.set(id, entry);
-    this.pathIndex.set(ref.path, id);
+    this.pathIndex.set(path, id);
     await this.save();
     return id;
   }
@@ -143,14 +147,33 @@ export class FileRegistry {
     await this.save();
   }
 
-  /** Update the content hash for a file after modification. */
-  async updateContentHash(path: string, contentHash: string, hlc: HLC): Promise<void> {
+  /** Update the content hash for a file after modification. `stat` (present when the
+   *  caller hashed off a listing) refreshes the O1 capture stat-gate cache. */
+  async updateContentHash(path: string, contentHash: string, hlc: HLC, stat?: VaultFileStat): Promise<void> {
     const id = this.pathIndex.get(path);
     if (!id) return;
 
     const entry = this.entries.get(id)!;
     entry.contentHash = contentHash;
     entry.hlcTimestamp = hlc;
+    if (stat) { entry.mtime = stat.mtime; entry.size = stat.size; }
+    this.entries.set(id, entry);
+    await this.save();
+  }
+
+  /**
+   * Record the file's on-disk `mtime`/`size` after a capture hashed its content and
+   * found it UNCHANGED (O1 self-heal). The stat drifted — a sync wrote the file, or
+   * this entry predates the gate — but the bytes still match, so no op is emitted;
+   * we only refresh the cheap-gate cache so the next capture skips the read+hash.
+   * No-op if the path is unknown.
+   */
+  async recordStat(path: string, mtime: number, size: number): Promise<void> {
+    const id = this.pathIndex.get(path);
+    if (!id) return;
+    const entry = this.entries.get(id)!;
+    entry.mtime = mtime;
+    entry.size = size;
     this.entries.set(id, entry);
     await this.save();
   }

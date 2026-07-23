@@ -7,7 +7,17 @@
 //  implementation (holds `App`); a fake `Map`-backed implementation drives the
 //  real device stack in tests.
 
-export interface VaultFileRef {
+/** The cheap change-detection stat for a file: last-modified time (ms) and byte
+ *  size. Carried on every {@link VaultFileRef} so the offline-capture pass can gate
+ *  its read+hash on a stat comparison (O1, docs/capture-optimization-spec.md §3) —
+ *  Obsidian's `TFile.stat` provides both for free, so `list()` fills them without an
+ *  extra syscall. */
+export interface VaultFileStat {
+  mtime: number;
+  size: number;
+}
+
+export interface VaultFileRef extends VaultFileStat {
   path: string;
 }
 
