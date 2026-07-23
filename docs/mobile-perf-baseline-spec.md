@@ -146,6 +146,27 @@ walks. *Hypothesis:* merge-phase cost grows with per-file lineage depth; `mergeB
 super-linear behavior (its `common.filter(common.some(isAncestor))` is O(common²·(V+E)),
 `version-dag.ts:156`). Confirm whether it's a real curve at K = 100 / 1,000 / 10,000.
 
+> **Measured (2026-07-23, `bench/run.ts` `b2`, K = 5/20/80/160 sweep).** The round **is
+> super-linear in lineage depth** — `mergeRoundMs/H` climbs 3.2 → 3.2 → 5.6 → 9.5, and
+> doubling K = 80 → 160 ≈ **3.4×**es the time (≈ O(H^1.7)). So the *curve is real*.
+> **But the mechanism is NOT the `mergeBase` `common²` filter the hypothesis names.** The
+> instrumented `isAncestor / mergeBase` ratio stays flat at **~1.0** across the sweep: this
+> topology gives each file a *single* common ancestor (the create version), so
+> `common.length == 1` and the `common.filter(common.some(isAncestor))` loop does **zero**
+> `isAncestor` work — the ~1 `isAncestor` per `mergeBase` is just `state-merge`'s
+> fast-forward check. The cost that *does* scale tracks `dagReachable` / `fileReads` /
+> `sha256` (all ≈ equal, growing with H): the **O(depth) ancestor + `reachableContentHashes`
+> walks and the re-read/re-hash of base bytes along each head's history**, repeated per file
+> per round. So B2-as-written measures the **deep-lineage walk-and-rehash** cost (the real
+> curve), and effectively *clears* `mergeBase`'s quadratic filter for the linear-lineage
+> case. **The `common²·(V+E)` cliff only bites when a file has many *incomparable* common
+> ancestors** (a criss-cross / merge-heavy sub-DAG) — which this profile never builds. To
+> test that specific suspicion, add a **B2b variant** whose two heads share a merge-heavy
+> sub-DAG (repeated concurrent-then-merge cycles) so `common` grows and the filter lands on
+> the hot path. Fixes implied by the *measured* curve (deep-walk, not filter): memoize/cache
+> `ancestors()` results within a round, and gate `buildLocalState`'s base-byte staging so it
+> doesn't re-hash unchanged history every round (relates to B1's O(F·B) re-hash).
+
 **B3 — Cold startup vs F (`captureOfflineChanges`).**
 Populate F files on disk (via `seedExistingFile` — no events), then `reload()` and time
 `init()` + the first `captureOfflineChanges()`. Record: startup wall time (L1/L3), # hashes +
@@ -268,6 +289,13 @@ are not fixes** — they are the map of what to measure.
 2. **VersionDAG walks are un-memoized and scale with history** — `mergeBase` O(common²·(V+E)),
    `isAncestor`/`ancestors`/`leaves` full DFS, recomputed per call, per differing file, over
    each file's full lineage. `version-dag.ts:94,131,156,179,189`. Gets worse as **H** grows. (B2)
+   — **B2 measured (2026-07-23):** the round *is* super-linear in depth (≈ O(H^1.7)), but via
+   the **O(depth) `ancestors()`/`reachableContentHashes` walks + base-byte re-hashing**, not
+   the `common²` filter — that filter did ~0 `isAncestor` work here (`common.length == 1` for a
+   linear lineage; `isAncestor/mergeBase ≈ 1.0` flat across the sweep). The quadratic filter
+   only bites a **merge-heavy / criss-cross** sub-DAG (needs a **B2b variant** to exercise).
+   Implied fixes: memoize `ancestors()` within a round; stop re-staging unchanged history's
+   base bytes (ties into #1). See the B2 §5 measured-note.
 3. **`ContentStore.memCache` is unbounded; `clearMemCache()` is never called** —
    `content-store.ts:31,112`. Session-lifetime RAM growth toward total content bytes. (B6)
 4. **FileRegistry full pretty-printed JSON rewrite on every one of ~12 mutation sites**, looped
