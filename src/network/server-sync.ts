@@ -570,6 +570,19 @@ export class ServerSyncClient {
     }
     if (touched.size === 0) return;
 
+    // Leaves we've already tried to fold this round, keyed `fileId leafId` (both are
+    // space-free — a UUID and an op-id). A clean
+    // fold collapses its leaf (it becomes an ancestor of the new head, so it stops
+    // being an "extra" naturally) — but a fold whose pairwise merge CONFLICTS does
+    // NOT collapse the heads, so without this guard the loop re-picks the same
+    // un-foldable leaf every iteration, spins to `maxFolds` (≈ pulled ops), and
+    // re-runs the full `buildLocalState` each time (the B2 deep-history blow-up:
+    // a two-headed text conflict pulled alongside a long history ⇒ O(pulled) round
+    // cost, docs/mobile-perf-baseline-spec.md). Skipping an already-attempted leaf
+    // bounds folds to O(distinct extra leaves) and lets the scan advance to the next
+    // extra instead of stalling on a conflicting one; an unresolved conflict re-pulls
+    // and retries fresh next round (the design already converges across rounds).
+    const attempted = new Set<string>();
     // Each successful fold removes one leaf; the extras are bounded by the ops we
     // pulled, so this terminates. The +touched guard covers the initial pass.
     const maxFolds = pulled.length + touched.size + 1;
@@ -603,12 +616,14 @@ export class ServerSyncClient {
         let leafId: string | undefined;
         let leafOp: Operation | undefined;
         for (const cand of extras) {
+          if (attempted.has(fileId + ' ' + cand)) continue; // don't re-spin a non-collapsing fold
           const op = opById.get(cand);
           if (!op || op.type === 'delete') continue;
           if (dag.mergeBase(localHead, cand) === null) continue;
           leafId = cand; leafOp = op; break;
         }
         if (!leafId || !leafOp) continue;
+        attempted.add(fileId + ' ' + leafId);
 
         const leafHash = dag.contentHashOf(leafId) ?? leafOp.contentHash;
         // Stage the extra leaf's bytes (the HLC-max projection never fetched them).
