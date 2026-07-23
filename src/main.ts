@@ -290,8 +290,45 @@ export default class VaultSyncPlugin extends Plugin {
 
   // ─── Vault key (E2E) ────────────────────────────────────────────────────────
 
+  /** Required-field labels currently missing, in setup order — the single source of
+   *  truth for "what's left to configure". Empty means ready to sync. Includes the
+   *  access token: a round can't authenticate without it, so naming it up front beats
+   *  a mid-sync AuthError. */
+  private missingConfigFields(): string[] {
+    const missing: string[] = [];
+    if (!this.settings.serverUrl) missing.push('Server URL');
+    if (!this.settings.vaultId) missing.push('Vault ID');
+    if (!this.settings.serverToken) missing.push('Access token');
+    if (!this.settings.vaultPassphrase) missing.push('Vault passphrase');
+    return missing;
+  }
+
   private isServerConfigured(): boolean {
-    return Boolean(this.settings.serverUrl && this.settings.vaultId && this.settings.vaultPassphrase);
+    return this.missingConfigFields().length === 0;
+  }
+
+  /** Open Obsidian's settings straight to the Vault Sync tab, so the finish-setup
+   *  notice is actionable instead of a dead end (UX audit §1.2). */
+  private openSettings(): void {
+    const setting = (this.app as unknown as {
+      setting?: { open(): void; openTabById(id: string): void };
+    }).setting;
+    setting?.open();
+    setting?.openTabById(this.manifest.id);
+  }
+
+  /** A "you're not set up yet" notice that names the concrete fields still missing
+   *  and links to the settings tab (UX audit §1.2). Replaces the old toast that
+   *  hard-coded "a server and passphrase" regardless of what was actually absent. */
+  private notifyMissingConfig(): void {
+    const missing = this.missingConfigFields();
+    const frag = createFragment(f => {
+      f.appendText(`Vault Sync: finish setup before syncing — still missing ${missing.join(', ')}.`);
+      f.createEl('br');
+      const link = f.createEl('a', { text: 'Open Vault Sync settings', cls: 'vault-sync-notice-link' });
+      link.addEventListener('click', () => this.openSettings());
+    });
+    new Notice(frag, 10000);
   }
 
   /**
@@ -366,8 +403,9 @@ export default class VaultSyncPlugin extends Plugin {
    * already user-actionable) so the button surfaces it before the first real round.
    */
   async testConnection(): Promise<string> {
-    if (!this.isServerConfigured()) {
-      throw new Error('Set the server URL, vault ID, and passphrase first.');
+    const missing = this.missingConfigFields();
+    if (missing.length > 0) {
+      throw new Error(`Finish setup first — still missing: ${missing.join(', ')}.`);
     }
     await this.applyVaultKey();
     const { keyState } = await this.buildSyncClient().preflight();
@@ -386,9 +424,7 @@ export default class VaultSyncPlugin extends Plugin {
       return;
     }
     if (!this.isServerConfigured()) {
-      if (source === 'manual') {
-        new Notice('Vault Sync: configure a server and passphrase in Settings → Vault Sync first.');
-      }
+      if (source === 'manual') this.notifyMissingConfig();
       return;
     }
     if (!this.crypto.isReady()) {
@@ -496,7 +532,7 @@ export default class VaultSyncPlugin extends Plugin {
    */
   async rebaselineToServer(): Promise<void> {
     if (!this.isServerConfigured()) {
-      new Notice('Vault Sync: configure a server and passphrase in Settings → Vault Sync first.');
+      this.notifyMissingConfig();
       return;
     }
     const fileCount = this.registry.getActiveEntries().length;

@@ -14,6 +14,9 @@ textarea.vault-sync-exclusions {
   font-size: 0.85rem;
 }
 
+/* Actionable "finish setup" notice link (UX audit §1.2) */
+a.vault-sync-notice-link { display: inline-block; margin-top: 0.4rem; text-decoration: underline; font-weight: 600; cursor: pointer; }
+
 /* Settings — onboarding readiness checklist (UX audit §1.1) */
 .vault-sync-readiness { margin: 0.25rem 0 1rem; font-size: 0.9rem; }
 .vault-sync-readiness-label { color: var(--text-muted); }
