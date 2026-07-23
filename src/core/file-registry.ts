@@ -25,6 +25,14 @@ export class FileRegistry {
   private entries: Map<string, FileEntry> = new Map();  // uuid → entry
   private pathIndex: Map<string, string> = new Map();   // path → uuid
 
+  /** When true, `save()` only marks the registry dirty instead of writing — a batch
+   *  (e.g. captureOfflineChanges over thousands of files) suspends the per-mutation
+   *  autosave so it doesn't re-serialize the WHOLE registry once per file (the O(F²)
+   *  rewrite that saturates GC on mobile), then `flush()`es periodically. */
+  private deferSave = false;
+  /** A suspended mutation happened since the last write — `flush()` has work to do. */
+  private dirty = false;
+
   constructor(
     private metadata: MetadataStore,
     private files: VaultFiles,
@@ -48,6 +56,16 @@ export class FileRegistry {
   }
 
   async save(): Promise<void> {
+    this.dirty = true;
+    if (this.deferSave) return;   // batched — defer the write to flush()
+    await this.flush();
+  }
+
+  /** Write the registry to disk if a mutation is pending (a no-op otherwise). The
+   *  actual persistence, used both by the per-mutation `save()` and, while saves are
+   *  suspended, by a batch's explicit checkpoint. */
+  async flush(): Promise<void> {
+    if (!this.dirty) return;
     const data: SerializedRegistry = {
       version: 1,
       entries: Array.from(this.entries.entries()),
@@ -56,7 +74,17 @@ export class FileRegistry {
       await this.metadata.mkdir('.vault-sync');
     }
     await this.metadata.write(REGISTRY_PATH, JSON.stringify(data, null, 2));
+    this.dirty = false;
   }
+
+  /** Suspend the per-mutation autosave (mutations mark the registry dirty but don't
+   *  write). Pair with `flush()` to persist at controlled checkpoints and
+   *  `resumeSaves()` to restore normal behaviour — always in a `finally`. */
+  suspendSaves(): void { this.deferSave = true; }
+
+  /** Restore the per-mutation autosave. Does NOT flush — call `flush()` first to
+   *  persist anything accumulated while suspended. */
+  resumeSaves(): void { this.deferSave = false; }
 
   // ─── Mutation ─────────────────────────────────────────────────────────────
 

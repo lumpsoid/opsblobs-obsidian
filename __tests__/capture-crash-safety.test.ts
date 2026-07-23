@@ -38,6 +38,28 @@ describe('captureOfflineChanges checkpoints the oplog', () => {
     expect(dev.pendingOps.length).toBe(500);
   });
 
+  test('batches the registry write instead of rewriting it per file (O(F²) → ~O(F))', async () => {
+    const seed = await TestDevice.create('cap-batch');
+    await seedFiles(seed, 500);
+    const dev = await seed.reload();
+
+    let registryWrites = 0;
+    const orig = dev.metadata.write.bind(dev.metadata);
+    dev.metadata.write = async (p: string, d: string) => {
+      if (p.endsWith('file-registry.json')) registryWrites++;
+      return orig(p, d);
+    };
+
+    await dev.opLogger.captureOfflineChanges();
+
+    // Pre-fix: registerFile + setHeadVersion each save → ~2 writes/file ≈ 1000.
+    // Batched: one flush per 200-op checkpoint (200, 400) + the final ≈ 3.
+    expect(registryWrites).toBeLessThan(10);
+    // …and it still captured everything correctly.
+    expect(dev.pendingOps.length).toBe(500);
+    expect(dev.activeEntries().length).toBe(500);
+  });
+
   test('an interrupted capture leaves the checkpointed ops durable (recoverable)', async () => {
     const seed = await TestDevice.create('cap-crash');
     await seedFiles(seed, 500);

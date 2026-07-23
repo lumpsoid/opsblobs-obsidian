@@ -111,6 +111,14 @@ export class OperationLogger {
     let sinceCheckpoint = 0;
     const onDisk = new Set<string>();
 
+    // Batch the registry writes. Without this each file re-serialized the WHOLE
+    // registry (registerFile + setHeadVersion each save()), so the pass was O(F²) —
+    // ~4 ms/file climbing to a GC cliff on a mobile vault of a few thousand files.
+    // Suspended here, the registry is persisted only at the checkpoints below, so the
+    // per-file cost is flat. `resumeSaves` runs in `finally` so an early throw (an
+    // interrupted capture) can't leave autosave wedged off.
+    this.registry.suspendSaves();
+    try {
     // ── Live files: untracked → create, content drifted → update ─────────────
     const live = this.files.list();
     const total = live.length;
@@ -154,15 +162,21 @@ export class OperationLogger {
       }
       changed = true;
 
-      // Crash-safety checkpoint. The registry is persisted per-file (registerFile /
-      // setHeadVersion each save), but without this the oplog was written only once,
-      // at the very end — so an interrupted capture (an OOM kill on a large mobile
-      // vault is realistic) left the registry marking files "captured" while their
-      // ops were never journalled, stranding them forever (they skip re-capture on
-      // the `entry.contentHash === hash` guard and never sync). Flushing every N ops
-      // bounds that loss to <N and refreshes the live pending count.
+      // Crash-safety + memory checkpoint (every N emitted ops). Persist the batched
+      // registry FIRST, then the oplog, so on-disk the registry is never behind the
+      // oplog — a crash in the gap strands files (registry ahead; recoverable via
+      // rebaseline), never orphans ops (oplog ahead, referencing unregistered files).
+      // Without this, an interrupted capture on a large mobile vault (OOM at the GC
+      // cliff) left the registry marking files "captured" while their ops were never
+      // journalled — they skip re-capture on the `entry.contentHash === hash` guard
+      // and never sync. Bounds that loss to <N and keeps the live pending count fresh.
+      // Then drop the in-memory content cache: every blob is already on disk
+      // (contentStore.put), so a later read re-loads it — this keeps the pass from
+      // accumulating the whole vault's content in RAM.
       if (++sinceCheckpoint >= CAPTURE_CHECKPOINT_EVERY) {
+        await this.registry.flush();
         await this.saveOpLog();
+        this.contentStore.clearMemCache();
         sinceCheckpoint = 0;
       }
     }
@@ -208,7 +222,14 @@ export class OperationLogger {
       }
     }
 
+    // Successful end: persist the tail (registry first, then oplog — same ordering
+    // as the checkpoint). On an early throw we skip this and fall to the `finally`,
+    // leaving disk at the last checkpoint (registry and oplog consistent there).
+    await this.registry.flush();
     if (changed) await this.saveOpLog();
+    } finally {
+      this.registry.resumeSaves();
+    }
   }
 
   /**
