@@ -1,16 +1,19 @@
 # Vault Sync — Pre-Release UX Audit & Remediation Spec
 
-**Status:** Draft / audit-of-record · **Date:** 2026-07-23 · **Owner:** UX + client
+**Status:** audit-of-record · **Date:** 2026-07-23 · **Owner:** UX + client ·
+**Progress: all P0 + all P1 landed; P2 polish + the §8 manual-smoke pass remain.**
 
 This is a **point-in-time audit** of every user-facing surface of the plugin, plus a
 prioritized remediation plan to make setup and daily use *clear and comfortable* before
-release. It is a plan, not a landed change; check items off as they ship. The companion
-engineering doc for behavior is `docs/sync-engineering-guide.md`; the pre-release
-*performance* work lives in `docs/mobile-perf-baseline-spec.md`.
+release. Findings are checked off as they ship; the **Decisions of record** (below) capture the
+*why* behind the shipped code. The companion engineering doc for behavior is
+`docs/sync-engineering-guide.md`; the pre-release *performance* work lives in
+`docs/mobile-perf-baseline-spec.md`.
 
-**Prime lens:** mobile is a declared target (`manifest.json` `isDesktopOnly: false`), yet
-the UI today has **zero mobile adaptation**. Every finding is weighed for how it lands on a
-phone, not just desktop.
+**Prime lens:** mobile is a declared target (`manifest.json` `isDesktopOnly: false`). The UI
+started with **zero mobile adaptation**; the conflict panel now has a mobile breakpoint (stacked
+panes, 44px touch targets) and moved to a main-area tab, but every finding is still weighed for
+how it lands on a phone, not just desktop.
 
 ## How to read this
 
@@ -265,10 +268,11 @@ Findings:
 - **P1 — no preview of the resolved result before Apply, and "Both" ordering unstated. ✅ SHIPPED.**
   A live, collapsible **Preview result** renders exactly what Apply will write (computed from the
   current picks via the same `resolveMarkedText` rule); "Both" now carries "Mine first, then Theirs".
-- **P1 — silent default on modal dismiss. ✅ SHIPPED.** Dismissing `DeleteConflictModal` /
-  `BinaryConflictModal` now **defers** (holds the cursor, tags `reason:'conflict'`, re-presents next
-  manual sync) instead of silently picking `'restore'` / `'keep_local'`; a decision is only committed
-  by an explicit button, and each modal has a **Decide later** that produces the same deferral.
+- **P1 — silent default on modal dismiss. ✅ SHIPPED, then SUPERSEDED.** First pass made dismissing
+  the delete/binary modals *defer* (never a silent `'restore'`/`'keep_local'` pick), with a "Decide
+  later" button. The "full inline" follow-up then **deleted the modals** — delete/binary conflicts
+  defer on every round into the Conflicts panel and are only ever resolved by an explicit inline
+  choice, so a silent-dismiss default no longer exists to guard against.
 - **P2 — binary conflict shows only text metadata ◑ PARTIAL.** The binary decision is now an inline
   panel card showing size + device + time per side; the raw UUID is gone (it uses the same
   `describeDevice` short label as the text-conflict provenance chips). **Still open:** an image
@@ -399,8 +403,11 @@ has **zero `@media` queries** (grep confirms). Findings:
       label); image thumbnail still open.)*
 - [ ] Clear-cache confirm consistency; move Device ID to diagnostics (§4).
 
-> **P0 status (2026-07-23):** all seven P0 items landed. Remaining work is P1/P2 plus the
-> manual-smoke matrix (§8) on desktop + a real mobile device.
+> **Status (2026-07-23):** all seven P0 items **and** the P1 set have landed (vocabulary,
+> full-inline conflict unification, danger hierarchy, plain phrasing, touch targets, onboarding
+> copy). Remaining work is **P2 polish** plus the **manual-smoke matrix (§8)** on desktop + a real
+> mobile device — the code is verified by unit tests in the obsidian-free layer, but every UI
+> surface still needs a hands-on pass (see the Known manual-smoke surface in the engineering guide).
 
 ---
 
@@ -417,12 +424,15 @@ mobile device** (Obsidian mobile). Run before release and after any UX change:
 3. **Each error class:** wrong token (`AuthError`), wrong URL/vault (`NotFoundError`), offline
    (`NetworkError`), server down (`ServerError`) — confirm each message is durable + actionable.
 4. **Text conflict:** two devices edit the same file → markers land → panel opens/discoverable
-   → resolve via panel and via hand-editing markers → converge. On mobile: panes readable and
-   tappable.
-5. **Delete/modify and binary conflict:** manual and auto sync; confirm dismiss defers (no
-   silent pick) and both appear in "Needs your attention".
-6. **Maintenance actions:** reset, re-baseline (double-confirm), clear cache — copy matches
-   effect; no accidental data loss path.
+   → resolve via panel (check the live **Preview result** matches, and "Both" ordering) and via
+   hand-editing markers → converge. On mobile: panes readable and tappable.
+5. **Delete/modify and binary conflict ("full inline"):** on both manual and auto sync the conflict
+   appears as an **inline card in the Conflicts panel** (no blocking modal); an auto round raises the
+   persistent "open conflicts" notice. Pick a side on device A → the applying round mints the merge
+   node → **device B fast-forwards without re-prompting**. Confirm the binary card shows size/device/
+   time per side, and that leaving a conflict unresolved keeps the current version (no silent pick).
+6. **Maintenance actions:** reset, re-baseline (type-to-confirm gate + solid-danger button), clear
+   cache — copy matches effect; no accidental data-loss path.
 
 ## 9. Out of scope
 Server-side/token issuance UX (spec §9.2), theming beyond light/dark, localization/i18n, and
