@@ -10,7 +10,7 @@ import { ContentStore } from './core/content-store';
 import { randomUuid } from './core/encoding';
 import { OperationLogger } from './core/operation-logger';
 import { resolveDeleteStrategy } from './core/conflict-policy';
-import { SyncApplicator } from './network/sync-applicator';
+import { SyncApplicator, DeferConflict } from './network/sync-applicator';
 import { ObsidianVaultFiles } from './network/obsidian-vault-files';
 import { ObsidianMetadataStore } from './network/obsidian-metadata-store';
 import { ObsidianVaultWatcher } from './network/obsidian-vault-watcher';
@@ -141,13 +141,13 @@ export default class VaultSyncPlugin extends Plugin {
           resolveDeleteStrategy(this.settings.deleteConflictStrategy),
           action,
           a =>
-            new Promise<'keep_deleted' | 'restore'>(resolve => {
+            new Promise<'keep_deleted' | 'restore' | DeferConflict>(resolve => {
               new DeleteConflictModal(this.app, a.path, a.side, resolve).open();
             }),
         ),
       (action) =>
         this.coordinator.decideBinaryConflict(action, a =>
-          new Promise<'keep_local' | 'keep_remote'>(resolve => {
+          new Promise<'keep_local' | 'keep_remote' | DeferConflict>(resolve => {
             new BinaryConflictModal(this.app, a, resolve).open();
           }),
         ),

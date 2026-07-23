@@ -44,6 +44,9 @@ export class ConflictsView extends ItemView {
   /** Per-file, per-hunk choice. Kept across re-renders so a spurious refresh (an op
    *  recorded elsewhere) doesn't discard an in-progress selection. */
   private selections = new Map<string, Map<number, SelectionKind>>();
+  /** Files whose resolved-result preview is expanded. Tracked (like {@link selections})
+   *  so the preview survives the re-render every side-pick triggers and updates live. */
+  private previewOpen = new Set<string>();
   /** Guards against overlapping async renders clobbering each other. */
   private renderToken = 0;
 
@@ -93,9 +96,10 @@ export class ConflictsView extends ItemView {
           'Choose a side per change, then Apply — or edit the markers directly in the note.',
     });
 
-    // Prune selection state for files that are no longer conflicted.
+    // Prune per-file UI state for files that are no longer conflicted.
     const liveIds = new Set(items.map(i => i.fileId));
     for (const id of [...this.selections.keys()]) if (!liveIds.has(id)) this.selections.delete(id);
+    for (const id of [...this.previewOpen]) if (!liveIds.has(id)) this.previewOpen.delete(id);
 
     if (items.length === 0) {
       setIcon(root.createDiv('vault-sync-conflicts-empty'), 'check-circle-2');
@@ -150,7 +154,9 @@ export class ConflictsView extends ItemView {
     };
     new ButtonComponent(globalBar).setButtonText('All mine').onClick(() => setAll('local'));
     new ButtonComponent(globalBar).setButtonText('All theirs').onClick(() => setAll('remote'));
-    new ButtonComponent(globalBar).setButtonText('Keep both').onClick(() => setAll('both'));
+    new ButtonComponent(globalBar).setButtonText('Keep both')
+      .setTooltip('Keep both on every change — Mine first, then Theirs')
+      .onClick(() => setAll('both'));
 
     // ── Per-hunk 3-way compare ────────────────────────────────────────────────
     const list = card.createDiv('vault-sync-conflict-hunks');
@@ -161,6 +167,21 @@ export class ConflictsView extends ItemView {
       ci++;
     }
 
+    // ── Preview of the resolved result ────────────────────────────────────────
+    // Show exactly what "Apply resolution" will write, computed live from the
+    // current per-hunk picks (§3). Its open/closed state is tracked so re-rendering
+    // on each pick keeps it open and refreshes the text underneath.
+    const preview = card.createEl('details', { cls: 'vault-sync-conflict-preview' });
+    preview.open = this.previewOpen.has(item.fileId);
+    preview.createEl('summary', { text: 'Preview result' });
+    preview.addEventListener('toggle', () => {
+      if (preview.open) this.previewOpen.add(item.fileId);
+      else this.previewOpen.delete(item.fileId);
+    });
+    const resolved = resolveMarkedText(text, this.resolutionsFrom(sel));
+    preview.createEl('pre', { cls: 'vault-sync-pane-code vault-sync-conflict-preview-code' })
+      .createEl('code', { text: resolved.length ? resolved : '(empty file)' });
+
     // ── Footer: apply / open ──────────────────────────────────────────────────
     const footer = card.createDiv('vault-sync-conflict-actions');
     new ButtonComponent(footer)
@@ -170,6 +191,14 @@ export class ConflictsView extends ItemView {
     new ButtonComponent(footer)
       .setButtonText('Edit in note')
       .onClick(() => { void this.host.openFile(item.path); });
+  }
+
+  /** The per-hunk picks as the `resolveMarkedText` decision map — the single rule the
+   *  preview and Apply both use, so the preview can never disagree with what lands. */
+  private resolutionsFrom(sel: Map<number, SelectionKind>): Map<number, ConflictResolution> {
+    const resolutions = new Map<number, ConflictResolution>();
+    for (const [ci, kind] of sel) resolutions.set(ci, { kind });
+    return resolutions;
   }
 
   private renderHunk(
@@ -185,8 +214,9 @@ export class ConflictsView extends ItemView {
     bar.createSpan({ cls: 'vault-sync-hunk-index', text: `Change ${ci + 1}` });
 
     const panes = hunk.createDiv('vault-sync-hunk-panes');
-    const pane = (cls: string, label: string, lines: string[], kind: SelectionKind | null) => {
+    const pane = (cls: string, label: string, lines: string[], kind: SelectionKind | null, tooltip: string) => {
       const el = panes.createDiv(`vault-sync-pane ${cls}${kind && chosen === kind ? ' is-chosen' : ''}`);
+      el.setAttribute('title', tooltip);
       el.createDiv({ cls: 'vault-sync-pane-label', text: label });
       const pre = el.createEl('pre', { cls: 'vault-sync-pane-code' });
       pre.createEl('code', { text: lines.length ? lines.join('\n') : '(empty)' });
@@ -194,19 +224,22 @@ export class ConflictsView extends ItemView {
         el.addEventListener('click', () => { sel.set(ci, kind); void this.render(); });
       }
     };
-    pane('pane-ours', 'Mine', seg.ours, 'local');
-    pane('pane-base', 'Base', seg.base, null);
-    pane('pane-theirs', 'Theirs', seg.theirs, 'remote');
+    pane('pane-ours', 'Mine', seg.ours, 'local', 'Your version on this device.');
+    // The Original (common ancestor) pane is read-only context, not a choice — it's
+    // greyed and non-clickable; the gloss says what it is (§3).
+    pane('pane-base', 'Original', seg.base, null, 'The shared starting point, before either edit. Read-only reference.');
+    pane('pane-theirs', 'Theirs', seg.theirs, 'remote', "The other device's version.");
 
     const actions = hunk.createDiv('vault-sync-hunk-actions');
-    const btn = (label: string, kind: SelectionKind) => {
+    const btn = (label: string, kind: SelectionKind, tooltip?: string) => {
       const b = new ButtonComponent(actions).setButtonText(label)
         .onClick(() => { sel.set(ci, kind); void this.render(); });
+      if (tooltip) b.setTooltip(tooltip);
       if (chosen === kind) b.setCta();
     };
     btn('Mine', 'local');
     btn('Theirs', 'remote');
-    btn('Both', 'both');
+    btn('Both', 'both', 'Keep both changes — Mine first, then Theirs');
   }
 
   private async applyResolution(
@@ -214,9 +247,7 @@ export class ConflictsView extends ItemView {
     text: string,
     sel: Map<number, SelectionKind>,
   ): Promise<void> {
-    const resolutions = new Map<number, ConflictResolution>();
-    for (const [ci, kind] of sel) resolutions.set(ci, { kind });
-    const resolved = resolveMarkedText(text, resolutions);
+    const resolved = resolveMarkedText(text, this.resolutionsFrom(sel));
     await this.host.resolveFile(item.path, resolved);
     this.selections.delete(item.fileId);
     // The resolving save clears the two-headed marker asynchronously (debounced op

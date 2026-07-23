@@ -9,6 +9,7 @@
 
 import { App, Modal } from 'obsidian';
 import { MergeAction } from '../types';
+import { DEFER_CONFLICT, DeferConflict } from '../network/sync-applicator';
 
 type BinaryConflictAction = Extract<MergeAction, { type: 'binary_conflict' }>;
 
@@ -18,14 +19,14 @@ export class BinaryConflictModal extends Modal {
   constructor(
     app: App,
     private action: BinaryConflictAction,
-    private resolve: (decision: 'keep_local' | 'keep_remote') => void,
+    private resolve: (decision: 'keep_local' | 'keep_remote' | DeferConflict) => void,
   ) {
     super(app);
   }
 
   onOpen() {
     const { contentEl, action } = this;
-    contentEl.createEl('h2', { text: '⚠️ Binary file conflict' });
+    contentEl.createEl('h2', { text: 'Binary file conflict' });
     contentEl.createEl('p', {
       text: `"${action.localPath}" was changed on two devices at once. Binary files ` +
         "can't be merged, so choose which version to keep — the other is kept in the " +
@@ -43,6 +44,11 @@ export class BinaryConflictModal extends Modal {
 
     const remoteBtn = buttons.createEl('button', { text: "Keep other device's version" });
     remoteBtn.addEventListener('click', () => this.decide('keep_remote'));
+
+    // Explicit defer — mirrors dismissing the modal. Both versions stay in the sync
+    // history; the conflict re-presents on the next manual sync.
+    const laterBtn = buttons.createEl('button', { text: 'Decide later' });
+    laterBtn.addEventListener('click', () => this.decide(DEFER_CONFLICT));
   }
 
   private renderSide(parent: HTMLElement, label: string, path: string, bytes: number, deviceId: string, wallTime: number): void {
@@ -55,16 +61,17 @@ export class BinaryConflictModal extends Modal {
     });
   }
 
-  private decide(decision: 'keep_local' | 'keep_remote') {
+  private decide(decision: 'keep_local' | 'keep_remote' | DeferConflict) {
     this.decided = true;
     this.resolve(decision);
     this.close();
   }
 
   onClose() {
-    // Dismissed without choosing — default to this device's version so the local
-    // file the user is looking at is never overwritten without an explicit choice.
-    if (!this.decided) this.resolve('keep_local');
+    // Dismissed without an explicit choice — defer rather than silently keeping one
+    // side. The round holds its cursor so the conflict re-presents next manual sync;
+    // both versions remain recoverable and nothing on disk is overwritten (§3).
+    if (!this.decided) this.resolve(DEFER_CONFLICT);
     this.contentEl.empty();
   }
 }

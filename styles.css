@@ -79,8 +79,14 @@ a.vault-sync-notice-link { display: inline-block; margin-top: 0.4rem; text-decor
 .vault-sync-hunk-actions { display: flex; gap: 0.4rem; flex-wrap: wrap; padding: 0.4rem 0.75rem; }
 .vault-sync-conflict-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; padding: 0.6rem 0.75rem; background: var(--background-secondary); border-top: 1px solid var(--background-modifier-border); }
 
+/* Resolved-result preview (UX audit §3) — a collapsible, live view of exactly what
+   "Apply resolution" will write, computed from the current per-hunk picks. */
+.vault-sync-conflict-preview { padding: 0.4rem 0.75rem 0.6rem; border-top: 1px solid var(--background-modifier-border); }
+.vault-sync-conflict-preview > summary { cursor: pointer; font-size: 0.8rem; font-weight: 600; color: var(--text-muted); }
+.vault-sync-conflict-preview-code { margin-top: 0.4rem; background: var(--background-primary-alt); padding: 0.4rem 0.6rem; border-radius: 4px; max-height: 200px; }
+
 /* Mobile / narrow width — the 3-way compare (UX audit §6). Three columns in a
-   phone-width view are unreadable, so stack the Mine/Common/Theirs panes vertically:
+   phone-width view are unreadable, so stack the Mine/Original/Theirs panes vertically:
    each becomes full-width with a bottom divider instead of a right one, and the code
    blocks lose their height cap so a short hunk isn't boxed into a scroll area. */
 @media (max-width: 700px) {

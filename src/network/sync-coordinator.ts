@@ -26,6 +26,8 @@ import { SyncStateStore } from './sync-state-store';
 import { SyncRoundSummary } from './server-sync';
 import { DEFER_CONFLICT, DeferConflict } from './sync-applicator';
 import { isSetupError } from './sync-errors';
+// The interactive resolvers may now themselves defer (the modal's "Decide later" /
+// dismiss path, §3), so their result type includes DeferConflict.
 
 export type SyncSource = 'manual' | 'auto';
 
@@ -42,9 +44,9 @@ export interface SyncOutcome {
  *  resolver: it is surfaced non-blockingly as inline markers (sync v2 Step 5) and
  *  resolved by the next ordinary save, never a modal. */
 export type InteractiveDeleteResolver =
-  (action: Extract<MergeAction, { type: 'delete_conflict' }>) => Promise<'keep_deleted' | 'restore'>;
+  (action: Extract<MergeAction, { type: 'delete_conflict' }>) => Promise<'keep_deleted' | 'restore' | DeferConflict>;
 export type InteractiveBinaryResolver =
-  (action: Extract<MergeAction, { type: 'binary_conflict' }>) => Promise<'keep_local' | 'keep_remote'>;
+  (action: Extract<MergeAction, { type: 'binary_conflict' }>) => Promise<'keep_local' | 'keep_remote' | DeferConflict>;
 
 export interface SyncCoordinatorDeps {
   editorSaver: EditorSaver;
