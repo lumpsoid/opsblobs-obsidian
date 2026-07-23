@@ -63,7 +63,7 @@ describe('R1 round stat-gate', () => {
     // nothing — the steady-state ideal (capture already did the O(touched) work).
     {
       const readsBefore = A.files.io.reads;
-      const { sha256 } = await countSha256(() => A.host.buildLocalState());
+      const { sha256 } = await countSha256(async () => A.host.buildLocalState(await A.host.loadDag()));
       expect(sha256).toBe(0);
       expect(A.files.io.reads - readsBefore).toBe(0);
     }
@@ -74,7 +74,7 @@ describe('R1 round stat-gate', () => {
     await A.files.write('notes/n-7.md', enc('a much longer, changed body for n-7\n'));
 
     const readsBefore = A.files.io.reads;
-    const { result: state, sha256 } = await countSha256(() => A.host.buildLocalState());
+    const { result: state, sha256 } = await countSha256(async () => A.host.buildLocalState(await A.host.loadDag()));
     expect(sha256).toBe(1);                       // ≈1, NOT F+1 — the R1 win
     expect(A.files.io.reads - readsBefore).toBe(1);
 
@@ -94,7 +94,7 @@ describe('R1 round stat-gate', () => {
     expect(A.entryByPath('a.md')!.mtime).toBeUndefined();
 
     const readsBefore = A.files.io.reads;
-    const { sha256 } = await countSha256(() => A.host.buildLocalState());
+    const { sha256 } = await countSha256(async () => A.host.buildLocalState(await A.host.loadDag()));
     expect(sha256).toBe(1);                       // hashed, not silently trusted
     expect(A.files.io.reads - readsBefore).toBe(1);
   });
@@ -204,7 +204,7 @@ describe('R1 round stat-gate', () => {
       expect(await A.contentStore.has(aHash)).toBe(false);
 
       const readsBefore = A.files.io.reads;
-      const { result: state, sha256 } = await countSha256(() => A.host.buildLocalState());
+      const { result: state, sha256 } = await countSha256(async () => A.host.buildLocalState(await A.host.loadDag()));
 
       // Still zero hashes (the stat says unchanged — no re-hash on the fallback), and
       // the missing blob was staged from disk so the merge sees a.md's bytes.

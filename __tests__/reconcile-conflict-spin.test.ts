@@ -66,7 +66,7 @@ describe('reconcileConcurrentHeads — a non-collapsing conflict fold must not s
     // Count buildLocalState invocations during B's reconciling round.
     let buildCount = 0;
     const origBuild = B.host.buildLocalState.bind(B.host);
-    B.host.buildLocalState = async () => { buildCount++; return origBuild(); };
+    B.host.buildLocalState = async (dag) => { buildCount++; return origBuild(dag); };
 
     await client(B).runSync();
 

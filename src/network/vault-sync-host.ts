@@ -33,28 +33,43 @@ export class PluginVaultSyncHost implements VaultSyncHost {
     private versionDagStore: VersionDagStore,
   ) {}
 
+  /** Load the persisted version-DAG once for the whole round. `runSync` calls this
+   *  a single time after the key/dag guard and threads the instance into
+   *  `dagNeedsRebuild`, `buildLocalState`, and `recordVersionEdges`, so the graph is
+   *  deserialized once per round instead of three times (round-residual spec §3). */
+  loadDag(): Promise<VersionDag> {
+    return this.versionDagStore.load();
+  }
+
   /**
    * Snapshot the local vault for a sync round: the registry entries, the
    * un-pushed pending ops, and a content store populated with the current bytes
    * of every live file (covers every pending op's content, whose hash equals the
    * live entry's) plus any retained ancestor content the three-way merge needs.
+   *
+   * `dag` is the round's single loaded graph (see {@link loadDag}). We must NOT
+   * mutate it: `recordVersionEdges` later journals this round's genuinely-new edges
+   * by asking `addVersion` whether each is absent, so pre-adding the pending ops
+   * here would make it return `false` and silently drop them from the journal
+   * (round-residual spec §3.1). Fold them into a private `clone()` instead.
    */
-  async buildLocalState(): Promise<VaultState> {
+  async buildLocalState(dag: VersionDag): Promise<VaultState> {
     const fileEntries = new Map<string, FileEntry>();
     const contentStore = new Map<string, Uint8Array>();
-    // The op-id DAG, so we can stage the bytes of every version reachable from each
-    // file's head (its ancestors). The three-way merge base LCA(localHead, peerHead)
-    // is always one of these, so pre-staging them makes any base available to the
-    // pure merge — including one deeper than the last-synced version (a multi-round
-    // offline divergence), which the scalar ancestor alone could not reach (#4).
-    const dag = await this.versionDagStore.load();
-    // This round's own edits aren't in the *persisted* DAG yet (recordVersionEdges
-    // runs later in the round), so a fresh head can't reach its base for staging.
-    // Fold the pending ops' edges into this in-memory copy — not persisted here — so
+    // Stage the bytes of every version reachable from each file's head (its
+    // ancestors). The three-way merge base LCA(localHead, peerHead) is always one of
+    // these, so pre-staging them makes any base available to the pure merge —
+    // including one deeper than the last-synced version (a multi-round offline
+    // divergence), which the scalar ancestor alone could not reach (#4).
+    //
+    // This round's own edits aren't in the persisted DAG yet (recordVersionEdges
+    // runs later), so a fresh head can't reach its base for staging. Fold the pending
+    // ops into a CLONE — never the shared round DAG (see the doc comment) — so
     // reachability from each head includes the base the merge will need.
+    const working = dag.clone();
     for (const op of this.opLogger.getPendingOps()) {
       if (op.type === 'move') continue;
-      dag.addVersion(op.id, op.parents, op.contentHash, op.fileId);
+      working.addVersion(op.id, op.parents, op.contentHash, op.fileId);
     }
 
     // Stat every live file once (no extra syscall — `TFile.stat` rides on the
@@ -113,7 +128,7 @@ export class PluginVaultSyncHost implements VaultSyncHost {
       // ancestors) that the content store still holds, so the merge can three-way
       // against the true LCA even when it is deeper than the scalar ancestor.
       if (resolved.headVersionId) {
-        for (const hash of dag.reachableContentHashes(resolved.headVersionId)) {
+        for (const hash of working.reachableContentHashes(resolved.headVersionId)) {
           if (!contentStore.has(hash)) {
             const bytes = await this.contentStore.get(hash);
             if (bytes) contentStore.set(hash, bytes);
@@ -139,8 +154,7 @@ export class PluginVaultSyncHost implements VaultSyncHost {
     await this.opLogger.clearOps();
   }
 
-  async recordVersionEdges(ops: Operation[]): Promise<VersionDag> {
-    const dag = await this.versionDagStore.load();
+  async recordVersionEdges(ops: Operation[], dag: VersionDag): Promise<VersionDag> {
     if (ops.length === 0) return dag;
     // Key by op-id (the version identity), carrying the content hash as the blob
     // address. A `move` carries no content parent and is not a new content version;
@@ -166,15 +180,15 @@ export class PluginVaultSyncHost implements VaultSyncHost {
     return dag;
   }
 
-  async dagNeedsRebuild(): Promise<boolean> {
+  async dagNeedsRebuild(dag: VersionDag): Promise<boolean> {
     // A torn/deleted version-dag.json loads as an EMPTY graph (VersionDagStore maps
     // any corruption to `new VersionDag()`). If we've consumed server ops before
     // (cursor > 0) the DAG must have been populated by recordVersionEdges, so an
     // empty graph now means it was lost — signal a rebuild-from-log. A fresh device
     // (cursor 0) legitimately has an empty DAG and is not a loss. After a rebuild
-    // the DAG is non-empty, so this can't loop.
+    // the DAG is non-empty, so this can't loop. Reads the round's single loaded
+    // `dag` (round-residual spec §3) — no extra deserialization.
     if (await this.cursor.load() === 0) return false;
-    const dag = await this.versionDagStore.load();
     return dag.size() === 0;
   }
 

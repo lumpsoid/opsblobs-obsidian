@@ -99,9 +99,18 @@ interface PulledOp {
  * (P4) wires FileRegistry, ContentStore, OperationLogger and SyncApplicator.
  */
 export interface VaultSyncHost {
+  /** Deserialize the persisted version-DAG once for the whole round. `runSync`
+   *  calls this a single time after the key/dag guard and threads the returned
+   *  instance into `dagNeedsRebuild`, `buildLocalState`, and `recordVersionEdges`,
+   *  so the graph is rebuilt from disk once per round instead of three times
+   *  (round-residual spec §3). The consumers must not persist mutations to it
+   *  except through `recordVersionEdges`. */
+  loadDag(): Promise<VersionDag>;
   /** Snapshot of the local state: fileEntries, un-pushed pendingOps, and a
-   *  contentStore populated with at least every pending op's content + ancestors. */
-  buildLocalState(): Promise<VaultState>;
+   *  contentStore populated with at least every pending op's content + ancestors.
+   *  `dag` is the round's single loaded graph; the host folds this round's pending
+   *  ops into a private clone for the staging walk and leaves `dag` pristine. */
+  buildLocalState(dag: VersionDag): Promise<VaultState>;
   /** Apply merge actions to the real vault (writes/deletes/moves, conflict
    *  prompts). Returns `deferred` (fileIds whose destructive action was skipped for
    *  on-disk drift (F5) or an auto-deferred conflict — the caller holds the cursor
@@ -118,15 +127,17 @@ export interface VaultSyncHost {
    *  `fileId`), keyed by op-id. Returns the updated in-memory DAG so the round can
    *  hand it to the merge, which derives the three-way base (LCA) and fast-forward
    *  from it. Called with this round's local + pulled ops BEFORE the merge, so both
-   *  heads are present when the merge reads the graph. */
-  recordVersionEdges(ops: Operation[]): Promise<VersionDag>;
+   *  heads are present when the merge reads the graph. Mutates `dag` in place (the
+   *  round's single loaded graph) and returns it. */
+  recordVersionEdges(ops: Operation[], dag: VersionDag): Promise<VersionDag>;
   /** Whether the persisted version-DAG was lost (a torn write on an older build,
    *  or a deleted metadata file) and must be rebuilt from the server op log. True
-   *  when this device has consumed server ops before (cursor > 0) yet the DAG loads
+   *  when this device has consumed server ops before (cursor > 0) yet the DAG loaded
    *  empty — the DAG is a derived cache of the log, so the round heals it by
    *  rewinding the cursor and replaying (see runSync). Never true for a fresh
-   *  device (cursor 0), and false again once rebuilt, so it can't loop. */
-  dagNeedsRebuild(): Promise<boolean>;
+   *  device (cursor 0), and false again once rebuilt, so it can't loop. Reads the
+   *  round's single loaded `dag` (round-residual spec §3). */
+  dagNeedsRebuild(dag: VersionDag): Promise<boolean>;
 }
 
 export interface ServerSyncOptions {
@@ -244,13 +255,19 @@ export class ServerSyncClient {
     // truth. The replay is idempotent — already-applied files merge to a no-op —
     // the same self-healing `recheckConflicts` triggers by hand. Rebuilt DAG is
     // non-empty, so the next round won't re-trigger.
-    if (await this.host.dagNeedsRebuild()) {
+    // Deserialize the persisted DAG exactly once and thread it through every
+    // consumer this round (dag-guard, buildLocalState, recordVersionEdges), instead
+    // of each reloading it from disk (round-residual spec §3: 3 loads → 1). A torn
+    // graph loads as empty here; the guard below sees size 0 and rewinds the cursor,
+    // and recordVersionEdges rebuilds into this same (empty) instance.
+    let dag = await this.host.loadDag();
+    if (await this.host.dagNeedsRebuild(dag)) {
       this.onProgress?.('Rebuilding sync history…');
       await this.host.saveCursor(0);
     }
     timer?.lap('keycheck+dag-guard');
 
-    const local = await this.host.buildLocalState();
+    const local = await this.host.buildLocalState(dag);
     const startCursor = await this.host.loadCursor();
     const pushed = local.pendingOps.length;
     timer?.lap('buildLocalState');
@@ -294,7 +311,7 @@ export class ServerSyncClient {
     // merge sees both this round's heads (local's and remote's) and can derive the
     // three-way base (LCA) and fast-forward from graph structure. The returned DAG
     // is handed to the merge.
-    const dag = await this.host.recordVersionEdges([...local.pendingOps, ...pulled.map(p => p.op)]);
+    dag = await this.host.recordVersionEdges([...local.pendingOps, ...pulled.map(p => p.op)], dag);
     timer?.lap('recordVersionEdges');
 
     this.onProgress?.('Merging…');
@@ -587,10 +604,10 @@ export class ServerSyncClient {
     // pulled, so this terminates. The +touched guard covers the initial pass.
     const maxFolds = pulled.length + touched.size + 1;
     for (let step = 0; step < maxFolds; step++) {
-      const local = await this.host.buildLocalState();
+      const local = await this.host.buildLocalState(dag);
       // Fold any merge node a previous iteration minted (now a pending op, not yet
       // in the persisted DAG) into the graph so this fold's LCA/leaf scan sees it.
-      dag = await this.host.recordVersionEdges(local.pendingOps);
+      dag = await this.host.recordVersionEdges(local.pendingOps, dag);
 
       let folded = false;
       for (const fileId of [...touched].sort()) {

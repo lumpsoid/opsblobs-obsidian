@@ -171,7 +171,7 @@ describe('VersionDagStore: auto-compaction (deferred coverage)', () => {
       parents: [],
     }));
 
-    await device.host.recordVersionEdges(ops);
+    await device.host.recordVersionEdges(ops, await device.host.loadDag());
 
     // Crossed the threshold → the journal was folded into the snapshot and cleared.
     expect(device.metadata.has('.vault-sync/version-dag.json')).toBe(true);

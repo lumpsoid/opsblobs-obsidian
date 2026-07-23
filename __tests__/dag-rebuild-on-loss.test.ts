@@ -103,7 +103,7 @@ describe('a lost version-DAG is rebuilt from the server log on the next sync', (
     await A.seedFile('note.md', 'hello\n', 1000);
     expect((await A.versionDagStore.load()).size()).toBe(0);
     expect(await A.cursor()).toBe(0);
-    expect(await A.host.dagNeedsRebuild()).toBe(false);
+    expect(await A.host.dagNeedsRebuild(await A.host.loadDag())).toBe(false);
 
     const labels: string[] = [];
     await new ServerSyncClient({ api, crypto: vc, host: A.host, hlc: A.hlc, onProgress: l => labels.push(l) }).runSync();

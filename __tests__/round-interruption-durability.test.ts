@@ -46,7 +46,8 @@ const text = (b: Uint8Array | null): string | null => (b ? new TextDecoder().dec
 class CrashOnFirstClearHost implements VaultSyncHost {
   private armed = true;
   constructor(private readonly inner: VaultSyncHost) {}
-  buildLocalState(): Promise<VaultState> { return this.inner.buildLocalState(); }
+  loadDag(): Promise<VersionDag> { return this.inner.loadDag(); }
+  buildLocalState(dag: VersionDag): Promise<VaultState> { return this.inner.buildLocalState(dag); }
   applyMerge(a: MergeAction[], l: VaultState, r: VaultState): Promise<{ deferred: Set<string>; deferredConflicts: Set<string> }> { return this.inner.applyMerge(a, l, r); }
   async clearPendingOps(): Promise<void> {
     if (this.armed) { this.armed = false; throw new Error('simulated crash after push, before clearOps'); }
@@ -54,8 +55,8 @@ class CrashOnFirstClearHost implements VaultSyncHost {
   }
   loadCursor(): Promise<number> { return this.inner.loadCursor(); }
   saveCursor(c: number): Promise<void> { return this.inner.saveCursor(c); }
-  recordVersionEdges(ops: Operation[]): Promise<VersionDag> { return this.inner.recordVersionEdges(ops); }
-  dagNeedsRebuild(): Promise<boolean> { return this.inner.dagNeedsRebuild(); }
+  recordVersionEdges(ops: Operation[], dag: VersionDag): Promise<VersionDag> { return this.inner.recordVersionEdges(ops, dag); }
+  dagNeedsRebuild(dag: VersionDag): Promise<boolean> { return this.inner.dagNeedsRebuild(dag); }
 }
 
 /**
