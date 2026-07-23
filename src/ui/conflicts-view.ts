@@ -131,12 +131,20 @@ export class ConflictsView extends ItemView {
     setIcon(title.createSpan('vault-sync-conflict-path-icon'), c.kind === 'delete' ? 'trash-2' : 'image');
     title.createSpan({ text: c.path });
 
+    // Explanation, then any per-side detail, then the decision buttons last — so the
+    // buttons always sit at the bottom of the card, below the context they act on.
     const body = card.createDiv('vault-sync-conflict-note');
+    if (c.kind === 'binary' && c.binary) {
+      const b = c.binary;
+      const sides = card.createDiv('vault-sync-binary-sides');
+      this.renderBinarySide(sides, 'This device', b.localBytes, b.localDevice, b.localAt);
+      this.renderBinarySide(sides, 'Other device', b.remoteBytes, b.remoteDevice, b.remoteAt);
+    }
     const actions = card.createDiv('vault-sync-conflict-actions');
 
     const resolve = (decision: ConflictDecision) => {
       // Optimistically disable the whole card while the applying round runs.
-      actions.querySelectorAll('button').forEach(b => (b as HTMLButtonElement).disabled = true);
+      actions.querySelectorAll('button').forEach(btn => (btn as HTMLButtonElement).disabled = true);
       void this.host.resolveDeleteBinary(c.fileId, decision);
     };
 
@@ -152,14 +160,8 @@ export class ConflictsView extends ItemView {
       new ButtonComponent(actions).setButtonText('Keep deleted')
         .onClick(() => resolve({ kind: 'delete', decision: 'keep_deleted' }));
     } else {
-      const b = c.binary;
       body.setText('Changed on two devices at once. Binary files can\'t be merged — keep one whole ' +
         'version (the other stays in the sync history and can be recovered later).');
-      if (b) {
-        const sides = card.createDiv('vault-sync-binary-sides');
-        this.renderBinarySide(sides, 'This device', b.localBytes, b.localDevice, b.localAt);
-        this.renderBinarySide(sides, 'Other device', b.remoteBytes, b.remoteDevice, b.remoteAt);
-      }
       new ButtonComponent(actions).setButtonText("Keep this device's version").setCta()
         .onClick(() => resolve({ kind: 'binary', decision: 'keep_local' }));
       new ButtonComponent(actions).setButtonText("Keep other device's version")
