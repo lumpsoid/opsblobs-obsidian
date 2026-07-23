@@ -27,6 +27,51 @@ not effort.
 
 ---
 
+## Decisions of record
+
+Choices made while remediating (so the *why* behind the shipped code isn't lost). Each links
+to the finding it resolves.
+
+**2026-07-23 — P0 remediation pass** (all seven P0 items landed; see §7 checklist):
+
+1. **Onboarding layout (§1.1).** Reorganize into a **Setup** section (4 required fields under a
+   live readiness checklist), everyday **Sync** controls, then two `<details>` disclosures:
+   **Advanced** (debounce, sync .obsidian, ancestor retention, exclusions) and **Maintenance &
+   danger zone** (clear cache, re-check, reset, re-baseline). No setting was removed.
+   **Rejected:** auto-opening the settings tab on first install — kept install non-intrusive.
+2. **Access token is a required field (§1.2).** `missingConfigFields()` is the single source of
+   truth for "what's left to configure" and **includes the token**, so a missing token is named
+   up front instead of surfacing as a mid-sync `AuthError`. The finish-setup notice names the
+   actual missing fields and links to settings.
+3. **Conflicts view is a main-area tab, not a sidebar (§3, §6).** `activateConflictsView` uses
+   `workspace.getLeaf('tab')` — a first-class view that reads far better on mobile than a
+   slide-over drawer. **Reveal behavior:** a *manual* sync that newly introduces text conflicts
+   opens the tab; an *auto* (unattended) sync raises a persistent, actionable notice instead of
+   stealing focus. "Newly introduced" is measured off the two-headed (text) conflict count, so a
+   periodic auto-sync doesn't nag every round while the same conflicts sit unresolved.
+4. **No emojis in user-facing UI — use color (§5, cross-cutting).** Notices convey status by
+   **color** (theme vars, e.g. `--text-error`), not glyphs. Applied to the new setup-error
+   notice and the sync-complete / sync-failed toasts (the `✅`/`❌` were dropped). *Not yet swept:*
+   pre-existing status-bar / status-modal text symbols (`⚠ ⟳ ✓`) — a full de-emoji sweep is still
+   open. Recorded as a standing preference for future work.
+5. **Setup-class errors get a durable, actionable surface (§5).** `isSetupError()` classifies
+   auth / 404 / key-mismatch / decrypt as *setup* failures → a persistent (non-fading),
+   color-flagged notice with an **Open settings** action, via a new `Notifier.setupError`.
+   Transient transport errors (network / timeout / 5xx) keep the fading toast since they
+   self-retry. Both still record to the status modal. `openSettings` is injected into the
+   coordinator so it stays obsidian-free.
+
+**Open / deferred decisions:**
+
+- **Vocabulary for the two conflicting sides (§2, P1) — UNDECIDED.** Leaning toward standardizing
+  on **"Mine" / "Theirs"** (panel already uses it; user-preferred for casual users) with the
+  ancestor renamed from "Base" to a plainer term, and the inline note markers possibly relabeled
+  (parsing is by sigil, so relabeling is safe + back-compatible). The delete/modify modal likely
+  stays outcome-based ("Keep modified" / "Keep deleted"), where "Mine/Theirs" is ambiguous. Not
+  yet chosen or implemented.
+
+---
+
 ## 0. The full UX surface (so nothing is audited that users never see)
 
 | File | Component | Live? |
@@ -62,32 +107,28 @@ three commands, and the tab — nothing prompts or opens settings on first insta
 
 Findings:
 
-1. **P0 — required order is implicit and undiscoverable.** Success requires, in order:
-   Server URL (`settings-tab.ts:71`), Vault ID (`:83`), Access token (`:95`), Vault
-   passphrase (`:135`), then Test connection (`:108`), then Sync. Nothing states this order,
-   states that all four are mandatory, or visually separates the 4 required fields from the
-   ~10 optional/advanced ones below them.
-   **Fix:** a first-run **Setup** section at the top that (a) groups the 4 required fields,
-   (b) shows a live readiness checklist ("Server URL ✓ · Vault ID ✓ · Token ✗ · Passphrase
-   ✗"), and (c) gates/hides advanced settings behind an "Advanced" disclosure until the
-   basics are set. Optionally open the settings tab automatically on first install when
-   unconfigured.
+1. **P0 — required order is implicit and undiscoverable. ✅ SHIPPED (decision 1).** Success
+   requires, in order: Server URL, Vault ID, Access token, Vault passphrase, then Test
+   connection, then Sync. Nothing stated this order or separated the required fields from the
+   ~10 optional ones.
+   **Shipped:** a **Setup** section groups the 4 required fields under a live readiness
+   checklist (✓/✗ per field, updating as you type); dev knobs and maintenance actions moved
+   under Advanced / Danger-zone disclosures. Auto-open-on-install was considered and **not**
+   done (kept install non-intrusive).
 
-2. **P0 — the "configure first" toast names the wrong fields.** Ribbon/sync-before-config →
-   `main.ts:390` (and duplicate at `:499`): *"configure a server and passphrase in Settings →
-   Vault Sync first."* But `isServerConfigured()` (`main.ts:294`) also requires `vaultId` and
-   the code path also needs a token. A user with URL+passphrase but no Vault ID gets a
-   message that doesn't name the missing field.
-   **Fix:** compute which fields are missing and name them; route the toast to open the
-   settings tab (a Notice with an action, or open-settings on click).
+2. **P0 — the "configure first" toast names the wrong fields. ✅ SHIPPED (decision 2).** The old
+   toast said *"configure a server and passphrase"* regardless of what was actually missing,
+   and dead-ended.
+   **Shipped:** `missingConfigFields()` computes the concrete missing fields (incl. the access
+   token) and the notice names them + carries an "Open Vault Sync settings" link. `testConnection`
+   uses the same list.
 
-3. **P0 — the second-device / join flow is explained nowhere in the UI.** The only hints are
-   buried helper text (`:85`, `:129-131`, `fingerprintDesc()` `:334`). Nothing tells a user
-   that device 2 needs the *same* Vault ID + passphrase + a token, where the token comes
-   from, or that the fingerprint is the cross-device check. This is the single most common
-   real-world task (sync a second device) and it has no first-class explanation.
-   **Fix:** a short "Add another device" help block (collapsible) in the Server section
-   stating exactly the three values to copy and how the fingerprint confirms a match.
+3. **P0 — the second-device / join flow is explained nowhere in the UI. ✅ SHIPPED.** Nothing told
+   a user that device 2 needs the same Vault ID + passphrase + a token, or that the fingerprint
+   is the cross-device check.
+   **Shipped:** a collapsible **"Add another device"** block in the Setup section names the three
+   values to copy and explains that the Key fingerprint must match (and that a mismatch means the
+   passphrases differ and sync will refuse to mix them).
 
 4. **P1 — fingerprint verification assumes the user already knows to compare it.**
    `Key fingerprint` (`settings-tab.ts:148`) shows a raw string + "must match on every
@@ -139,7 +180,8 @@ Additional copy findings:
   Internal names are fine; ensure the *UI label* is the only thing users see (it is) — but
   align the setting value name to reduce contributor confusion (P2, code-hygiene).
 - **P2 — "Bearer token" jargon** (`settings-tab.ts:96`). Call it "Access token" (the label
-  already does) and drop "Bearer" from the description.
+  already does) and drop "Bearer" from the description. **✅ DONE** (dropped in the §1.1 reorg;
+  description now "Token authorizing this device for the vault.").
 
 ---
 
@@ -156,14 +198,14 @@ user, and blocking-vs-nonblocking is inconsistent.
 
 Findings:
 
-- **P0 — conflicts are hard to discover.** The text-conflict panel only opens if the user
-  clicks the status bar *while conflicts exist*, runs the "Open conflicts panel" command, or
-  clicks the ribbon (which **syncs**, not opens). Nothing auto-reveals it after a sync that
-  produced conflicts. On mobile the status bar may be absent, leaving only the command
-  palette.
-  **Fix:** after a round that leaves conflicts, surface a persistent, actionable entry point
-  (a Notice with an "Open conflicts" action and/or auto-open the panel on the first
-  conflicting round).
+- **P0 — conflicts are hard to discover. ✅ SHIPPED (decision 3).** The text-conflict view only
+  opened via a status-bar click, the command, or the ribbon (which syncs). Nothing revealed it
+  after a round that produced conflicts.
+  **Shipped:** a round that *newly* introduces text conflicts now surfaces them — a manual sync
+  opens the conflicts view; an unattended auto sync raises a persistent, actionable "Open
+  conflicts" notice (no surprise focus change). The rise is keyed off the two-headed count so a
+  periodic auto-sync doesn't nag. The view also moved from the right sidebar to a **main-area
+  tab** (better on mobile). The command-palette route ("Open conflicts") is retained.
 - **P1 — blocking vs waiting is inconsistent and unexplained.** Text waits (panel); delete/
   binary block (modal) but only on manual sync, and are silently deferred on auto sync.
   A user who only auto-syncs may never see a delete/binary decision unless they open the
@@ -190,16 +232,14 @@ Findings:
 Every setting sits in one flat list, mixing four mandatory basics, several everyday options,
 and four expert/maintenance actions. Findings:
 
-- **P1 — expert controls interleaved with basics:** **Debounce delay** (`:200`, milliseconds,
-  "recording an operation") and **Ancestor retention** (`:260`, "ancestor content", "garbage
-  collection") are developer-facing and sit in the main list. **Fix:** move under an
-  "Advanced" disclosure; restate consequences in plain terms.
-- **P1 — the most dangerous action is visually equal to the safest.** **Re-baseline this
-  device to the server** (`:314`) can overwrite other devices' concurrent edits, yet is
-  styled identically to **Clear sync cache** (`:273`, explicitly "Safe"). Both are `setWarning`
-  at the bottom. **Fix:** a distinct "Danger zone" grouping; strongest wording + double-confirm
-  for re-baseline (it *does* confirm today via `ConfirmModal`, `main.ts:503-514` — keep, but
-  escalate copy).
+- **P1 — expert controls interleaved with basics. ✅ DONE (with decision 1).** Debounce delay and
+  Ancestor retention (plus sync-.obsidian and exclusions) were developer-facing but in the main
+  list. **Shipped:** all moved under the **Advanced** `<details>` disclosure.
+- **P1 — the most dangerous action is visually equal to the safest. ◑ PARTIAL (with decision 1).**
+  Re-baseline could overwrite other devices' edits yet was styled like the "Safe" Clear cache.
+  **Shipped:** clear cache / re-check / reset / re-baseline are grouped under a **Maintenance &
+  danger zone** disclosure. **Still open:** distinct danger-styling for re-baseline vs the safe
+  actions, and escalated double-confirm copy (the single `ConfirmModal` is retained).
 - **P2 — "Clear sync cache" is styled as a warning but fires unguarded** (`:273`, no
   `ConfirmModal`). Its desc says "Safe", so acceptable; either drop the warning styling or add
   a confirm for consistency.
@@ -218,12 +258,12 @@ The typed error family (`sync-errors.ts`) is **good** — messages name the knob
 (`AuthError`→token, `NotFoundError`→URL/vault, `KeyMismatchError`/`DecryptError`→passphrase,
 `Network`/`Timeout`→connection). Remaining rough edges are about *how/where* state is shown:
 
-- **P0/P1 — setup-time errors surface as a transient toast.** Every failure toasts
-  `❌ Sync failed: {message}` (`sync-coordinator.ts:142`) and then fades; the persistent copy
-  lives only in the status modal's "Last error" (`sync-status-modal.ts:108`), which the user
-  must know to open. Auth/404/key-mismatch are *setup* problems that need durable, actionable
-  presentation. **Fix:** for the setup-class typed errors, show a persistent banner (or route
-  the user to the Test-connection result), not just a fading toast.
+- **P0/P1 — setup-time errors surface as a transient toast. ✅ SHIPPED (decisions 4 & 5).** Every
+  failure toasted then faded; the durable copy lived only in the status modal's "Last error".
+  **Shipped:** `isSetupError()` classifies auth / 404 / key-mismatch / decrypt as setup failures
+  → a persistent, **color-flagged (no emoji)** notice with an "Open settings" action (new
+  `Notifier.setupError`). Transient transport errors keep the fading toast (they self-retry). The
+  `✅`/`❌` were dropped from the complete/failed toasts per the no-emoji decision.
 - **P1 — `{operation}` fragments read technical** ("pushing ops", "pulling") inside otherwise-
   friendly sentences (`ServerError`/`NetworkError`/`TimeoutError`). **Fix:** map to plain
   phrases ("uploading your changes", "downloading changes").
