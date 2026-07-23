@@ -110,4 +110,26 @@ a.vault-sync-notice-link { display: inline-block; margin-top: 0.4rem; text-decor
   .vault-sync-pane:not(:last-child) { border-bottom: 1px solid var(--background-modifier-border); }
   .vault-sync-pane-code { font-size: 0.85rem; max-height: none; }
   .vault-sync-pane-label { font-size: 0.8rem; }
+
+  /* Touch targets (UX audit §6): the per-hunk, global, and footer buttons sit at
+     default desktop sizing with a 0.4rem gap — too small/tight for a thumb. Give
+     them a ~44px min height, roomier padding, and more spacing under the breakpoint.
+     The conflict/confirm modal buttons get the same treatment so a phone tap can't
+     miss. */
+  .vault-sync-conflict-global,
+  .vault-sync-hunk-actions,
+  .vault-sync-conflict-actions,
+  .delete-conflict-buttons,
+  .binary-conflict-buttons,
+  .confirm-modal-buttons { gap: 0.6rem; }
+  .vault-sync-conflict-global button,
+  .vault-sync-hunk-actions button,
+  .vault-sync-conflict-actions button,
+  .delete-conflict-buttons button,
+  .binary-conflict-buttons button,
+  .confirm-modal-buttons button {
+    min-height: 44px;
+    padding: 0.5rem 1rem;
+    flex-grow: 1;
+  }
 }
