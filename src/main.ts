@@ -514,6 +514,14 @@ export default class VaultSyncPlugin extends Plugin {
     const writePerf = sink ? { writeMs: 0, writeTmpMs: 0, existsMs: 0, removeMs: 0, renameMs: 0 } : null;
     this.contentStore.capturePutPerf = putPerf;
     this.metadata.captureWritePerf = writePerf;
+    // The `otherMs` sub-split (oplog-append-journal-spec §3 Step 1): attribute the
+    // per-checkpoint registry+oplog rewrites — and, within each, serialize CPU vs native
+    // write — so we cut the half that dominates and know if it's CPU or the bridge. Same
+    // sink-gated arming as put/write perf, so a normal enable pays nothing.
+    const oplogPerf = sink ? { stringifyMs: 0, writeMs: 0 } : null;
+    const flushPerf = sink ? { stringifyMs: 0, writeMs: 0 } : null;
+    this.opLogger.captureOplogPerf = oplogPerf;
+    this.registry.captureFlushPerf = flushPerf;
     // Only surface a progress UI for a *large* first-enable — a routine capture (a
     // handful of changed files) fires the callback at most once and should stay quiet.
     let announced = false;
@@ -559,10 +567,27 @@ export default class VaultSyncPlugin extends Plugin {
       sink?.(`captureOfflineChanges put.otherMs`, stats.putMs - encodeMs - writeMs - writeTmpMs - existsMs - removeMs - renameMs);
     }
     sink?.(`captureOfflineChanges otherMs`, stats.totalMs - stats.readMs - stats.hashMs - stats.putMs - stats.flushMs);
+    // The otherMs split (oplog-append-journal-spec §3 Step 1): the two per-checkpoint
+    // rewrites that make up otherMs, so both this spec and the registry one act on numbers.
+    sink?.(`captureOfflineChanges regFlushMs`, stats.regFlushMs);
+    sink?.(`captureOfflineChanges oplogSaveMs`, stats.oplogSaveMs);
+    // The residual after attributing the two rewrites — expect ≈ 0, confirming the
+    // checkpoint rewrites ARE the whole of otherMs (not hidden loop overhead).
+    sink?.(`captureOfflineChanges otherResidualMs`, stats.totalMs - stats.readMs - stats.hashMs - stats.putMs - stats.flushMs - stats.regFlushMs - stats.oplogSaveMs);
+    // The serialize-vs-write sub-split within each rewrite — decides whether the cost is
+    // serialize CPU (quadratic JSON.stringify) or the MB-scale native write on the bridge.
+    if (oplogPerf && flushPerf) {
+      sink?.(`captureOfflineChanges oplog.stringifyMs`, oplogPerf.stringifyMs);
+      sink?.(`captureOfflineChanges oplog.writeMs`, oplogPerf.writeMs);
+      sink?.(`captureOfflineChanges reg.stringifyMs`, flushPerf.stringifyMs);
+      sink?.(`captureOfflineChanges reg.writeMs`, flushPerf.writeMs);
+    }
     sink?.(`captureOfflineChanges total${heapNote()}`, stats.totalMs);
     // Disarm the diagnostics so nothing accumulates outside the capture pass.
     this.contentStore.capturePutPerf = null;
     this.metadata.captureWritePerf = null;
+    this.opLogger.captureOplogPerf = null;
+    this.registry.captureFlushPerf = null;
     // Capture done — the modal's indexing section clears itself once this reads null.
     this.indexingProgress = null;
     if (announced) {

@@ -43,7 +43,20 @@ export interface CaptureStats {
   hashMs: number;       // Σ hashContent
   putMs: number;        // Σ contentStore.putNew (base64 encode + buffer push; pack-writes moved the fs write to flushMs)
   flushMs: number;      // Σ contentStore.flushPack (the per-checkpoint pack + index appends — A3 pack-writes)
+  regFlushMs: number;   // Σ registry.flush wall time at capture checkpoints (the OTHER half of otherMs — registry-checkpoint-cost-spec.md)
+  oplogSaveMs: number;  // Σ oplog-persist wall time (serialize + append the delta) at capture checkpoints (THIS spec — oplog-append-journal-spec.md §4)
   totalMs: number;      // wall time of the whole pass
+}
+
+/** When non-null, {@link OperationLogger}'s capture-path `saveOpLog` records its
+ *  serialize (JSON.stringify) time apart from its native-write time here — the
+ *  load-bearing sub-split of the checkpoint oplog rewrite (docs/oplog-append-journal-spec.md
+ *  §3 Step 1: is the O(N²) whole-array rewrite CPU or the bridge?). Set by `main.ts`
+ *  around the first-enable capture only (sink-gated), so a normal enable pays nothing;
+ *  null by default → zero overhead. Mirrors `FileRegistry.captureFlushPerf`. */
+export interface OplogPerf {
+  stringifyMs: number;  // Σ JSON.stringify(delta ops) at capture checkpoints
+  writeMs: number;      // Σ metadata.append of the delta bytes to the oplog journal at capture checkpoints
 }
 
 const OPLOG_DIR = '.vault-sync';
@@ -63,11 +76,26 @@ const CAPTURE_CHECKPOINT_EVERY = 200;
 
 export class OperationLogger {
   private pendingOps: Operation[] = [];
+  /** How many leading ops of {@link pendingOps} are already durable in the on-disk
+   *  NDJSON journal at {@link OPLOG_PATH}. The append hot path persists only the
+   *  unwritten tail (`pendingOps.slice(oplogPersistedCount)`) and advances this only
+   *  after the `append` succeeds — so a failed/retried checkpoint re-appends the same
+   *  delta once, never twice, and never skips it (spec §5 inv. 4). A full rewrite
+   *  (`clearOps`, `pruneCreateDeletePair`) resets it to `pendingOps.length`, and
+   *  `load()` sets it to the count replayed from disk. */
+  private oplogPersistedCount = 0;
   private debounceTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   /** Notified whenever the pending oplog is persisted — i.e. an op was
    *  recorded, cleared, or cancelled. Lets the UI reflect "changes to sync"
    *  the instant a (debounced) edit lands, without polling. */
   private changeListener: (() => void) | null = null;
+
+  /** When non-null, the capture-path `saveOpLog` records its serialize-vs-write
+   *  sub-split here (A3 capture diagnostics, docs/oplog-append-journal-spec.md §3
+   *  Step 1). Set by `main.ts` around the first-enable capture; null otherwise → zero
+   *  overhead. Only the capture path arms this — the per-op live `recordOp` save is not
+   *  measured (this attributes the first-enable checkpoint cost, not steady-state edits). */
+  captureOplogPerf: OplogPerf | null = null;
 
   constructor(
     private files: VaultFiles,
@@ -101,8 +129,24 @@ export class OperationLogger {
   // ─── Lifecycle ────────────────────────────────────────────────────────────
 
   async load(): Promise<void> {
+    // The oplog is a line-oriented NDJSON journal (one op per line) — the capture hot
+    // path *appends* only each checkpoint's delta ops rather than rewriting the whole
+    // growing array (spec §4, the O(N²)→O(N) cut). Replay it line by line, tolerating a
+    // torn trailing line from a crash mid-append: a final line that won't parse is dropped
+    // (its op simply re-captures next enable — no persisted op references an unwritten
+    // blob, since blobs flush before the oplog append). A pre-journal single-array file
+    // (old on-disk format) parses to zero lines and loads empty — `.vault-sync/` is
+    // disposable (rebuild), so no migration is carried (ground rule §0).
     const raw = await this.metadata.read(OPLOG_PATH);
-    this.pendingOps = raw === null ? [] : (JSON.parse(raw) as Operation[]);
+    const ops: Operation[] = [];
+    if (raw !== null) {
+      for (const line of raw.split('\n')) {
+        if (!line) continue;
+        try { ops.push(JSON.parse(line) as Operation); } catch { /* torn/partial line — skip */ }
+      }
+    }
+    this.pendingOps = ops;
+    this.oplogPersistedCount = ops.length;
   }
 
   /**
@@ -149,7 +193,7 @@ export class OperationLogger {
     // phase (docs/startup-capture-optimization-spec.md §3). Every return path below
     // (abort, normal end) returns these partial-or-full totals.
     const startedAt = nowMs();
-    const stats: CaptureStats = { files: 0, opsEmitted: 0, readMs: 0, hashMs: 0, putMs: 0, flushMs: 0, totalMs: 0 };
+    const stats: CaptureStats = { files: 0, opsEmitted: 0, readMs: 0, hashMs: 0, putMs: 0, flushMs: 0, regFlushMs: 0, oplogSaveMs: 0, totalMs: 0 };
 
     // Batch the registry writes. Without this each file re-serialized the WHOLE
     // registry (registerFile + setHeadVersion each save()), so the pass was O(F²) —
@@ -178,8 +222,14 @@ export class OperationLogger {
         const tf = nowMs();
         await this.contentStore.flushPack();
         stats.flushMs += nowMs() - tf;
+        const tr = nowMs();
         await this.registry.flush();
-        if (changed) await this.saveOpLog();
+        stats.regFlushMs += nowMs() - tr;
+        if (changed) {
+          const to = nowMs();
+          await this.appendOpLog();
+          stats.oplogSaveMs += nowMs() - to;
+        }
         stats.totalMs = nowMs() - startedAt;
         return stats;
       }
@@ -280,8 +330,12 @@ export class OperationLogger {
         const tf = nowMs();
         await this.contentStore.flushPack();
         stats.flushMs += nowMs() - tf;
+        const tr = nowMs();
         await this.registry.flush();
-        await this.saveOpLog();
+        stats.regFlushMs += nowMs() - tr;
+        const to = nowMs();
+        await this.appendOpLog();
+        stats.oplogSaveMs += nowMs() - to;
         this.contentStore.clearMemCache();
         sinceCheckpoint = 0;
       }
@@ -337,12 +391,24 @@ export class OperationLogger {
     const tf = nowMs();
     await this.contentStore.flushPack();
     stats.flushMs += nowMs() - tf;
+    const tr = nowMs();
     await this.registry.flush();
-    if (changed) await this.saveOpLog();
+    stats.regFlushMs += nowMs() - tr;
+    if (changed) {
+      const to = nowMs();
+      await this.appendOpLog();
+      stats.oplogSaveMs += nowMs() - to;
+    }
     stats.totalMs = nowMs() - startedAt;
     return stats;
     } finally {
       this.registry.resumeSaves();
+      // Fold the first-enable journal (~F append lines) into one clean snapshot before
+      // steady state (registry-append-journal-spec §3.1) — a single full write vs all 42
+      // of the old per-checkpoint rewrites. Off the hot path (post-resumeSaves), and safe
+      // on an abort/throw: it snapshots the partial-but-consistent registry (registry ahead
+      // of the oplog → rebaseline heals). compact() no-ops if nothing was journalled.
+      await this.registry.compact();
     }
   }
 
@@ -404,7 +470,7 @@ export class OperationLogger {
       changed = true;
     }
 
-    if (changed) await this.saveOpLog();
+    if (changed) await this.appendOpLog();
   }
 
   startListening(): void {
@@ -569,7 +635,9 @@ export class OperationLogger {
     // a phantom, audit-G-adjacent leak). The registry tombstone above still
     // stands. Persist the pruned log ourselves, since we skip `recordOp`.
     if (this.pruneCreateDeletePair(entry.id)) {
-      await this.saveOpLog();
+      // The prune is a shrink (drops the create + its file's ops), breaking append-only —
+      // compact the journal with a full rewrite rather than an append (spec §4.2).
+      await this.rewriteOpLog();
       return;
     }
 
@@ -613,7 +681,9 @@ export class OperationLogger {
 
   async clearOps(): Promise<void> {
     this.pendingOps = [];
-    await this.saveOpLog();
+    // A shrink (drain to empty) breaks append-only, so compact the journal with a full
+    // rewrite (here: truncate to an empty file) rather than an append (spec §4.2).
+    await this.rewriteOpLog();
   }
 
   /**
@@ -650,14 +720,64 @@ export class OperationLogger {
 
   private async recordOp(op: Operation): Promise<void> {
     this.pendingOps.push(op);
-    await this.saveOpLog();
+    await this.appendOpLog();
   }
 
-  private async saveOpLog(): Promise<void> {
+  /**
+   * The oplog hot path: append only the unwritten tail of {@link pendingOps} to the
+   * NDJSON journal — O(delta), not O(N) (spec §4.1). Used by the capture checkpoints
+   * and live single-op `recordOp`, where `pendingOps` only ever grows since the last
+   * persist. `oplogPersistedCount` advances only after the `append` resolves, so a
+   * throw leaves the marker un-advanced and the same delta re-appends once on retry —
+   * never twice, never skipped (spec §5 inv. 4). Persisting the HLC + notifying is
+   * shared with the rewrite path via {@link finishOpLog}.
+   */
+  private async appendOpLog(): Promise<void> {
+    const delta = this.pendingOps.slice(this.oplogPersistedCount);
+    if (delta.length > 0) {
+      await this.ensureOplogDir();
+      // Serialize-vs-write sub-split (sink-gated): attribute the checkpoint cost to the
+      // JSON.stringify (CPU) vs the native append (bridge). Step 1 measured the whole-array
+      // rewrite as ~86% native write; the append cuts BOTH — only the delta ops are
+      // serialized (stringifyMs → O(delta)) and only the delta bytes are appended
+      // (writeMs → O(delta)) — so this same split now confirms the post-fix floor.
+      const ts = nowMs();
+      const data = delta.map(op => JSON.stringify(op)).join('\n') + '\n';
+      if (this.captureOplogPerf) this.captureOplogPerf.stringifyMs += nowMs() - ts;
+      const tw = nowMs();
+      await this.metadata.append(OPLOG_PATH, data);
+      if (this.captureOplogPerf) this.captureOplogPerf.writeMs += nowMs() - tw;
+      this.oplogPersistedCount = this.pendingOps.length;
+    }
+    await this.finishOpLog();
+  }
+
+  /**
+   * The cold path: rewrite the whole journal from the current (shrunken) `pendingOps`.
+   * Used only by the two rare shrink events that break append-only — `clearOps` (drain
+   * to empty → an empty file) and `pruneCreateDeletePair` (a `filter` that drops a
+   * file's ops) — both off the capture hot path, so an O(N) full write is fine (spec
+   * §4.2). Resets `oplogPersistedCount` so a subsequent append doesn't re-emit or skip
+   * anything. Written atomically (`metadata.write`) so a reader never sees a torn file.
+   */
+  private async rewriteOpLog(): Promise<void> {
+    await this.ensureOplogDir();
+    const data = this.pendingOps.length === 0
+      ? ''
+      : this.pendingOps.map(op => JSON.stringify(op)).join('\n') + '\n';
+    await this.metadata.write(OPLOG_PATH, data);
+    this.oplogPersistedCount = this.pendingOps.length;
+    await this.finishOpLog();
+  }
+
+  private async ensureOplogDir(): Promise<void> {
     if (!(await this.metadata.exists(OPLOG_DIR))) {
       await this.metadata.mkdir(OPLOG_DIR);
     }
-    await this.metadata.write(OPLOG_PATH, JSON.stringify(this.pendingOps, null, 2));
+  }
+
+  /** Shared tail of both persist paths: durable-HLC + observer notify. */
+  private async finishOpLog(): Promise<void> {
     // Persist the current logical time whenever we persist ops (F7). This is the
     // per-op cadence; `main.ts` additionally persists after each sync round and
     // on unload, so time issued outside op-recording (merge/setCurrent) is durable.

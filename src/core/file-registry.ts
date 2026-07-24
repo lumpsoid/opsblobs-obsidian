@@ -11,15 +11,40 @@ import { MetadataStore } from '../ports/metadata-store';
 import { VaultFiles, VaultFileStat } from '../ports/vault-files';
 import { VersionDag } from './version-dag';
 import { hlcCompare, hlcToString } from './hlc';
+import { nowMs } from './perf-clock';
 import { isExcluded } from './exclusion-policy';
 import { randomUuid } from './encoding';
 
+const REGISTRY_DIR = '.vault-sync';
 const REGISTRY_PATH = '.vault-sync/file-registry.json';
+/** The append-only NDJSON journal of entry mutations since the last snapshot
+ *  (docs/registry-append-journal-spec.md §1). Each checkpoint `flush()` appends
+ *  only the touched entries here (O(delta)) rather than rewriting the whole
+ *  snapshot (O(N)); `compact()` folds it back into {@link REGISTRY_PATH} and
+ *  truncates it. Mirrors `ContentStore`'s pack/index journal. */
+const REGISTRY_JOURNAL_PATH = '.vault-sync/file-registry.journal';
 
 type SerializedRegistry = {
   version: number;
   entries: Array<[string, FileEntry]>;   // [uuid, entry]
 };
+
+/** A hard-delete journal record — a `{del:<uuid>}` line removes the id from the
+ *  Map on replay (the `adoptRemote` divergent-duplicate drop). Distinct from an
+ *  entry's ordinary `deleted:true` *tombstone flag*, which is a normal upsert. */
+type JournalDelete = { del: string };
+
+/** When non-null, {@link FileRegistry.flush} accumulates its serialize (JSON.stringify)
+ *  time apart from its native-write time here — the load-bearing sub-split of the
+ *  first-enable checkpoint cost (docs/oplog-append-journal-spec.md §3 Step 1: is the
+ *  per-checkpoint registry rewrite CPU or the bridge?). Set by `main.ts` around the
+ *  first-enable capture only (sink-gated), so a normal enable pays nothing; null by
+ *  default → zero overhead. Mirrors `ContentStore.capturePutPerf` /
+ *  `ObsidianMetadataStore.captureWritePerf`. */
+export interface FlushPerf {
+  stringifyMs: number;  // Σ JSON.stringify(the touched-entry delta) at capture checkpoints
+  writeMs: number;      // Σ metadata.append of the delta to the journal at capture checkpoints
+}
 
 export class FileRegistry {
   private entries: Map<string, FileEntry> = new Map();  // uuid → entry
@@ -30,8 +55,26 @@ export class FileRegistry {
    *  autosave so it doesn't re-serialize the WHOLE registry once per file (the O(F²)
    *  rewrite that saturates GC on mobile), then `flush()`es periodically. */
   private deferSave = false;
-  /** A suspended mutation happened since the last write — `flush()` has work to do. */
-  private dirty = false;
+  /** Ids upserted-or-hard-deleted since the last `flush()` append — the delta a
+   *  checkpoint must journal. Resolved against the live Map at flush time: still
+   *  present → an upsert line, gone → a `{del}` line. A single Set collapses any
+   *  number of intra-window mutations to the same id into one appended line
+   *  (register → setHeadVersion → recordStat → one line). */
+  private dirtyIds: Set<string> = new Set();
+
+  /** Journal accounting since the last snapshot, for the compaction size-valves
+   *  (docs/registry-append-journal-spec.md §3). `journalBytes`/`journalRecords`
+   *  grow with each append and reset on `compact()`; `snapshotBytes` is the size
+   *  of the current on-disk snapshot. Tracked in-memory so the valve needs no
+   *  extra read. */
+  private journalBytes = 0;
+  private journalRecords = 0;
+  private snapshotBytes = 0;
+
+  /** When non-null, `flush()` records its serialize-vs-write sub-split here (A3 capture
+   *  diagnostics, docs/oplog-append-journal-spec.md §3 Step 1). Set by `main.ts` around
+   *  the first-enable capture; null otherwise → zero overhead. */
+  captureFlushPerf: FlushPerf | null = null;
 
   constructor(
     private metadata: MetadataStore,
@@ -42,39 +85,108 @@ export class FileRegistry {
 
   // ─── Persistence ──────────────────────────────────────────────────────────
 
+  /** Rebuild the in-memory Map from the on-disk snapshot, then replay the
+   *  append-journal over it last-write-wins (docs/registry-append-journal-spec.md §3).
+   *  The Map produced is byte-identical to the pre-journal format's, so every
+   *  consumer (`getById`/`getByPath`/`referencedHashes`/…) is untouched. A torn
+   *  trailing journal line (crash mid-append) is dropped — append only ever cuts the
+   *  end, so interior lines are intact; a dropped tail strands that file (registry
+   *  slightly behind → rebaseline heals), never orphans an op (§4). An old flat
+   *  `file-registry.json` with no journal loads exactly as before (§5 migration). */
   async load(): Promise<void> {
-    const raw = await this.metadata.read(REGISTRY_PATH);
-    if (raw === null) {
-      // Registry doesn't exist yet — start fresh
-      this.entries = new Map();
-      this.pathIndex = new Map();
-      return;
+    const snapRaw = await this.metadata.read(REGISTRY_PATH);
+    this.entries = snapRaw
+      ? new Map((JSON.parse(snapRaw) as SerializedRegistry).entries)
+      : new Map();
+    this.snapshotBytes = snapRaw?.length ?? 0;
+
+    const jrnl = await this.metadata.read(REGISTRY_JOURNAL_PATH);
+    let records = 0;
+    if (jrnl !== null) {
+      for (const line of jrnl.split('\n')) {
+        if (line === '') continue;
+        let rec: JournalDelete | FileEntry;
+        try { rec = JSON.parse(line); } catch { continue; } // torn trailing line → drop
+        if (typeof (rec as JournalDelete).del === 'string') {
+          this.entries.delete((rec as JournalDelete).del);
+        } else if (typeof (rec as FileEntry).id === 'string') {
+          this.entries.set((rec as FileEntry).id, rec as FileEntry); // last-write-wins
+        }
+        records++;
+      }
     }
-    const data = JSON.parse(raw) as SerializedRegistry;
-    this.entries = new Map(data.entries);
+    this.journalBytes = jrnl?.length ?? 0;
+    this.journalRecords = records;
+
     this.rebuildPathIndex();
+    this.dirtyIds.clear();
+    await this.maybeCompactOnLoad();
   }
 
-  async save(): Promise<void> {
-    this.dirty = true;
+  async save(id?: string): Promise<void> {
+    if (id !== undefined) this.dirtyIds.add(id);
     if (this.deferSave) return;   // batched — defer the write to flush()
     await this.flush();
   }
 
-  /** Write the registry to disk if a mutation is pending (a no-op otherwise). The
-   *  actual persistence, used both by the per-mutation `save()` and, while saves are
-   *  suspended, by a batch's explicit checkpoint. */
+  /** Append the touched-entry delta to the journal if any mutation is pending (a
+   *  no-op otherwise) — O(delta), not the former O(N) whole-registry rewrite. Used
+   *  both by the per-mutation `save()` and, while saves are suspended, by a batch's
+   *  explicit checkpoint. Resolves each touched id against the live Map: present →
+   *  an upsert line, gone → a `{del}` line. Off the deferred (capture) path it also
+   *  runs the compaction size-valve so a long-lived interactive session can't grow
+   *  the journal unbounded (§3.4). */
   async flush(): Promise<void> {
-    if (!this.dirty) return;
+    if (this.dirtyIds.size === 0) return;
+    await this.ensureDir();
+    // Serialize-vs-write sub-split (sink-gated): the delta serialize vs the native
+    // append — both now O(delta), confirming the post-fix floor (Step 1 metrics).
+    const ts = nowMs();
+    let delta = '';
+    let records = 0;
+    for (const id of this.dirtyIds) {
+      const e = this.entries.get(id);
+      delta += (e ? JSON.stringify(e) : JSON.stringify({ del: id })) + '\n';
+      records++;
+    }
+    if (this.captureFlushPerf) this.captureFlushPerf.stringifyMs += nowMs() - ts;
+    const tw = nowMs();
+    // One native append per checkpoint — the O(delta) win (mirrors ContentStore.flushPack).
+    await this.metadata.append(REGISTRY_JOURNAL_PATH, delta);
+    if (this.captureFlushPerf) this.captureFlushPerf.writeMs += nowMs() - tw;
+    this.journalBytes += delta.length;
+    this.journalRecords += records;
+    this.dirtyIds.clear();
+    // Safety valve — never on the deferred capture path (checkpoints are pure appends,
+    // which is what keeps the O(N²) rewrite from sneaking back in). Amortized O(1).
+    if (!this.deferSave && this.shouldCompact()) await this.compact();
+  }
+
+  /** Fold the journal back into the snapshot and truncate it. Snapshot first,
+   *  truncate second — never the reverse: a crash after the snapshot write but
+   *  before the truncate leaves a redundant journal that replays idempotently
+   *  (last-write-wins) onto an already-current snapshot; a crash that truncated
+   *  first would lose every mutation the journal still held. Both writes are atomic
+   *  (tmp+rename), so neither can tear. Runs off the per-checkpoint hot path only —
+   *  at capture/merge end, opportunistically on load, or the live-path valve (§3). */
+  async compact(): Promise<void> {
+    // Nothing journalled since the last snapshot → the snapshot already reflects the
+    // current Map, so there is nothing to fold. Skipping keeps a routine no-op capture
+    // (and an empty vault) from redundantly rewriting the snapshot / creating files.
+    if (this.journalRecords === 0) return;
+    await this.ensureDir();
     const data: SerializedRegistry = {
       version: 1,
       entries: Array.from(this.entries.entries()),
     };
-    if (!(await this.metadata.exists('.vault-sync'))) {
-      await this.metadata.mkdir('.vault-sync');
-    }
-    await this.metadata.write(REGISTRY_PATH, JSON.stringify(data, null, 2));
-    this.dirty = false;
+    // No pretty-print — the snapshot is machine-read; `null, 2` ~doubles the bytes.
+    const json = JSON.stringify(data);
+    await this.metadata.write(REGISTRY_PATH, json);   // atomic
+    await this.metadata.write(REGISTRY_JOURNAL_PATH, '');  // atomic truncate — MUST come second
+    this.snapshotBytes = json.length;
+    this.journalBytes = 0;
+    this.journalRecords = 0;
+    this.dirtyIds.clear();
   }
 
   /** Suspend the per-mutation autosave (mutations mark the registry dirty but don't
@@ -109,7 +221,7 @@ export class FileRegistry {
         entry.contentHash = contentHash;
         entry.hlcTimestamp = hlc;
         if (stat) { entry.mtime = stat.mtime; entry.size = stat.size; }
-        await this.save();
+        await this.save(existing);
       }
       return existing;   // already tracked (live), or resurrected just now
     }
@@ -129,7 +241,7 @@ export class FileRegistry {
     };
     this.entries.set(id, entry);
     this.pathIndex.set(path, id);
-    await this.save();
+    await this.save(id);
     return id;
   }
 
@@ -144,7 +256,7 @@ export class FileRegistry {
     entry.hlcTimestamp = hlc;
     this.pathIndex.set(newPath, id);
     this.entries.set(id, entry);
-    await this.save();
+    await this.save(id);
   }
 
   /** Update the content hash for a file after modification. `stat` (present when the
@@ -158,7 +270,7 @@ export class FileRegistry {
     entry.hlcTimestamp = hlc;
     if (stat) { entry.mtime = stat.mtime; entry.size = stat.size; }
     this.entries.set(id, entry);
-    await this.save();
+    await this.save(id);
   }
 
   /**
@@ -175,7 +287,7 @@ export class FileRegistry {
     entry.mtime = mtime;
     entry.size = size;
     this.entries.set(id, entry);
-    await this.save();
+    await this.save(id);
   }
 
   /** Mark a file as deleted (tombstone). */
@@ -188,7 +300,7 @@ export class FileRegistry {
     entry.hlcTimestamp = hlc;
     this.entries.set(id, entry);
     // Keep path index for now — GC will clean up
-    await this.save();
+    await this.save(id);
   }
 
   /** Apply a remote FileEntry (during merge). */
@@ -205,7 +317,7 @@ export class FileRegistry {
     if (!entry.deleted) {
       this.pathIndex.set(entry.path, entry.id);
     }
-    await this.save();
+    await this.save(entry.id);
   }
 
   /**
@@ -221,6 +333,9 @@ export class FileRegistry {
     const existingId = this.pathIndex.get(path);
     if (existingId && existingId !== id) {
       this.entries.delete(existingId);
+      // A hard Map-delete (divergent-duplicate drop) — journal a `{del}` line for it,
+      // since it's no longer in the Map for flush() to resolve as an upsert.
+      this.dirtyIds.add(existingId);
     }
     // If this id currently lives at a DIFFERENT path, drop that stale path→id
     // mapping — otherwise a rename adopted alongside a content merge (H5) leaves
@@ -251,7 +366,7 @@ export class FileRegistry {
       headVersionId: headVersionId ?? hlcToString(hlc),
     });
     this.pathIndex.set(path, id);
-    await this.save();
+    await this.save(id);
   }
 
   /**
@@ -266,7 +381,7 @@ export class FileRegistry {
     if (!entry) return;
     entry.headVersionId = versionId;
     this.entries.set(fileId, entry);
-    await this.save();
+    await this.save(fileId);
   }
 
   /**
@@ -286,7 +401,7 @@ export class FileRegistry {
     entry.hlcTimestamp = hlc;
     entry.conflictParents = parents;
     this.entries.set(id, entry);
-    await this.save();
+    await this.save(id);
   }
 
   /** Clear a file's two-headed (conflict-awaiting-resolution) marker — called when
@@ -297,7 +412,7 @@ export class FileRegistry {
     if (!entry || entry.conflictParents == null) return;
     delete entry.conflictParents;
     this.entries.set(fileId, entry);
-    await this.save();
+    await this.save(fileId);
   }
 
   /** Record the file's current path as its last-synced path after a successful
@@ -310,7 +425,7 @@ export class FileRegistry {
     if (!entry) return;
     entry.lastSyncedPath = entry.path;
     this.entries.set(fileId, entry);
-    await this.save();
+    await this.save(fileId);
   }
 
   // ─── Scan & reconcile ─────────────────────────────────────────────────────
@@ -339,6 +454,7 @@ export class FileRegistry {
         };
         this.entries.set(id, entry);
         this.pathIndex.set(file.path, id);
+        this.dirtyIds.add(id);
       }
     }
 
@@ -348,6 +464,7 @@ export class FileRegistry {
         entry.deleted = true;
         entry.hlcTimestamp = hlc;
         this.entries.set(id, entry);
+        this.dirtyIds.add(id);
       }
     }
 
@@ -398,6 +515,28 @@ export class FileRegistry {
   }
 
   // ─── Private helpers ──────────────────────────────────────────────────────
+
+  private async ensureDir(): Promise<void> {
+    if (!(await this.metadata.exists(REGISTRY_DIR))) {
+      await this.metadata.mkdir(REGISTRY_DIR);
+    }
+  }
+
+  /** Whether the journal has grown large enough relative to the snapshot to be
+   *  worth folding back in — the compaction trigger shared by the load-time and
+   *  live-path valves (§3). Bounds both subsequent load cost and live-session
+   *  journal growth. */
+  private shouldCompact(): boolean {
+    return this.journalBytes > this.snapshotBytes ||
+      this.journalRecords > Math.max(1000, 2 * this.entries.size);
+  }
+
+  /** Opportunistic compaction on load: the read+replay was already paid, so folding
+   *  a large journal back into the snapshot here is near-free and bounds every
+   *  subsequent load (§3.3). */
+  private async maybeCompactOnLoad(): Promise<void> {
+    if (this.journalRecords > 0 && this.shouldCompact()) await this.compact();
+  }
 
   private rebuildPathIndex(): void {
     this.pathIndex = new Map();

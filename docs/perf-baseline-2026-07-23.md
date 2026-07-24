@@ -607,6 +607,95 @@ cache-coherence dependency (can return content Obsidian hasn't re-read after an 
 cachedRead **capture-path-only** (keep the sync round on fresh `readBinary`). The A/B instrumentation
 was removed after this measurement.
 
+### The oplog append-journal — on-device confirmed (`oplogSaveMs` 5.37 s → 1.25 s; the append write 3.82 s → 0.21 s)
+
+With pack-writes solving the blob-write half, the residual **otherMs 12.1 s** was the per-200-op
+checkpoint metadata rewrites: `registry.flush()` **+** `saveOpLog()`. The Step-1 split (above /
+`docs/oplog-append-journal-spec.md` §3.3) attributed it near-evenly — **reg 5.73 s, oplog 5.37 s** —
+with **~86% of each being the native write**, not the serialize. The oplog half was the clean,
+ready-to-land cut: `saveOpLog` re-serialized + re-wrote the **whole** growing `pendingOps` array every
+checkpoint (200, 400, … 8389 ops) → **triangular O(N²)** bytes over the pass. The fix
+(`docs/oplog-append-journal-spec.md` §4, landed): make `oplog.json` a **line-oriented NDJSON journal**
+and **append only the delta ops** since the last checkpoint (`metadata.append`), mirroring pack-writes'
+per-chunk append — O(delta), not O(N²). The two rare shrink events (`clearOps`, create/delete-pair
+prune) keep a full rewrite; `load()` replays the journal line-by-line, dropping a torn trailing line.
+
+**On-device re-measure (2026-07-24, same first-enable, F=8389, `perfLog`):**
+
+| oplog line | Step-1 (rewrite) | **Step-2 (append)** | Δ |
+|---|--:|--:|--:|
+| **oplogSaveMs** (whole persist, ×~42 checkpoints) | 5,371.9 | **1,247.1** | **−77%** |
+| — `oplog.stringifyMs` (serialize) | 576.5 | **20.8** | −96% (only the delta ops serialized) |
+| — `oplog.writeMs` (native write/append) | 3,823.2 | **208.9** | **−18×** (only the delta *bytes* appended) |
+| — residual (dir-`exists` + `hlcStore.save` + notify) | ~971 | ~1,017 | ~flat — the **new floor** |
+| regFlushMs (registry half — **untouched**) | 5,730.3 | 5,760.2 | unchanged |
+| **otherMs** | 12,122.4 | **8,047.8** | −34% |
+| **total** (heap 68/1940 MB) | 46,850.0 | **37,724.3** | (readMs also −5 s this run — floor variance) |
+
+**The O(N²)→O(delta) cut landed exactly as predicted.** The append-specific work (stringify + write)
+collapsed **4.40 s → 0.23 s (~19×)**; `oplog.writeMs` alone did the predicted **3.82 s → 0.21 s (~18×)**.
+`oplogSaveMs` is 1.25 s rather than "well under 1 s" only because **~1.0 s of it is now the per-checkpoint
+`hlcStore.save` (an atomic small-file write) + dir-`exists` probe + change-notify** — a fixed
+~24 ms × ~42 checkpoints that lived inside `saveOpLog` all along (Step-1's "residual 1.0 s") and is
+untouched by this spec. A possible micro-follow-up (persist the HLC once at end / cache the dir-exists)
+would reclaim it, but it is small against the read floor — noted, not pursued.
+
+**What this leaves as the next lever.** `regFlushMs` is **unchanged at 5.76 s** (the registry rewrite was
+not touched) and is now **72% of the 8.05 s otherMs** (was 47% of 12.1 s). So the **registry-checkpoint
+rewrite is the unambiguous next cut** — its own spec (below). Pinned by
+`__tests__/oplog-append-journal.test.ts` (round-trip, O(delta) linearity guard, torn-tail, clearOps-truncate,
+prune-compaction). *(The design memo's provisional option A — raise the flush cadence — was superseded:
+the chosen fix was **option B, an append-journal mirroring the oplog**, which attacks the byte volume
+itself rather than the write frequency. See the next section.)*
+
+### The registry append-journal — on-device confirmed (`regFlushMs` 5.76 s → 0.34 s; the registry is no longer a lever)
+
+The registry half of `otherMs` was the twin of the oplog problem, one step harder: the registry is a
+**keyed map mutated in place** (not a pure append), sits on the crash-safety spine (registry-before-oplog),
+and is the rebaseline anchor. The design memo (`docs/registry-checkpoint-cost-spec.md`) weighed three
+directions and **graduated to option B — a keyed append-journal, last-write-wins + snapshot compaction** —
+sharpened by three code findings that shrank its cost: it is a **persistence-layer-only** change (nothing
+outside `file-registry.ts` reads the registry file, so every consumer reads the same in-memory `Map` and is
+untouched as long as `load()` rebuilds it identically), the pattern already ships twice in-repo
+(`ContentStore.pack/index`, the version-DAG journal), and the `append`/atomic-`write` primitives are
+purpose-built. The rollout spec `docs/registry-append-journal-spec.md` (**landed**): `flush()` **appends
+only the touched entries** to `file-registry.journal` (full-entry line = LWW upsert, `{"del":id}` line =
+hard Map-delete) instead of rewriting the whole snapshot; `load()` replays the journal over the snapshot
+(torn-tail-tolerant); `compact()` folds it back (snapshot-write-**then**-truncate, both atomic) at
+capture-end / merge-end / opportunistically-on-load / a live-path size-valve — **never at a checkpoint**, so
+the O(N²) rewrite can't sneak back in.
+
+**On-device re-measure (2026-07-25, same first-enable, F=8389, `perfLog`):**
+
+| line | oplog-run (Step-2) | **registry-run (Step-3)** | Δ |
+|---|--:|--:|--:|
+| **regFlushMs** (registry persist, ×~42 checkpoints) | 5,760.2 | **336.3** | **−94% (~17×)** |
+| — `reg.stringifyMs` (serialize) | ~780 | **29.1** | only the touched delta serialized |
+| — `reg.writeMs` (native write/append) | ~4,860 | **227.7** | only the delta *bytes* appended (O(delta)) |
+| oplogSaveMs (untouched) | 1,247.1 | 1,232.4 | unchanged |
+| otherResidualMs | ~1,017 | 1,009.4 | ~flat — the standing floor |
+| **otherMs** | 8,047.8 | **2,578.1** | **−68%** |
+| readMs (floor) | ~26,000 | 27,782.0 | floor variance |
+| hashMs / putMs / flushMs | — | 1,213 / 836 / 1,232 | write phase, all small |
+| **total** (heap 68/1940 MB) | 37,724.3 | **33,641.2** | −4.1 s (read variance offsets part of the −5.5 s otherMs cut) |
+
+**The O(N)→O(delta) cut landed as predicted, and beat the < 1 s target by 3×.** `regFlushMs` fell to
+**336 ms** — `reg.writeMs` 4.86 s → 0.23 s and `reg.stringifyMs` 0.78 s → 0.03 s: the per-checkpoint appends
+are near-free versus the old triangular whole-registry write. The capture-end `compact()` (one full snapshot
+write, ~0.2 s) runs in the `finally` **after** `stats.totalMs` is stamped, so it is off the hot path and
+excluded from the reported total — exactly the off-checkpoint placement the spec intended.
+
+**Both write-side O(N²) checkpoint costs are now solved.** `otherMs` is down to **2.58 s** — its remaining
+pieces are `oplogSaveMs` 1.23 s (the per-checkpoint `hlcStore.save` + dir-probe floor, *not* the append —
+the standing micro-follow-up), residual 1.0 s, and `regFlushMs` 0.34 s. **`readMs` 27.8 s is now ~83% of the
+33.6 s total** — the read floor overwhelmingly dominates, and per the A3 read-probe above it is a genuine
+disk-bound floor (deferred: cachedRead was only ~25% cheaper with a cache-coherence risk). Pinned by
+`__tests__/registry-append-journal.test.ts` (round-trip, LWW, hard-delete `{del}` line, intra-window 1-line
+collapse, torn-tail, compaction + no-pretty-print, crash-order idempotent replay, migration, opportunistic
+load-compact), the §4-Q3 durability gate in `__tests__/capture-crash-safety.test.ts` (registry-ahead-not-
+orphaned; torn-registry-journal strands-not-orphans), and the O(delta) append-volume guard in
+`__tests__/perf-timing.test.ts`.
+
 ---
 
 ## Judged against the provisional budgets (spec §6)
@@ -719,14 +808,25 @@ so both would reproduce in the WebView.
   - [x] **C4** (direct non-atomic blob write, replacing the atomic temp+rename ceremony; safe via
         hash-verify-on-read) — **200 s → 102 s (−49%)**, `putMs` 146 s → 56 s. Confirmed on device.
   - [x] **C3** (raw-binary / drop base64) — **dropped**; writes are latency- not bandwidth-bound.
-  - [ ] **C1** (bounded-concurrency capture pipeline) — **NEXT**, own spec
-        `docs/capture-concurrency-spec.md`. Overlap the remaining serial write 56 s + read 32 s.
-        Projected ~102 s → **~25 s**.
-  - [ ] **Post-C1: the checkpoint `otherMs` (13.5 s of per-200-op registry+oplog atomic rewrites)**
-        is the likely next-dominant cost (serial, non-parallelising) — fewer checkpoints / append-
-        only oplog journal. Pack-writes only if C1's write overlap disappoints.
-- [ ] **Re-confirm on device** — with the fix + `heapMB` line, verify the cliff is gone
-      (or moved far out) on the 8.4k-file vault; pin the GC ceiling.
+  - [x] **C1** (bounded-concurrency capture pipeline) — **MEASURED + REVERTED.** K=8 = 120 s vs C4's
+        102 s (+18 s): the Android/Capacitor bridge serializes native fs, so overlap can't win — cut
+        call COUNT, not overlap. See "C1 measured" above + `docs/capture-concurrency-spec.md`.
+  - [x] **Pack-writes** (batch blobs into per-chunk packs — parallelism-independent) — **DONE + CONFIRMED.**
+        Write phase 50–56 s → ~2.1 s; total **102 s → 46 s (−55%)**. See "Pack-writes" above.
+  - [x] **Oplog append-journal** (NDJSON, append the delta not the whole array) — **DONE + CONFIRMED.**
+        `oplogSaveMs` 5.37 s → 1.25 s (the append write 3.82 s → 0.21 s, ~18×); otherMs 12.1 s → 8.05 s;
+        total 46.85 s → 37.72 s. See "The oplog append-journal" above.
+  - [x] **Registry append-journal** (keyed NDJSON journal + snapshot compaction — the design memo's option
+        B, superseding the provisional option A) — **DONE + CONFIRMED.** `regFlushMs` 5.76 s → **0.34 s
+        (~17×, beat the < 1 s target)**; otherMs 8.05 s → **2.58 s**; total 37.72 s → **33.64 s**. Both
+        write-side O(N²) checkpoint costs now solved. See "The registry append-journal" above.
+  - **Write side is done.** `readMs` (27.8 s ≈ 83% of the 33.6 s total) is now the whole remaining
+    first-enable cost — a genuine disk-bound floor (the A3 read-probe's ~25% cachedRead win is deferred for
+    cache-coherence risk). The only sub-second scraps left are the `oplogSaveMs` per-checkpoint HLC/dir floor
+    (~1 s) and loop residual (~1 s); neither is worth pursuing against the read floor.
+- [ ] **Re-confirm the cliff is gone on device** — DONE in substance: the 8.4k-file vault now completes
+      first-enable in **33.6 s** with `heapMB=68/1940` (no GC cliff, no OOM); the O(F²) churn that caused
+      the original ~3.2k-file cliff is fully removed (registry + oplog + blob writes all O(delta)).
 - [ ] **Full Layer-3 matrix** — B1/B3/B4 at profiles S and M on a mid-range and a
       low-end phone, record device model + real wall-times (add device columns).
 - [ ] Re-run and append a new baseline before each release and after any change to the

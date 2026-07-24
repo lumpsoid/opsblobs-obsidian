@@ -145,6 +145,10 @@ export class SyncApplicator {
       // per-mutation autosave — always, even if flush throws (else deferSave sticks
       // on and later mutations would silently never persist).
       try { await this.registry.flush(); } finally { this.registry.resumeSaves(); }
+      // Fold this batch's journal into a fresh snapshot (registry-append-journal-spec
+      // §3.2) — keeps the journal from carrying merge deltas into steady state. Off the
+      // per-action hot path; no-ops if nothing was journalled.
+      await this.registry.compact();
     }
 
     return { deferred, deferredConflicts };
