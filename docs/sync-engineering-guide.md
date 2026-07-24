@@ -407,6 +407,36 @@ test; the *classes* are what to watch for.
   root, so a peer that deleted the file still gets a delete/create conflict (safe), never a
   silent un-delete. Pinned by `recreate-after-delete.test.ts`. **Lesson:** reusing an id across
   a delete→re-create must reset the entry's *state*, not just its head.
+- **O(N²) registry writes made a large first sync never converge.** Every registry
+  mutation rewrites the *whole* `file-registry.json` (`flush()` serializes all entries).
+  The applicator saved per-mutation, so a first sync — which touches every file — did N
+  full-registry writes: minutes on a large mobile vault. Long enough that the user
+  force-closed mid-apply, and because the **cursor is saved only at round end**, it never
+  advanced — so the whole vault re-pulled and re-applied on *every* restart (the "applying
+  8390 changes forever" report). Fix: `applyActions` now brackets the entire apply in
+  `registry.suspendSaves()` → a single `flush()` in a guaranteed `finally` (mirrors the
+  capture pass), turning O(N²) into O(N) — apply dropped from minutes to ~700ms. Pinned by
+  `first-sync-registry-batching.test.ts` (asserts O(1) registry writes; fails at N without
+  the batching). **Lesson — any bulk pass over the vault (apply, capture, reconcile) must
+  batch registry/DAG persistence; a per-item `save()` that rewrites the whole file is a
+  hidden O(N²) that only bites at scale, exactly where it can't be undone by hand.**
+- **A single self-syncing device emits `send_remote` for every file, every round.**
+  `reconstructRemoteState` excludes our own re-pulled ops, so with no peer the remote
+  projection is empty and the merge classifies each local file as `send_remote` (transport-
+  only, a local no-op). This is correct, but two traps follow: (1) the merge emits **one
+  action per file** even in the converged case, so any "applying N changes" UX must count
+  only `affectsLocalVault(action)` (the exhaustive classifier in `types.ts`) or an unchanged
+  vault reports the whole vault; (2) `updateSyncedPaths` runs `setSyncedPath` per file on the
+  first sync — the O(N²) trap above. **Lesson — the merge produces O(vault) actions, most of
+  them inert; never treat `actions.length` as "work done", and never let a per-action side
+  effect persist per-action.**
+- **`buildLocalState` is O(vault) every round (the standing hotspot).** It stat-gates the
+  re-hash (R1) but still *stages the bytes of every file* into the snapshot's content map
+  (plus each head's DAG-reachable bases), so a converged round that changes nothing still
+  reads the whole vault — ~52s at 8390 files, ~92% of the round. It runs *before* the pull,
+  so it can't yet know which files the merge needs and stages them all defensively. Not a
+  correctness bug (rounds converge), but the next optimization target: stage bytes only for
+  files the merge will actually touch. See `docs/build-local-state-perf-spec.md`.
 
 Meta-lesson across all of them: **the dangerous failures are silent** — an edit that
 doesn't propagate, content at the wrong path, a file that won't empty, a base that unions.
