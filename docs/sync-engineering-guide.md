@@ -155,7 +155,7 @@ relevant `core`/`merge` unit) with a port for the Obsidian bit.
 | `merge/diff3.ts` | Three-way line merge + `resolveConflictChunkLines`; the marker helpers `renderConflictMarkers` / `renderMarkersFromResult` / `hasConflictMarkers` / `parseConflictMarkers` / `resolveMarkedText` / `countMarkerConflicts` (the in-context conflict UX + the panel's compare). |
 | `network/server-sync.ts` | `ServerSyncClient.runSync()` — orchestrates one round (build→pull→fetch→push→**record DAG edges**→merge→apply→**reconcile concurrent heads**→cursor). Obsidian-free; driven by fakes in tests. Also `reconstructRemoteState`, `reconcileConcurrentHeads` (the multi-head sweep — see `docs/multi-head-reconciliation.md`), and `safeCursor`. |
 | `network/sync-applicator.ts` | Applies merge actions to the real vault (writes/moves/trashes, writes conflict markers, mints merge nodes via `mintMergeResolution`). Reports `deferred` + `deferredConflicts` fileIds back to the round. |
-| `network/vault-sync-host.ts` | `PluginVaultSyncHost` — bridges the obsidian-free round to the live stores; stages each head's DAG-reachable base bytes for the three-way merge. |
+| `network/vault-sync-host.ts` | `PluginVaultSyncHost` — bridges the obsidian-free round to the live stores. `buildLocalIdentity` snapshots entries + pending ops with the A1 stat-gate hash correction and **no** O(vault) byte staging; `stageContent(state, hashes)` fills the content store for exactly the hashes the round scopes (A2). |
 | `network/version-dag-store.ts` | Persists the `VersionDag` incrementally: a compacted snapshot (`version-dag.json`) + an append-only JSONL journal (`version-dag.log`) of edges since. A round `appendEdges` only its *new* edges (O(delta)); the O(N) full rewrite is deferred to `compact()` past a threshold. Defensive `load()` = snapshot ⊕ journal-replay, tolerant of a missing/corrupt snapshot and a torn trailing journal line. |
 | `network/sync-coordinator.ts` | Obsidian-free orchestration: the capture→round→record sequence, delete/binary conflict decisions (always defer to the panel; consume a `pendingDecision` when present — §3 "full inline"), reset/rebaseline. `deferredConflictCount()` is a derived per-round count (no badge bookkeeping). |
 | `network/sync-state-store.ts` | The **observable** sync state (`.vault-sync/sync-state.json`): `deferred` files (each `reason: 'drift' \| 'conflict'`), `stranded` content, last error, last-round summary. No outstanding-conflict set (retired in Step 7). |
@@ -183,11 +183,14 @@ relevant `core`/`merge` unit) with a port for the Obsidian bit.
    record and the loser is caught by the guard next round. A withholding server (omission →
    staleness, per the spec threat model) degrades this to the pre-guard status quo, never
    corruption.
-1. **`buildLocalState()`** — snapshot registry entries + pending ops + content. It
-   re-hashes live files against the registry and corrects the snapshot to the *real disk
-   hash* (never the stale recorded one) so the merge compares true content. It also
-   **stages the DAG-reachable base bytes** for each head (`reachableContentHashes`) so
-   the three-way LCA base is available even when deeper than the last sync.
+1. **`buildLocalIdentity()`** — snapshot registry entries + pending ops, with an
+   **empty** content store (A2). It re-hashes only *stat-drifted* live files against the
+   registry and corrects the snapshot to the *real disk hash* (never the stale recorded
+   one) so the merge compares true content and the `localAtHead` guard holds; it keeps
+   just those drift-read bytes so staging needn't re-read them. It stages **no** other
+   bytes — the O(vault) byte staging moved out of this before-pull step. Content is
+   staged later, scoped (step 5 below): the whole-vault snapshot was ~92% of a converged
+   round at F≈8390 (`docs/build-local-state-perf-spec.md`).
 2. **Pull** remote ops since the cursor, decrypt each. Keep each op's server `seq`.
 3. **Reconstruct the remote projection** (`reconstructRemoteState`) and fetch the blobs
    it needs (verifying each decrypts back to its asserted content hash).
@@ -199,7 +202,14 @@ relevant `core`/`merge` unit) with a port for the Obsidian bit.
    by `clientOpId`, so a crash in between is safe.
 5. **Record this round's DAG edges** (`recordVersionEdges([...local.pendingOps,
    ...pulled])`) **before** the merge, so both this round's heads are in the DAG the merge
-   reads. Then **merge + apply** — `mergeVaultStates(local, remote, dag)`, advance the HLC
+   reads. Then **stage content, scoped** (A2, `stageMergeContent`): the identity build
+   staged nothing, so before the merge stage exactly the local bytes + DAG-reachable
+   bases of the files the merge reconciles — the remote projection's ids plus any
+   local-only file colliding by path with a live remote entry (F2). A converged round
+   scopes to zero. (The push at step 4 separately staged the pending ops' own content so
+   their blobs upload — a local-only `send_remote` file's bytes are read by neither the
+   merge nor the identity build.) Then **merge + apply** —
+   `mergeVaultStates(local, remote, dag)`, advance the HLC
    past the merged time *before* applying (so a merge node minted during apply dominates
    what it supersedes), then `applicator.applyActions`.
 6. **Reconcile concurrent heads pulled together** (`reconcileConcurrentHeads`, "step 4b").
@@ -430,13 +440,19 @@ test; the *classes* are what to watch for.
   first sync — the O(N²) trap above. **Lesson — the merge produces O(vault) actions, most of
   them inert; never treat `actions.length` as "work done", and never let a per-action side
   effect persist per-action.**
-- **`buildLocalState` is O(vault) every round (the standing hotspot).** It stat-gates the
-  re-hash (R1) but still *stages the bytes of every file* into the snapshot's content map
-  (plus each head's DAG-reachable bases), so a converged round that changes nothing still
-  reads the whole vault — ~52s at 8390 files, ~92% of the round. It runs *before* the pull,
-  so it can't yet know which files the merge needs and stages them all defensively. Not a
-  correctness bug (rounds converge), but the next optimization target: stage bytes only for
-  files the merge will actually touch. See `docs/build-local-state-perf-spec.md`.
+- **`buildLocalState` staging was O(vault) every round — now scoped (A2, fixed).** The
+  pre-A2 snapshot stat-gated the re-hash (R1) but still *staged the bytes of every file*
+  (plus each head's DAG-reachable bases), so a converged round read the whole vault —
+  ~52s at 8390 files, ~92% of the round. It ran *before* the pull, so it couldn't know
+  which files the merge needed and staged them all defensively. Fixed by splitting the
+  host into `buildLocalIdentity` (cheap, before-pull: entries + the R1 hash correction,
+  **no** byte staging) and `stageContent(state, hashes)`, and moving staging into the
+  round *after* the pull, scoped to the files the merge reconciles + the pending ops'
+  own content (for the push). Staging drops to O(touched this round + their bases) — zero
+  on a converged round. The enabling move was dropping the dead `send_remote.content` so a
+  local-only file classifies from its entry alone (no bytes read). A genuinely-missing
+  base still degrades to a conflict (F1), never a union. See
+  `docs/build-local-state-perf-spec.md` and `scoped-content-staging.test.ts`.
 
 Meta-lesson across all of them: **the dangerous failures are silent** — an edit that
 doesn't propagate, content at the wrong path, a file that won't empty, a base that unions.
