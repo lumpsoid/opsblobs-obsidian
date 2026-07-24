@@ -113,6 +113,40 @@ describe('A2 scoped content staging', () => {
     expect(await onDisk(B, 'n39.md')).toBe('body 39\n');
   });
 
+  // ── Constant-independence: the staged total does NOT grow with the vault ─────
+  // The ceilings above prove "small"; this proves "constant". Run the identical
+  // touch-one-of-N scenario at two vault sizes and assert B stages the SAME number of
+  // hashes both times — the tell-tale of O(touched), not O(vault). If staging ever
+  // silently reverted to scanning all files, the larger N would stage more and this
+  // equality would break.
+  test('the staged total for pulling one edit is identical at N=10 and N=80 (constant in vault size)', async () => {
+    // Returns how many hashes B's host is asked to stage while pulling a single edit
+    // made to one file of a converged N-file vault.
+    const stagedForVaultSize = async (N: number): Promise<number> => {
+      const api = new FakeSyncServer();
+      const A = await TestDevice.create(`ci-a-${N}`);
+      const B = await TestDevice.create(`ci-b-${N}`);
+      for (let i = 0; i < N; i++) await A.seedFile(`n${i}.md`, `body ${i}\n`, 1000 + i);
+      await client(api, A).runSync();
+      await client(api, B).runSync();
+
+      await A.editFile('n0.md', 'body 0 EDITED\n', 5000);
+      await client(api, A).runSync();
+
+      const spy = spyStageContent(B);
+      await client(api, B).runSync();
+      // Sanity: the edit really propagated, so a staged-total of e.g. 0 means "scoped",
+      // not "did nothing".
+      expect(await onDisk(B, 'n0.md')).toBe('body 0 EDITED\n');
+      return spy.total();
+    };
+
+    const small = await stagedForVaultSize(10);
+    const large = await stagedForVaultSize(80);
+    expect(large).toBe(small);         // ← constant: 8× the vault, identical staging
+    expect(small).toBeLessThan(10);    // …and genuinely O(1), not "equal but large"
+  });
+
   // ── A concurrent divergence still stages its base (F1 not degraded to a lie) ──
   test('a genuine concurrent edit stages the touched file so it three-way merges, not conflicts', async () => {
     const api = new FakeSyncServer();
