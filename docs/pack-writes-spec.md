@@ -1,6 +1,38 @@
 # Vault Sync — First-Enable Pack-Writes Spec (the write-count cut)
 
-**Status:** Draft / scoping · **Date:** 2026-07-24 · **Owner:** client/perf
+**Status:** IMPLEMENTED (per-chunk packs) · **Date:** 2026-07-24 · **Owner:** client/perf
+
+**Landed (2026-07-24).** The append micro-measurement ran on-device FIRST (§8's
+load-bearing unknown) and confirmed the plan: `append` is **O(delta)** — the append-bench
+growth ratio was **0.4** (last-quartile per-append 2.7 ms < first-quartile 7.6 ms; cost does
+NOT grow with file size). Head-to-head at 200×4 KB: loose `writeDirect` **6.7 ms/call**
+(→ 8389 blobs ≈ 56 s, matching the measured `putMs`), vs **per-chunk pack append 25.7 ms**
+for a 200-blob (~800 KB) chunk (→ 42 chunks ≈ **1.08 s**). So the write phase collapses
+**~56 s → ~1.1 s**. One nuance recorded: a large 800 KB append is NOT pure latency
+(25.7 ms vs 4.2 ms for 4 KB) — there's a real per-byte component at that size — but the
+call-count cut (42 vs 8389) dominates. Small `index` appends are flat, so **append-per-chunk
+index** was chosen (no deferred single write). Design landed as **per-chunk packs** (§8's
+leaning), which also de-risks the append answer: each pack is written once.
+
+**Implementation:** `src/core/append-bench.ts` (the measurement, run via the
+"Measure append cost (diagnostic)" command → console + `perf-log.txt`).
+`src/core/content-store.ts` (buffered `putNew` → `flushPack`, pack format §3.1, `get`/`has`/
+`listHashes` pack fallback with whole-pack caching, index load on `init()`, whole-pack
+retention GC, `delete` drops the index entry). `src/core/operation-logger.ts` (`flushPack`
+before `saveOpLog` at checkpoint/abort/final + `CaptureStats.flushMs`). Tests:
+`__tests__/content-store-pack.test.ts` (round-trip, whole-pack-read amortisation, torn-tail,
+coexistence, whole-pack GC, index rebuild, pack-id resume) + the multi-checkpoint write-count
+and updated C2 assertion in `__tests__/offline-capture.test.ts` + `__tests__/append-bench.test.ts`.
+
+**On-device re-measure — CONFIRMED (2026-07-24, F=8389).** First-enable **total 102 s → 46 s
+(−55%)**. Split: readMs **30.4 s** (the floor, unchanged), otherMs **12.1 s** (checkpoint
+registry+oplog rewrites), hashMs 1.2 s, **buffered putMs 0.8 s + flushMs 1.3 s = ~2.1 s** for the
+whole write phase (was 50–56 s — a **~26× cut**). `put.writeMs = 0` confirms zero per-blob writes.
+`flushMs 1.3 s` lands exactly on probe C (1.08 s packs + ~0.25 s index appends) — the measurement
+predicted the outcome. **The write half is solved.** Next-dominant: the read floor (30.4 s, deferred)
+and the **checkpoint `otherMs` (12.1 s)** — the append-only-oplog-journal / fewer-checkpoints spec.
+
+---
 
 **One sentence:** the first-enable capture writes one content blob per native fs call (~8389
 serial `writeDirect`s ≈ 50–56 s); this spec batches many blobs into a few large **pack** files

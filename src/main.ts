@@ -9,6 +9,7 @@ import { FileRegistry } from './core/file-registry';
 import { ContentStore } from './core/content-store';
 import { randomUuid } from './core/encoding';
 import { OperationLogger } from './core/operation-logger';
+import { runAppendBench, formatAppendBench } from './core/append-bench';
 import { SyncApplicator } from './network/sync-applicator';
 import { ObsidianVaultFiles } from './network/obsidian-vault-files';
 import { ObsidianMetadataStore } from './network/obsidian-metadata-store';
@@ -281,6 +282,16 @@ export default class VaultSyncPlugin extends Plugin {
       callback: () => { void this.activateConflictsView(); },
     });
 
+    // Diagnostic (A3 pack-writes): measure whether the native `append` is O(delta)
+    // or a whole-file rewrite on this device — the load-bearing assumption the
+    // pack-writes optimization rests on (docs/pack-writes-spec.md §6.1). Writes the
+    // full timing split to perf-log.txt and shows the verdict in a Notice.
+    this.addCommand({
+      id: 'measure-append-cost',
+      name: 'Measure append cost (diagnostic)',
+      callback: () => { void this.measureAppendCost(); },
+    });
+
     // ── Settings ───────────────────────────────────────────────────────────
     this.addSettingTab(new SyncSettingTab(this.app, this));
 
@@ -465,6 +476,29 @@ export default class VaultSyncPlugin extends Plugin {
     }
   }
 
+  /** On-device micro-benchmark for the pack-writes load-bearing question: is native
+   *  `append` O(delta) or a whole-file rewrite? (docs/pack-writes-spec.md §6.1.) Runs
+   *  the three probes, appends the full split to perf-log.txt (always — this is a
+   *  deliberate measurement, not gated on the `perfLog` setting), and surfaces the
+   *  verdict in a Notice so the result is readable on the phone without a file pull. */
+  private async measureAppendCost(): Promise<void> {
+    new Notice('Vault Sync: measuring append cost… (this writes ~35 MB of scratch, then cleans up)', 6000);
+    try {
+      const result = await runAppendBench(this.metadata);
+      const lines = formatAppendBench(result);
+      // Console is the easiest surface to read on the current dev setup; also persist
+      // to perf-log.txt for a post-hoc pull.
+      console.log('[vault-sync] append-bench:\n' + lines.join('\n'));
+      for (const line of lines) {
+        await this.metadata.append('.vault-sync/perf-log.txt', line + '\n').catch(() => {});
+      }
+      const verdict = (lines[0] ?? '').replace('append-bench VERDICT: ', '');
+      new Notice(`Vault Sync append-bench: ${verdict}`, 12000);
+    } catch (e) {
+      new Notice(`Vault Sync append-bench failed: ${e instanceof Error ? e.message : String(e)}`, 8000);
+    }
+  }
+
   /** Run the first-enable capture, streaming scan progress to the `perfLog` diagnostic
    *  (Layer 3) so a long-running pass on a large vault yields the throughput curve
    *  instead of a single line that only prints if/when it finishes. Untimed and with
@@ -506,6 +540,9 @@ export default class VaultSyncPlugin extends Plugin {
     sink?.(`captureOfflineChanges readMs (${stats.files} files)`, stats.readMs);
     sink?.(`captureOfflineChanges hashMs`, stats.hashMs);
     sink?.(`captureOfflineChanges putMs`, stats.putMs);
+    // A3 pack-writes: the per-checkpoint pack + index appends that replaced the ~8389
+    // per-blob writes. This is where the old ~50 s putMs write phase now lives (~1–2 s).
+    sink?.(`captureOfflineChanges flushMs`, stats.flushMs);
     // The putMs sub-split (A3 §3.2): base64 encode (CPU) vs the atomic-write ceremony's
     // native adapter sub-ops. `putOtherMs` = ensureShard + memCache + loop overhead not
     // in the five measured sub-phases. This decides whether the temp-write + rename
@@ -521,7 +558,7 @@ export default class VaultSyncPlugin extends Plugin {
       sink?.(`captureOfflineChanges put.renameMs`, renameMs);         // atomic ceremony — now 0
       sink?.(`captureOfflineChanges put.otherMs`, stats.putMs - encodeMs - writeMs - writeTmpMs - existsMs - removeMs - renameMs);
     }
-    sink?.(`captureOfflineChanges otherMs`, stats.totalMs - stats.readMs - stats.hashMs - stats.putMs);
+    sink?.(`captureOfflineChanges otherMs`, stats.totalMs - stats.readMs - stats.hashMs - stats.putMs - stats.flushMs);
     sink?.(`captureOfflineChanges total${heapNote()}`, stats.totalMs);
     // Disarm the diagnostics so nothing accumulates outside the capture pass.
     this.contentStore.capturePutPerf = null;

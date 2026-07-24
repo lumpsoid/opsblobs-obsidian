@@ -152,12 +152,22 @@ describe('C2 — first-enable bulk write skips the redundant `exists` probe', ()
     let blobExists = 0;
     let blobDirectWrites = 0;
     let blobAtomicWrites = 0;
+    // A3 pack-writes: capture buffers blobs and appends them in packs at checkpoints, so
+    // the write phase is pack + index appends, NOT per-blob `.bin` writes. Count both.
+    let packAppends = 0;
+    let indexAppends = 0;
     const origExists = A.metadata.exists.bind(A.metadata);
     const origWrite = A.metadata.write.bind(A.metadata);
     const origWriteDirect = A.metadata.writeDirect.bind(A.metadata);
+    const origAppend = A.metadata.append.bind(A.metadata);
     A.metadata.exists = async p => { if (p.endsWith('.bin')) blobExists++; return origExists(p); };
     A.metadata.write = async (p, d) => { if (p.endsWith('.bin')) blobAtomicWrites++; return origWrite(p, d); };
     A.metadata.writeDirect = async (p, d) => { if (p.endsWith('.bin')) blobDirectWrites++; return origWriteDirect(p, d); };
+    A.metadata.append = async (p, d) => {
+      if (p.endsWith('.pack')) packAppends++;
+      if (p.endsWith('/pack/index')) indexAppends++;
+      return origAppend(p, d);
+    };
 
     await A.opLogger.captureOfflineChanges();
 
@@ -166,11 +176,14 @@ describe('C2 — first-enable bulk write skips the redundant `exists` probe', ()
     expect(putNewCalls).toBe(4);
     // No per-file blob exists probe at all — the whole point of C2.
     expect(blobExists).toBe(0);
-    // C4: blobs take the non-atomic direct-write path, never the atomic ceremony. Two
-    // distinct hashes → exactly two writes; the duplicates dedup in memCache (no
-    // redundant write, no corruption of the already-written blob).
-    expect(blobDirectWrites).toBe(2);
+    // A3 pack-writes: NO per-blob `.bin` write of either kind. All four files (two
+    // distinct hashes) are buffered by putNew and flushed into ONE pack at the final
+    // checkpoint (4 < CAPTURE_CHECKPOINT_EVERY), with one index-delta append alongside.
+    // This is the whole point: ~F blob writes → ~2 appends per 200-blob chunk.
+    expect(blobDirectWrites).toBe(0);
     expect(blobAtomicWrites).toBe(0);
+    expect(packAppends).toBe(1);
+    expect(indexAppends).toBe(1);
     // The encode accumulator was threaded through the two real writes (a finite,
     // non-negative CPU total — the wiring works; exact ms is a device concern).
     expect(Number.isFinite(putPerf.encodeMs)).toBe(true);
@@ -178,8 +191,12 @@ describe('C2 — first-enable bulk write skips the redundant `exists` probe', ()
 
     // Restore spies before reading content back through the store.
     A.metadata.exists = origExists;
+    A.metadata.append = origAppend;
 
-    // Each file's blob is readable back by its registry hash — content intact.
+    // Each file's blob is readable back by its registry hash — content intact. The
+    // capture left the final window warm in memCache AND flushed to a pack; drop the
+    // cache so the read-back exercises the pack extract + hash-verify path (spec §3.3).
+    A.contentStore.clearMemCache();
     for (const [path, text] of [['a1.md', 'alpha\n'], ['b1.md', 'beta\n']] as const) {
       const hash = A.entryByPath(path)!.contentHash;
       const bytes = await A.content(hash);
@@ -189,6 +206,46 @@ describe('C2 — first-enable bulk write skips the redundant `exists` probe', ()
     // Duplicate pairs share the one blob (same hash).
     expect(A.entryByPath('a1.md')!.contentHash).toBe(A.entryByPath('a2.md')!.contentHash);
     expect(A.entryByPath('b1.md')!.contentHash).toBe(A.entryByPath('b2.md')!.contentHash);
+  });
+
+  test('a capture spanning multiple checkpoints writes ~ceil(F/200) packs, no per-blob writes', async () => {
+    const A = await TestDevice.create('dev-a');
+    // 450 distinct files → checkpoints fire at 200 and 400, plus the final tail (50):
+    // three flushPack calls → three packs. The whole point of pack-writes at scale.
+    const N = 450;
+    for (let i = 0; i < N; i++) await A.seedExistingFile(`n${i}.md`, `content-${i}\n`);
+
+    let packAppends = 0;
+    let indexAppends = 0;
+    let blobWrites = 0;
+    const origAppend = A.metadata.append.bind(A.metadata);
+    const origWriteDirect = A.metadata.writeDirect.bind(A.metadata);
+    A.metadata.append = async (p, d) => {
+      if (p.endsWith('.pack')) packAppends++;
+      if (p.endsWith('/pack/index')) indexAppends++;
+      return origAppend(p, d);
+    };
+    A.metadata.writeDirect = async (p, d) => { if (p.endsWith('.bin')) blobWrites++; return origWriteDirect(p, d); };
+
+    const stats = await A.opLogger.captureOfflineChanges();
+
+    expect(stats.opsEmitted).toBe(N);
+    expect(packAppends).toBe(Math.ceil(N / 200)); // 3
+    expect(indexAppends).toBe(Math.ceil(N / 200));
+    expect(blobWrites).toBe(0);                    // ~0 per-blob writes — the win
+    expect(stats.flushMs).toBeGreaterThanOrEqual(0);
+
+    A.metadata.append = origAppend;
+    A.metadata.writeDirect = origWriteDirect;
+
+    // A mid-capture (checkpoint-evicted) file still round-trips through its pack, and a
+    // fresh reload rebuilds the index so every blob resolves after a restart.
+    const reloaded = await A.reload();
+    for (const i of [0, 199, 200, 449]) {
+      const hash = reloaded.entryByPath(`n${i}.md`)!.contentHash;
+      const bytes = await reloaded.content(hash);
+      expect(new TextDecoder().decode(bytes!)).toBe(`content-${i}\n`);
+    }
   });
 });
 

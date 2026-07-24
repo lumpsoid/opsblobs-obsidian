@@ -551,6 +551,32 @@ The write half's next lever is **pack-writes** (A3 endgame step 3 — batch many
 write; parallelism-independent, so it works despite the serial bridge), targeting the ~56 s of
 serial `put.writeMs`. Full analysis: `docs/capture-concurrency-spec.md` §7/§9.
 
+### Pack-writes — append measured O(delta); write phase ~56 s → ~1.1 s (implemented)
+
+The load-bearing unknown (does the bridge's `append` rewrite the whole file?) was measured FIRST
+via an on-device micro-bench (`src/core/append-bench.ts`, "Measure append cost" command):
+
+| probe | what | result |
+|---|---|---|
+| **A · growth** | append 4 KB × 200 to ONE file; per-append curve | **ratio 0.4** (last-Q 2.7 ms < first-Q 7.6 ms) → **`append` is O(delta)**, flat in file size |
+| **B · baseline** | `writeDirect` 4 KB × 200 (status-quo loose) | **6.7 ms/call** → 8389 blobs ≈ **56 s** (matches measured `put.writeMs`) |
+| **C · packed** | append one ~800 KB (200-blob) chunk × 42 (per-chunk pack) | **25.7 ms/chunk** → 42 chunks ≈ **1.08 s** |
+
+So the capture **write phase collapses ~56 s → ~1.1 s** (+~0.6 s base64 encode). Nuance: a large
+800 KB append is not pure latency (25.7 ms vs 4.2 ms for 4 KB — a real per-byte component at size),
+but the call-count cut (42 vs 8389) dominates; small `index` appends are flat, so append-per-chunk
+index was kept. **Implemented as per-chunk packs** (git loose-vs-packed): `putNew` buffers, `flushPack`
+appends one pack + one index delta per 200-blob checkpoint, `get` falls back to a whole-pack read that
+caches every blob it holds (reads stay constant in blob count), C4 hash-verify preserved per blob,
+whole-pack retention GC. See `docs/pack-writes-spec.md` (Landed).
+
+**On-device CONFIRMED (2026-07-24, F=8389):** total **102 s → 46 s (−55%)**. New split — readMs
+**30.4 s** (floor), otherMs **12.1 s** (checkpoint rewrites), hashMs 1.2 s, and the whole write phase
+**buffered putMs 0.8 s + flushMs 1.3 s ≈ 2.1 s** (was 50–56 s; `put.writeMs = 0` → zero per-blob
+writes). `flushMs 1.3 s` == probe C (1.08 s + index) — the pre-build measurement predicted it exactly.
+The write half is done; next-dominant is the read floor (30.4 s, deferred) and the checkpoint
+`otherMs` (12.1 s of per-200-op registry+oplog atomic rewrites → append-only-oplog-journal spec).
+
 ### Read-path probe — `cachedRead` vs `readBinary` (measured; a modest, deferred win)
 
 The read phase (~31.6 s, 31%) is all `vault.readBinary` (disk). Hypothesis: since Obsidian reads

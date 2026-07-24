@@ -28,6 +28,23 @@ export interface PutPerf {
 export { uint8ToBase64, base64ToUint8 };
 
 const CONTENT_DIR = '.vault-sync/content';
+// Packed-blob storage (A3 pack-writes). The first-enable capture buffers blobs and
+// appends them in large per-checkpoint **packs** instead of one loose `.bin` per file,
+// cutting ~8389 native writes to ~2 per 200-blob chunk. Confirmed on device: `append`
+// is O(delta) (append-bench ratio 0.4), so 42 chunk-appends ≈ 1.1 s vs ~56 s of loose
+// writes. See docs/pack-writes-spec.md. `pack` is NOT a 2-hex shard name, so the loose
+// `listHashes` shard sweep never mistakes a pack/index file for a blob.
+const PACK_DIR = `${CONTENT_DIR}/pack`;
+const PACK_INDEX_PATH = `${PACK_DIR}/index`;
+
+/** Where a packed blob's base64 body lives: which pack, the char offset of the body
+ *  within it, and the body's char length. base64 is ASCII so char offset == byte
+ *  offset; `pack.substr(offset, len)` slices the body with no delimiter scan. */
+interface PackLoc {
+  packId: string;
+  offset: number;
+  len: number;
+}
 
 // The 256 possible shard directory names ("00".."ff"). Content hashes are hex,
 // so `hash[0:2]` is always one of these. `listHashes` sweeps this fixed set
@@ -56,6 +73,20 @@ export class ContentStore {
   // pays at most one `mkdir` per shard (256 max) instead of one per file.
   private ensuredShards: Set<string> = new Set();
 
+  // ── Packed-blob state (A3 pack-writes) ──────────────────────────────────────
+  // In-memory index of every packed blob's location, loaded from `pack/index` at
+  // `init()` and extended by `flushPack`. Authoritative for the session; the on-disk
+  // append-only `index` file is its durable mirror.
+  private index: Map<string, PackLoc> = new Map();
+  // Blobs `putNew` has buffered but not yet appended to a pack. Flushed (and cleared)
+  // by `flushPack` at each capture checkpoint. Bounded to one chunk of base64 (~MB).
+  private packBuffer: Array<{ hash: string; b64: string }> = [];
+  // Monotonic per-chunk pack id, resumed past any pack already on disk at `init()` so
+  // a new session never reuses an id and clobbers a pack.
+  private nextPackId = 0;
+  // `pack/` dir ensured once per session (mirrors `ensuredShards`).
+  private packDirEnsured = false;
+
   /** When non-null, `putNew` accumulates its base64-encode time here (A3 capture
    *  diagnostics). Set by `main.ts` around the first-enable capture; null otherwise. */
   capturePutPerf: PutPerf | null = null;
@@ -66,6 +97,41 @@ export class ContentStore {
     if (!(await this.metadata.exists(CONTENT_DIR))) {
       await this.metadata.mkdir(CONTENT_DIR);
     }
+    await this.loadPackIndex();
+  }
+
+  /**
+   * Rebuild the in-memory pack index from the on-disk `pack/index` (append-only) and
+   * resume the pack-id counter past any pack already on disk. Called once at `init()`.
+   *
+   * Torn-append tolerant, exactly like the version-DAG journal reader: a crash mid-
+   * flush can leave a short/garbled *trailing* line, which fails the field/number
+   * guards and is dropped — that blob then reads as missing (`get` returns null) and
+   * is simply re-captured next enable (F1-safe, never corrupt). Interior lines can't
+   * tear (append only ever cuts the end).
+   */
+  private async loadPackIndex(): Promise<void> {
+    const raw = await this.metadata.read(PACK_INDEX_PATH);
+    if (raw !== null) {
+      for (const line of raw.split('\n')) {
+        if (line === '') continue;
+        const parts = line.split(' ');
+        if (parts.length !== 4) continue; // torn/partial trailing line → drop
+        const [hash, packId, off, len] = parts;
+        const offset = Number(off);
+        const length = Number(len);
+        if (!hash || !packId || !Number.isFinite(offset) || !Number.isFinite(length)) continue;
+        this.index.set(hash, { packId, offset, len: length });
+      }
+    }
+    // Resume the counter past the highest existing pack (packs may exist that the
+    // torn index doesn't fully cover, so scan the dir rather than trust the index).
+    let maxId = -1;
+    for (const p of await this.metadata.list(PACK_DIR)) {
+      const m = (p.split('/').pop() ?? '').match(/^(\d+)\.pack$/);
+      if (m) maxId = Math.max(maxId, Number(m[1]));
+    }
+    this.nextPackId = maxId + 1;
   }
 
   /** Store content by hash. No-op if already present. */
@@ -97,19 +163,56 @@ export class ContentStore {
    * its disk `exists` dedup for the general case.
    */
   async putNew(hash: string, content: Uint8Array): Promise<void> {
-    // A memCache hit means this blob was already written (put/putNew) or loaded
-    // (get) this session — both imply it is on disk — so the write is redundant.
+    // A memCache hit means this blob was already written (put/putNew), buffered, or
+    // loaded (get) this session — all imply it is on disk or about to be — so it is
+    // redundant. (Cross-session dedup: a blob already in a prior pack is skipped by the
+    // capture's own `entry.contentHash === hash` gate before putNew is even called.)
     if (this.memCache.has(hash)) return;
     this.memCache.set(hash, content);
-    await this.ensureShard(hash);
     const t = nowMs();
     const b64 = uint8ToBase64(content);
     if (this.capturePutPerf) this.capturePutPerf.encodeMs += nowMs() - t;
-    // Direct (non-atomic) write — C4. Safe here because the blob is content-addressed
-    // and `get` hash-verifies on read: a torn write reads back as missing (F1), never as
-    // a corrupt base. Skips the temp-file + rename ceremony, whose rename alone costs as
-    // much as this write on the mobile bridge (A3 perf split).
-    await this.metadata.writeDirect(this.contentPath(hash), b64);
+    // Pack-writes (A3): buffer the encoded blob instead of issuing a per-blob native
+    // write. The buffer is appended to a pack in one native call per checkpoint by
+    // `flushPack` (which the capture loop calls before each `saveOpLog`), so ~8389
+    // serial writes collapse to ~2 appends per 200-blob chunk. No I/O here — just the
+    // base64 encode (CPU) + a RAM push, bounded to one chunk by the checkpoint flush.
+    this.packBuffer.push({ hash, b64 });
+  }
+
+  /**
+   * Append the buffered blobs to a fresh **pack** file (one native append) and their
+   * locations to the `pack/index` (a second append), then clear the buffer. A no-op on
+   * an empty buffer, so the capture loop can call it unconditionally at every checkpoint.
+   *
+   * **Per-chunk packs.** Each flush writes a brand-new `pack/<id>.pack` (never appended
+   * to again), so a whole-pack `get` reads at most one chunk (≤200 blobs) and the
+   * append cost is irrelevant for the pack body (written once); only the small `index`
+   * is appended repeatedly, and device measurement shows those small appends are flat/
+   * O(delta) (append-bench). Two native writes per 200-blob chunk vs 200 before.
+   *
+   * **Ordering (blob-before-op, spec §4).** The capture loop calls this *before* the
+   * chunk's `registry.flush()` / `saveOpLog()`, so every blob an op references is durable
+   * before that op is journalled. A crash between the two appends leaves either an
+   * unindexed pack (blobs read as missing → re-captured) or an index line pointing past
+   * a torn pack body (hash-verify on read → missing) — F1-safe, never corrupt.
+   */
+  async flushPack(): Promise<void> {
+    if (this.packBuffer.length === 0) return;
+    const packId = String(this.nextPackId++);
+    let packBody = '';
+    let idxDelta = '';
+    for (const { hash, b64 } of this.packBuffer) {
+      const header = `${hash} ${b64.length}\n`;
+      const offset = packBody.length + header.length; // char offset of the body
+      packBody += header + b64 + '\n';
+      this.index.set(hash, { packId, offset, len: b64.length });
+      idxDelta += `${hash} ${packId} ${offset} ${b64.length}\n`;
+    }
+    await this.ensurePackDir();
+    await this.metadata.append(this.packPath(packId), packBody);
+    await this.metadata.append(PACK_INDEX_PATH, idxDelta);
+    this.packBuffer = [];
   }
 
   /** Retrieve content by hash. Returns null if not found — or if the stored bytes fail
@@ -124,28 +227,60 @@ export class ContentStore {
     if (cached) return cached;
 
     const raw = await this.metadata.read(this.contentPath(hash));
-    if (raw === null) return null;
-    const content = base64ToUint8(raw);
-    // Integrity check: a content hash names its exact bytes, so a mismatch means the
-    // blob is torn/corrupt. Don't cache it and don't return it — report missing (F1).
-    if ((await hashContent(content)) !== hash) return null;
-    this.memCache.set(hash, content);
-    return content;
+    if (raw !== null) {
+      const content = base64ToUint8(raw);
+      // Integrity check: a content hash names its exact bytes, so a mismatch means the
+      // blob is torn/corrupt. Don't cache it and don't return it — report missing (F1).
+      if ((await hashContent(content)) !== hash) return null;
+      this.memCache.set(hash, content);
+      return content;
+    }
+    // Loose miss → try the packs (A3). Steady-state edits stay loose, so this only
+    // fires for capture-packed blobs (merge bases, on-conflict reads, the push stage).
+    return this.getFromPack(hash);
+  }
+
+  /**
+   * Extract a packed blob, hash-verifying it (C4, per blob) exactly as the loose path
+   * does. Whole-pack amortization: reading the pack caches **every** blob it holds, so a
+   * round that reads many blobs from one pack pays a single native read (mitigates the
+   * lack of a ranged-read primitive — spec §3.3). Returns null if the blob is unknown,
+   * its pack is gone, or its bytes fail to hash back (torn tail → missing, F1-safe).
+   */
+  private async getFromPack(hash: string): Promise<Uint8Array | null> {
+    const loc = this.index.get(hash);
+    if (!loc) return null;
+    const pack = await this.metadata.read(this.packPath(loc.packId));
+    if (pack === null) return null;
+    for (const [h, l] of this.index) {
+      if (l.packId !== loc.packId || this.memCache.has(h)) continue;
+      const body = pack.substr(l.offset, l.len);
+      if (body.length !== l.len) continue; // truncated/torn record → skip (reads missing)
+      const content = base64ToUint8(body);
+      if ((await hashContent(content)) === h) this.memCache.set(h, content);
+    }
+    return this.memCache.get(hash) ?? null;
   }
 
   /** Check if content is available without loading it. */
   async has(hash: string): Promise<boolean> {
     if (this.memCache.has(hash)) return true;
+    if (this.index.has(hash)) return true;
     return this.metadata.exists(this.contentPath(hash));
   }
 
-  /** Remove content by hash. */
+  /** Remove content by hash. Drops it from the memCache, the loose `.bin` (if present),
+   *  and the pack index. A packed blob's *bytes* stay in the pack (no in-place edit), but
+   *  dropping the index entry makes it read as missing (`get`/`has` miss) and reclaims the
+   *  space when whole-pack GC later retires the pack; the index rewrite keeps that durable
+   *  across a reload. Loose-only deletes (the GC hot path) never touch the index. */
   async delete(hash: string): Promise<void> {
     this.memCache.delete(hash);
     const path = this.contentPath(hash);
     if (await this.metadata.exists(path)) {
       await this.metadata.remove(path);
     }
+    if (this.index.delete(hash)) await this.rewriteIndex();
   }
 
   /**
@@ -158,6 +293,18 @@ export class ContentStore {
    * one-level device semantics.
    */
   async listHashes(): Promise<string[]> {
+    const hashes = new Set<string>(await this.listLooseHashes());
+    // GC safety (spec §4): the keep-set must see *packed* hashes too, or GC would
+    // ignore them (or, worse, a naive loose delete would leave them stranded). Union
+    // in the in-memory index keys — the durable mirror of every packed blob.
+    for (const hash of this.index.keys()) hashes.add(hash);
+    return [...hashes];
+  }
+
+  /** The loose (`.bin`) hashes only — the 256-shard sweep. Split out so `gc` can route
+   *  loose blobs through the per-blob mtime path and packed blobs through whole-pack
+   *  retention (a packed hash has no `.bin` to `delete`). */
+  private async listLooseHashes(): Promise<string[]> {
     const hashes: string[] = [];
     for (const prefix of SHARD_PREFIXES) {
       const files = await this.metadata.list(`${CONTENT_DIR}/${prefix}`);
@@ -179,8 +326,8 @@ export class ContentStore {
    * Call after a successful sync when ancestor hashes are updated.
    */
   async gc(keepHashes: Set<string>, retentionMs: number, now: number): Promise<void> {
-    const all = await this.listHashes();
-    for (const hash of all) {
+    // ── Loose (`.bin`) blobs — per-blob mtime retention (unchanged) ────────────
+    for (const hash of await this.listLooseHashes()) {
       if (keepHashes.has(hash)) continue;
       let mtime: number | null = null;
       try {
@@ -193,6 +340,56 @@ export class ContentStore {
       if (mtime === null || now - mtime < retentionMs) continue;
       await this.delete(hash);
     }
+    // ── Packed blobs — whole-pack retention (spec §3.5) ────────────────────────
+    await this.gcPacks(keepHashes, retentionMs, now);
+  }
+
+  /**
+   * A blob inside a pack can't be deleted individually (no in-place edit / ranged
+   * write), so GC works at pack granularity: a pack is dropped only when **every** blob
+   * it holds is unreferenced AND the pack file itself has aged past the window. First-
+   * enable packs are mostly all-referenced (every captured file is live), so this frees
+   * space once churn fully retires a chunk; a partially-live pack is kept whole (spec
+   * §3.5 defers mark-and-compact). Conservative on datelessness, mirroring the loose path.
+   */
+  private async gcPacks(keepHashes: Set<string>, retentionMs: number, now: number): Promise<void> {
+    const members = new Map<string, string[]>(); // packId → its blob hashes
+    for (const [hash, loc] of this.index) {
+      let list = members.get(loc.packId);
+      if (!list) members.set(loc.packId, (list = []));
+      list.push(hash);
+    }
+    let removedAny = false;
+    for (const [packId, hashes] of members) {
+      if (hashes.some(h => keepHashes.has(h))) continue; // any live blob → keep the pack
+      let mtime: number | null = null;
+      try {
+        const stat = await this.metadata.stat(this.packPath(packId));
+        mtime = stat?.mtime ?? null;
+      } catch {
+        mtime = null;
+      }
+      if (mtime === null || now - mtime < retentionMs) continue; // keep young/undatable
+      await this.metadata.remove(this.packPath(packId));
+      for (const h of hashes) {
+        this.index.delete(h);
+        this.memCache.delete(h);
+      }
+      removedAny = true;
+    }
+    // The `index` file is append-only during capture; a GC that drops packs is the one
+    // place it's rewritten wholesale (rare, off the hot path) so it doesn't keep listing
+    // dead blobs. Atomic `write` — a torn rewrite here would lose live index entries.
+    if (removedAny) await this.rewriteIndex();
+  }
+
+  /** Rewrite `pack/index` from the surviving in-memory index (after a GC pack drop). */
+  private async rewriteIndex(): Promise<void> {
+    let body = '';
+    for (const [hash, loc] of this.index) {
+      body += `${hash} ${loc.packId} ${loc.offset} ${loc.len}\n`;
+    }
+    await this.metadata.write(PACK_INDEX_PATH, body);
   }
 
   clearMemCache(): void {
@@ -211,5 +408,18 @@ export class ContentStore {
 
   private contentPath(hash: string): string {
     return `${CONTENT_DIR}/${hash.slice(0, 2)}/${hash}.bin`;
+  }
+
+  /** Ensure the `pack/` directory exists (once per session; mirrors `ensureShard`). */
+  private async ensurePackDir(): Promise<void> {
+    if (this.packDirEnsured) return;
+    if (!(await this.metadata.exists(PACK_DIR))) {
+      await this.metadata.mkdir(PACK_DIR);
+    }
+    this.packDirEnsured = true;
+  }
+
+  private packPath(packId: string): string {
+    return `${PACK_DIR}/${packId}.pack`;
   }
 }

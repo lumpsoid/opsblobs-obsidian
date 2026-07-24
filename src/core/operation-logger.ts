@@ -41,7 +41,8 @@ export interface CaptureStats {
   opsEmitted: number;   // create/update/delete ops pushed
   readMs: number;       // Σ files.read
   hashMs: number;       // Σ hashContent
-  putMs: number;        // Σ contentStore.putNew (base64 encode + fs write; C2 dropped the exists probe)
+  putMs: number;        // Σ contentStore.putNew (base64 encode + buffer push; pack-writes moved the fs write to flushMs)
+  flushMs: number;      // Σ contentStore.flushPack (the per-checkpoint pack + index appends — A3 pack-writes)
   totalMs: number;      // wall time of the whole pass
 }
 
@@ -148,7 +149,7 @@ export class OperationLogger {
     // phase (docs/startup-capture-optimization-spec.md §3). Every return path below
     // (abort, normal end) returns these partial-or-full totals.
     const startedAt = nowMs();
-    const stats: CaptureStats = { files: 0, opsEmitted: 0, readMs: 0, hashMs: 0, putMs: 0, totalMs: 0 };
+    const stats: CaptureStats = { files: 0, opsEmitted: 0, readMs: 0, hashMs: 0, putMs: 0, flushMs: 0, totalMs: 0 };
 
     // Batch the registry writes. Without this each file re-serialized the WHOLE
     // registry (registerFile + setHeadVersion each save()), so the pass was O(F²) —
@@ -170,6 +171,13 @@ export class OperationLogger {
       // file as "vanished while offline" and emit a vault-wide phantom delete. The
       // tail re-captures on the next enable; the `finally` still runs `resumeSaves`.
       if (signal?.aborted) {
+        // Blob-before-op (spec §4): flush the buffered pack + index BEFORE the oplog,
+        // so no persisted op references an unwritten blob. Buffered-but-unflushed blobs
+        // have no saved op either (op save is below), so an abort simply re-captures the
+        // tail next enable.
+        const tf = nowMs();
+        await this.contentStore.flushPack();
+        stats.flushMs += nowMs() - tf;
         await this.registry.flush();
         if (changed) await this.saveOpLog();
         stats.totalMs = nowMs() - startedAt;
@@ -266,6 +274,12 @@ export class OperationLogger {
       // warm for the sync round that runs right after — it reads those blobs from
       // memCache instead of a disk read + C4 hash-verify (keeps the round stat-gate hot).
       if (++sinceCheckpoint >= CAPTURE_CHECKPOINT_EVERY) {
+        // Pack-writes (spec §3.2/§4): append this chunk's buffered blobs to a pack +
+        // index FIRST, so every blob is durable before the ops that reference it are
+        // journalled (blob-before-op). Then the existing registry-then-oplog ordering.
+        const tf = nowMs();
+        await this.contentStore.flushPack();
+        stats.flushMs += nowMs() - tf;
         await this.registry.flush();
         await this.saveOpLog();
         this.contentStore.clearMemCache();
@@ -315,9 +329,14 @@ export class OperationLogger {
       }
     }
 
-    // Successful end: persist the tail (registry first, then oplog — same ordering
-    // as the checkpoint). On an early throw we skip this and fall to the `finally`,
+    // Successful end: flush the final (sub-checkpoint) buffered pack, then persist the
+    // tail (registry first, then oplog — same ordering as the checkpoint). The final
+    // window's blobs stay in memCache (never cleared) so the sync round that runs right
+    // after reads them warm. On an early throw we skip this and fall to the `finally`,
     // leaving disk at the last checkpoint (registry and oplog consistent there).
+    const tf = nowMs();
+    await this.contentStore.flushPack();
+    stats.flushMs += nowMs() - tf;
     await this.registry.flush();
     if (changed) await this.saveOpLog();
     stats.totalMs = nowMs() - startedAt;
