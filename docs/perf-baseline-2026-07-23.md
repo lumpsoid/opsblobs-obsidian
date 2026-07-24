@@ -368,6 +368,68 @@ is what R2 addresses. **R2 is not pursued.** If the steady-state round is optimi
 further, the targets are the capture/buildLocalState entry iteration and the per-round
 DAG deserialization, not byte-staging.
 
+> **Superseded on device — see "The A2 fix" below.** This "R2 not warranted" call
+> measured byte-staging at ~8 ms *on the laptop with in-memory fake fs* (a Map hit). On
+> the real Capacitor filesystem the same staging is thousands of file reads and was
+> **52 s — 92% of a converged round** at F≈8388. A2 (essentially R2) was re-justified by
+> the device numbers and **landed**.
+
+---
+
+## The A2 fix — scoped `buildLocalState` content-staging (on-device confirmed)
+
+Landed on `master` (commits `7147e41`…`f5838c9`; `docs/build-local-state-perf-spec.md`).
+R1 removed the per-round *re-hash*, but `buildLocalState` still **staged the bytes of
+every live file** into the round's content map (plus each head's DAG-reachable bases).
+A2 splits the host into `buildLocalIdentity` (before the pull: entries + the R1 hash
+correction, **no** byte staging) and `stageContent(state, hashes)`, and moves staging
+into the round *after* the pull, scoped to the files the merge reconciles + the pending
+ops' own content (for the push). Enabled by dropping the dead `send_remote.content`.
+
+**On-device (Obsidian WebView, Android, F≈8388 notes, `perfLog`), per-phase ms:**
+
+| phase | first-ever sync | converged 2nd round |
+|---|--:|--:|
+| keycheck+dag-guard | 270 | 366 |
+| **buildLocalIdentity** | **99** | **30** |
+| pull | 274 | 2,474 |
+| fetchBlobs | 1.4 | 3.4 |
+| push | 94,487 | 0.3 |
+| recordVersionEdges | 368 | 8.6 |
+| **stageContent** | **5.8** | **5.7** |
+| merge | 12 | 12 |
+| applyMerge | 611 | 182 |
+| reconcileConcurrentHeads | 1.0 | 3.8 |
+| saveCursor | 63 | 50 |
+| **total** | **96,192** | **3,136** |
+
+**The converged round is the case A2 targeted.** It dropped from the spec's measured
+**56,254 ms → 3,136 ms (~18×)**, and the staging work specifically from **~51,928 ms
+(92% of the round) → 36 ms** (identity 30 + stage 5.7 — a ~1450× cut on that phase). The
+round is now **pull-bound** (2,474 ms, 79%), exactly the floor
+`build-local-state-perf-spec.md` §6 predicted. `stageContent = 5.7 ms` confirms a
+converged round stages ~nothing.
+
+**Why the laptop shelved this (R2) and the device revived it (A2).** The bench uses
+in-memory fake fs, so byte-staging read as a Map hit (~8 ms) and looked not-worth-it. On
+the device each staged byte is a real Capacitor filesystem read, so the same work was
+52 s. This is the sharpest instance of the Layer-3 lesson (§4): a cost negligible on the
+laptop can be 92% of the round on the phone — the fake fs hid it completely. Pinned by
+`__tests__/scoped-content-staging.test.ts` (staging is O(touched), constant across vault
+size).
+
+**The first sync is push-bound, as expected.** 94.5 s of the 96 s first-ever sync is
+`push` — the one-time baseline upload of the whole vault's blobs + ops (already batched,
+`26af94b`/`b6230d2`); it does not recur. Note the first sync's identity is 99 ms and
+staging 5.8 ms — the A2 phases are cheap even here.
+
+**Next on-device target: startup capture (184 s).** The cold-start
+`captureOfflineChanges` on this 8.4k-file vault (`startup … total heapMB=77/1940
+184027.5ms`) now dominates the whole session — bigger than either sync round. Post the
+O(F²) batching fix it is no longer a *cliff*, but it is still a long O(F) stat-scan +
+registry build. Separate from the round; the next thing to look at (append-only registry
+journal / persisted-identity snapshot, both already flagged as future work above).
+
 ---
 
 ## Judged against the provisional budgets (spec §6)
@@ -378,7 +440,7 @@ as a *hypothesis* for the on-device pass to confirm.
 
 | Operation | Budget (mid-range) | Laptop L1 (M) | On phone |
 |---|---|--:|---|
-| routine sync (1-file delta) | < 1 s | 153 ms | not yet measured (plausibly over on M once fs latency is real) |
+| routine sync (1-file delta) | < 1 s | 153 ms | **converged round measured on device: 3.1 s at F≈8388, pull-bound** (2.5 s pull); the round's *compute* is now sub-second — buildLocalIdentity 30 ms + stage 5.7 ms + merge/apply ~200 ms. Over budget only because of the 8.4k-op backlog pull, not the delta. See "The A2 fix" |
 | first-enable capture | < 4 s | 4.2 s → **0.26 s** post-fix | pre-fix: CONFIRMED over (cliff at ~3.2k files). Post-fix removes the O(F²) churn — re-confirm on device |
 | resident RAM, long session | not monotonic | +8.1 MB/50 rounds | **fails the qualitative bar** (monotonic; the on-device cliff is consistent with the same unbounded cache) |
 
@@ -466,6 +528,13 @@ so both would reproduce in the WebView.
 - [x] **Native-ARM (Termux) full sweep** — B1–B9 at XS/S/M on the phone's real cores
       (recorded above; ~3× CPU penalty confirmed, routine budgets pass, diff3 low-unique
       + steady-state memCache flagged as the CPU hazards).
+- [x] **A2 scoped `buildLocalState` staging — on-device confirmed.** WebView, F≈8388:
+      converged round **56.3 s → 3.1 s**, staging **52 s → 36 ms**; now pull-bound. The
+      laptop's "R2 not warranted" (~8 ms on fake fs) was overturned by the real fs (52 s).
+      See "The A2 fix" above.
+- [ ] **Startup `captureOfflineChanges` is the new session-dominant cost** — **184 s** on
+      the 8.4k-file WebView vault (no longer a cliff post-batching, but a long O(F) pass).
+      Next optimization target: append-only registry journal / persisted-identity snapshot.
 - [ ] **Re-confirm on device** — with the fix + `heapMB` line, verify the cliff is gone
       (or moved far out) on the 8.4k-file vault; pin the GC ceiling.
 - [ ] **Full Layer-3 matrix** — B1/B3/B4 at profiles S and M on a mid-range and a

@@ -1,16 +1,22 @@
 # Vault Sync — `buildLocalState` Content-Staging Optimization Spec (A2)
 
-**Status:** Implemented (rollout steps 1–4) · **Date:** 2026-07-24 · **Owner:** client/perf
+**Status:** Implemented + on-device confirmed (rollout steps 1–5) · **Date:** 2026-07-24 · **Owner:** client/perf
 
-> **Landed 2026-07-24.** §4.1 (`send_remote.content` dropped), §4.2 (host split into
-> `buildLocalIdentity` + `stageContent`), and §4.3 (scoped post-pull staging in the round,
+> **Landed & confirmed 2026-07-24.** §4.1 (`send_remote.content` dropped), §4.2 (host
+> split into `buildLocalIdentity` + `stageContent`), and §4.3 (scoped post-pull staging,
 > incl. pending-op content staged before the push and the multi-head reconcile sweep
 > scoped) are all in, with the §6 scoping tests (`scoped-content-staging.test.ts`) plus the
-> full regression suite green (`npm run build && npx vitest run`). Extends the §4.3 scope
-> beyond the spec's `remote.fileEntries.keys()` to also cover an F2 create/create path
-> collision (whose local bytes the merge reads under the local id). **Remaining:** rollout
-> step 5 — the on-device F≈8390 re-measurement — is deferred until hardware is available;
-> the guide §7 bullet is already updated from "standing hotspot" to "scoped (A2)".
+> full regression suite green. Extends the §4.3 scope beyond the spec's
+> `remote.fileEntries.keys()` to also cover an F2 create/create path collision (whose local
+> bytes the merge reads under the local id).
+>
+> **Step 5 — on-device re-measure — DONE.** Obsidian WebView, Android, F≈8388: the
+> converged round dropped **56,254 ms → 3,136 ms (~18×)** and its staging work **~51,928 ms
+> (92% of the round) → 36 ms** (identity 30 + stage 5.7). The round is now pull-bound
+> (2.47 s), exactly the §6 prediction. Full per-phase breakdown recorded in
+> `docs/perf-baseline-2026-07-23.md` → "The A2 fix". The device also overturned the
+> laptop's earlier "R2 not warranted" call: byte-staging read as ~8 ms on fake fs but was
+> 52 s on the real Capacitor filesystem.
 
 The follow-on to `docs/steady-state-round-optimization-spec.md` (A1/B1). A1 added the
 mtime/size **stat-gate** so a routine round no longer re-reads + re-SHA-256s the whole
