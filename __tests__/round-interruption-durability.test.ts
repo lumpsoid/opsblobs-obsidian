@@ -48,6 +48,8 @@ class CrashOnFirstClearHost implements VaultSyncHost {
   private armed = true;
   constructor(private readonly inner: VaultSyncHost) {}
   loadDag(): Promise<VersionDag> { return this.inner.loadDag(); }
+  buildLocalIdentity(dag: VersionDag): Promise<VaultState> { return this.inner.buildLocalIdentity(dag); }
+  stageContent(state: VaultState, hashes: Iterable<string>): Promise<void> { return this.inner.stageContent(state, hashes); }
   buildLocalState(dag: VersionDag): Promise<VaultState> { return this.inner.buildLocalState(dag); }
   applyMerge(a: MergeAction[], l: VaultState, r: VaultState): Promise<{ deferred: Set<string>; deferredConflicts: Set<string> }> { return this.inner.applyMerge(a, l, r); }
   async clearPendingOps(): Promise<void> {

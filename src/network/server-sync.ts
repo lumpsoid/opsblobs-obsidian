@@ -118,10 +118,22 @@ export interface VaultSyncHost {
    *  (round-residual spec §3). The consumers must not persist mutations to it
    *  except through `recordVersionEdges`. */
   loadDag(): Promise<VersionDag>;
-  /** Snapshot of the local state: fileEntries, un-pushed pendingOps, and a
-   *  contentStore populated with at least every pending op's content + ancestors.
-   *  `dag` is the round's single loaded graph; the host folds this round's pending
-   *  ops into a private clone for the staging walk and leaves `dag` pristine. */
+  /** Snapshot of the local IDENTITY: fileEntries (with the A1 stat-gate hash
+   *  correction) + un-pushed pendingOps, and a contentStore holding at most the
+   *  drift set's bytes (read for the correction; kept so `stageContent` needn't
+   *  re-read them) — empty on a converged round. Runs before the pull; `stageContent`
+   *  fills the rest afterwards, scoped to what the merge needs (A2, §4.2). `dag` is
+   *  the round's single loaded graph; identity does not mutate or walk it. */
+  buildLocalIdentity(dag: VersionDag): Promise<VaultState>;
+  /** Fill `state.contentStore` with the bytes for exactly `hashes` (content-cache
+   *  read; disk read on a live entry's miss). Called after the pull with the files
+   *  the merge will reconcile — their local bytes + DAG-reachable bases — so staging
+   *  is O(touched), not O(vault). A genuinely-absent base is left unstaged and the
+   *  merge degrades it to a conflict (F1). Already-present hashes are skipped. */
+  stageContent(state: VaultState, hashes: Iterable<string>): Promise<void>;
+  /** TRANSITIONAL (A2 rollout step 2): pre-A2 whole-vault snapshot =
+   *  `buildLocalIdentity` + stage(all live bytes + all reachable bases). Kept only
+   *  until the scoped staging moves into the round (§4.3); deleted in step 3. */
   buildLocalState(dag: VersionDag): Promise<VaultState>;
   /** Apply merge actions to the real vault (writes/deletes/moves, conflict
    *  prompts). Returns `deferred` (fileIds whose destructive action was skipped for

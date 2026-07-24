@@ -42,35 +42,31 @@ export class PluginVaultSyncHost implements VaultSyncHost {
   }
 
   /**
-   * Snapshot the local vault for a sync round: the registry entries, the
-   * un-pushed pending ops, and a content store populated with the current bytes
-   * of every live file (covers every pending op's content, whose hash equals the
-   * live entry's) plus any retained ancestor content the three-way merge needs.
+   * Snapshot the local vault's IDENTITY for a sync round: the registry entries and
+   * the un-pushed pending ops, with an **empty** content store. No file bytes are
+   * staged — that is `stageContent`'s job, called after the pull once the round
+   * knows which files the merge actually needs (A2, §4.2). This is the cheap,
+   * O(vault)-map-only half that runs *before* the pull.
    *
-   * `dag` is the round's single loaded graph (see {@link loadDag}). We must NOT
-   * mutate it: `recordVersionEdges` later journals this round's genuinely-new edges
-   * by asking `addVersion` whether each is absent, so pre-adding the pending ops
-   * here would make it return `false` and silently drop them from the journal
-   * (round-residual spec §3.1). Fold them into a private `clone()` instead.
+   * It keeps the A1 stat-gate's **snapshot-correction**: for a stat-drifted file it
+   * re-reads + re-hashes disk and corrects `entry.contentHash` to the true disk hash,
+   * so the merge's `localAtHead` guard (guide §5) can tell a real head from an
+   * unlogged in-window edit. That correction only *reads+hashes* the drift set (the
+   * stat gate bounds it to O(touched)). The contentStore is otherwise **empty** —
+   * with one exception: the drift set's bytes are *already in hand* from the
+   * correction read, so we keep them (O(drift), tiny) rather than force `stageContent`
+   * to read the same file a second time. Every un-drifted (gated) file stages nothing
+   * here; that is the O(vault)→O(touched) cut.
+   *
+   * `dag` is the round's single loaded graph (see {@link loadDag}); identity does not
+   * mutate it and does not walk it (no base staging here).
    */
-  async buildLocalState(dag: VersionDag): Promise<VaultState> {
+  async buildLocalIdentity(dag: VersionDag): Promise<VaultState> {
     const fileEntries = new Map<string, FileEntry>();
+    // Only ever holds the drift set's bytes (read for hash-correction below), so a
+    // later `stageContent` doesn't re-read a file we just read. Empty on a converged
+    // round (no drift).
     const contentStore = new Map<string, Uint8Array>();
-    // Stage the bytes of every version reachable from each file's head (its
-    // ancestors). The three-way merge base LCA(localHead, peerHead) is always one of
-    // these, so pre-staging them makes any base available to the pure merge —
-    // including one deeper than the last-synced version (a multi-round offline
-    // divergence), which the scalar ancestor alone could not reach (#4).
-    //
-    // This round's own edits aren't in the persisted DAG yet (recordVersionEdges
-    // runs later), so a fresh head can't reach its base for staging. Fold the pending
-    // ops into a CLONE — never the shared round DAG (see the doc comment) — so
-    // reachability from each head includes the base the merge will need.
-    const working = dag.clone();
-    for (const op of this.opLogger.getPendingOps()) {
-      if (op.type === 'move') continue;
-      working.addVersion(op.id, op.parents, op.contentHash, op.fileId);
-    }
 
     // Stat every live file once (no extra syscall — `TFile.stat` rides on the
     // listing) so the per-entry loop can gate its read+hash on an mtime/size
@@ -88,14 +84,12 @@ export class PluginVaultSyncHost implements VaultSyncHost {
         // `captureOfflineChanges` ran milliseconds ago under this exact mtime+size
         // gate and reconciled the registry with disk, so a tracked file whose stat
         // is unchanged since we last hashed it has content byte-identical to
-        // `entry.contentHash`. Skip the read + SHA-256 and stage its bytes straight
-        // from the content store (a memCache/blob hit), disk-reading only on a
-        // store miss (no re-hash — the stat already says unchanged). This turns the
-        // round's O(F) whole-vault re-hash into O(touched). A placeholder
-        // (`contentHash === ''`), head-less, stat-drifted, or stat-absent entry
-        // fails the strict `===` and falls through to today's read+hash +
-        // snapshot-correction path unchanged — the F5 / un-opped-edit safeguards
-        // (§5) are preserved up to the same heuristic capture already accepts.
+        // `entry.contentHash` — no read, no re-hash, and the recorded hash is
+        // already the true disk hash. A placeholder (`contentHash === ''`),
+        // head-less, stat-drifted, or stat-absent entry fails the strict `===` and
+        // falls through to the read+hash + snapshot-correction path — the F5 /
+        // un-opped-edit safeguards (§5) are preserved up to the same heuristic
+        // capture already accepts. Unlike pre-A2, NEITHER branch stages bytes.
         if (
           entry.headVersionId &&
           entry.contentHash !== '' &&
@@ -103,38 +97,25 @@ export class PluginVaultSyncHost implements VaultSyncHost {
           entry.mtime === ref.mtime &&
           entry.size === ref.size
         ) {
-          let bytes = await this.contentStore.get(entry.contentHash);
-          if (bytes === null) bytes = await this.files.read(entry.path);
-          if (bytes !== null) contentStore.set(entry.contentHash, bytes);
+          // Unchanged — `entry.contentHash` is correct as recorded. No byte read.
         } else {
           const content = await this.files.read(entry.path);
           if (content !== null) {
             const hash = await hashContent(content);
-            // Key the bytes under their *actual* hash, never the registry's
+            // Correct the snapshot to the *actual* disk hash, never the registry's
             // recorded one. If an edit hasn't been logged yet the recorded hash is
-            // stale; keying under it would alias the current bytes over the
-            // ancestor, making the three-way merge see the file as unchanged and
-            // silently adopt the remote (data loss). If they differ, trust the
-            // disk and correct this snapshot so the merge compares real content.
+            // stale; leaving it would make the three-way merge's `localAtHead` guard
+            // treat the stale head as representing local and adopt a remote descendant,
+            // silently clobbering the in-window edit. Trust the disk.
             if (hash !== entry.contentHash) resolved = { ...entry, contentHash: hash };
+            // Keep the bytes we just read under their true hash so `stageContent`
+            // needn't re-read this file if the merge ends up needing it.
             contentStore.set(hash, content);
           }
         }
       }
 
       fileEntries.set(id, resolved);
-
-      // Stage the bytes of every base reachable from this file's head (its DAG
-      // ancestors) that the content store still holds, so the merge can three-way
-      // against the true LCA even when it is deeper than the scalar ancestor.
-      if (resolved.headVersionId) {
-        for (const hash of working.reachableContentHashes(resolved.headVersionId)) {
-          if (!contentStore.has(hash)) {
-            const bytes = await this.contentStore.get(hash);
-            if (bytes) contentStore.set(hash, bytes);
-          }
-        }
-      }
     }
 
     return {
@@ -144,6 +125,72 @@ export class PluginVaultSyncHost implements VaultSyncHost {
       pendingOps: this.opLogger.getPendingOps(),
       contentStore,
     };
+  }
+
+  /**
+   * Fill `state.contentStore` with the bytes for exactly `hashes` — the files the
+   * merge will actually reconcile this round (their local bytes + their DAG-reachable
+   * bases), scoped by the caller after the pull (A2, §4.3). Each hash is served from
+   * the content-cache (`ContentStore.get`, a memCache/blob hit); on a miss, if the
+   * hash is a live entry's *current* content we fall back to a disk read of its path
+   * (mirroring the pre-A2 staging fallback). A base whose bytes are genuinely absent
+   * (GC'd / never fetched) is simply left unstaged — the merge then degrades it to a
+   * conflict rather than a union (F1), exactly as before; scoping only changes *which*
+   * hashes are present, never the missing-base semantics.
+   *
+   * Already-present hashes are skipped, so a caller may pass a superset harmlessly.
+   */
+  async stageContent(state: VaultState, hashes: Iterable<string>): Promise<void> {
+    // A live entry's current bytes may not be in the content store yet (e.g. an
+    // un-opped in-window edit); its hash maps to a real vault path we can read on a
+    // store miss. Bases have no current path (they are prior versions) and so have no
+    // disk fallback — a miss there correctly leaves them unstaged.
+    const pathByHash = new Map<string, string>();
+    for (const entry of state.fileEntries.values()) {
+      if (!entry.deleted && entry.contentHash !== '') pathByHash.set(entry.contentHash, entry.path);
+    }
+
+    for (const hash of hashes) {
+      if (hash === '' || state.contentStore.has(hash)) continue;
+      let bytes = await this.contentStore.get(hash);
+      if (bytes === null) {
+        const path = pathByHash.get(hash);
+        if (path !== undefined) bytes = await this.files.read(path);
+      }
+      if (bytes !== null) state.contentStore.set(hash, bytes);
+    }
+  }
+
+  /**
+   * TRANSITIONAL (A2 rollout step 2): the pre-A2 whole-vault snapshot, reconstructed
+   * as `buildLocalIdentity` + staging every live file's bytes and every head's
+   * DAG-reachable bases. Kept only so the round + tests land the port split before
+   * the scoped staging moves into the round (§4.3, rollout step 3), which deletes
+   * this. Do not build new callers on it.
+   */
+  async buildLocalState(dag: VersionDag): Promise<VaultState> {
+    const state = await this.buildLocalIdentity(dag);
+
+    // This round's own edits aren't in the persisted DAG yet (recordVersionEdges runs
+    // later), so a fresh head can't reach its base for staging. Fold the pending ops
+    // into a CLONE — never the shared round DAG — so reachability from each head
+    // includes the base the merge will need.
+    const working = dag.clone();
+    for (const op of this.opLogger.getPendingOps()) {
+      if (op.type === 'move') continue;
+      working.addVersion(op.id, op.parents, op.contentHash, op.fileId);
+    }
+
+    const hashes = new Set<string>();
+    for (const entry of state.fileEntries.values()) {
+      if (entry.deleted) continue;
+      if (entry.contentHash !== '') hashes.add(entry.contentHash);
+      if (entry.headVersionId) {
+        for (const h of working.reachableContentHashes(entry.headVersionId)) hashes.add(h);
+      }
+    }
+    await this.stageContent(state, hashes);
+    return state;
   }
 
   async applyMerge(actions: MergeAction[], local: VaultState, remote: VaultState): Promise<{ deferred: Set<string>; deferredConflicts: Set<string> }> {
