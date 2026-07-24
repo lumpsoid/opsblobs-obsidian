@@ -106,13 +106,16 @@ function classifyAndResolve(
       const re = remote.fileEntries.get(collidingRemoteId)!;
       return resolveCreateCollision(localEntry, re, local, remote, /* selfIsRemote */ false, dag);
     }
-    const content = local.contentStore.get(localEntry.contentHash);
-    if (!content) return { type: 'no_op', fileId };
+    // A local-only live file classifies as `send_remote` from its entry alone — no
+    // staged bytes are read (A2, §4.1). The push loop uploads the content from the
+    // pending oplog + content store, not from this action; requiring staged bytes
+    // here only served to flip `no_op`→`send_remote`, and forced every untouched
+    // file's bytes into the snapshot. Dropping it is what lets an untouched file
+    // need zero content staging.
     return {
       type: 'send_remote',
       fileId,
       path: localEntry.path,
-      content,
       hlc: localEntry.hlcTimestamp,
     };
   }

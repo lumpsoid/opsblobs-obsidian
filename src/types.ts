@@ -131,7 +131,13 @@ export type MergeAction =
   // Recording it as a real DAG node is what lets the next edit off a merged file
   // find its base in the graph instead of falling back to the scalar ancestor.
   | { type: 'write_merge'; fileId: string; path: string; content: Uint8Array; parents: string[] }
-  | { type: 'send_remote'; fileId: string; path: string; content: Uint8Array; hlc: HLC }
+  // A local-only live file to push to the server. Transport-only: the applicator
+  // no-ops it and the push loop uploads the bytes from the pending oplog + content
+  // store, NOT from this action — so it carries no `content`. Classified from the
+  // entry alone (no staged bytes needed), which is what lets an untouched file need
+  // zero content staging while still keeping the `send_remote` vs `no_op` split
+  // `updateSyncedPaths` relies on for first-sync path advancement (A2, §4.1).
+  | { type: 'send_remote'; fileId: string; path: string; hlc: HLC }
   | { type: 'delete_local'; fileId: string; path: string }
   | { type: 'delete_remote'; fileId: string; path: string }
   | { type: 'move_local'; fileId: string; fromPath: string; toPath: string }
