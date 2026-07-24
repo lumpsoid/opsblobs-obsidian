@@ -13,6 +13,7 @@ import { HybridLogicalClock } from './hlc';
 import { Ops, mergeVersionId } from './operations';
 import { FileRegistry } from './file-registry';
 import { ContentStore, hashContent } from './content-store';
+import { nowMs } from './perf-clock';
 import { isExcluded } from './exclusion-policy';
 import { hasConflictMarkers } from '../merge/diff3';
 import { VaultFiles } from '../ports/vault-files';
@@ -24,6 +25,24 @@ import { Notifier } from '../ports/notifier';
  *  structurally so `core/` needn't depend on `network/`. */
 export interface HlcPersister {
   save(hlc: HLC): Promise<void>;
+}
+
+/** Per-phase split of a {@link OperationLogger.captureOfflineChanges} pass (perf
+ *  diagnostics, Layer 3). Returned always (never logged unless the caller has a
+ *  sink) so `main.ts` can attribute the first-enable capture total to its
+ *  read / hash / store phases and cut the one that dominates
+ *  (docs/startup-capture-optimization-spec.md §3). The three phase sums are Σ of
+ *  the individual `await`s, so `totalMs - readMs - hashMs - putMs` is the residual
+ *  (registry flush, base64 encode, loop overhead). Accumulation is a handful of
+ *  `nowMs()` calls per file — sub-ms over thousands of files, so it stays
+ *  always-on rather than threaded behind a flag. */
+export interface CaptureStats {
+  files: number;        // files scanned (post-exclusion)
+  opsEmitted: number;   // create/update/delete ops pushed
+  readMs: number;       // Σ files.read
+  hashMs: number;       // Σ hashContent
+  putMs: number;        // Σ contentStore.putNew (base64 encode + fs write; C2 dropped the exists probe)
+  totalMs: number;      // wall time of the whole pass
 }
 
 const OPLOG_DIR = '.vault-sync';
@@ -112,14 +131,24 @@ export class OperationLogger {
    *  the checkpoints use) and returns *before* the delete-detection pass — a partial
    *  `onDisk` set there would look like a vault-wide offline delete. The un-scanned tail
    *  is simply picked up on the next capture; deferring capture is always safe.
+   * @returns {@link CaptureStats} — the read/hash/put phase split + file/op counts for
+   *  the pass (perf diagnostics). An aborted return carries the partial totals scanned
+   *  so far. Callers with no perf sink ignore it.
    */
   async captureOfflineChanges(
     onProgress?: (scanned: number, total: number) => void,
     signal?: AbortSignal,
-  ): Promise<void> {
+  ): Promise<CaptureStats> {
     let changed = false;
     let sinceCheckpoint = 0;
     const onDisk = new Set<string>();
+
+    // Per-phase split (perf diagnostics, Layer 3) — returned always so the caller
+    // can attribute the first-enable total to read/hash/store and cut the dominant
+    // phase (docs/startup-capture-optimization-spec.md §3). Every return path below
+    // (abort, normal end) returns these partial-or-full totals.
+    const startedAt = nowMs();
+    const stats: CaptureStats = { files: 0, opsEmitted: 0, readMs: 0, hashMs: 0, putMs: 0, totalMs: 0 };
 
     // Batch the registry writes. Without this each file re-serialized the WHOLE
     // registry (registerFile + setHeadVersion each save()), so the pass was O(F²) —
@@ -143,12 +172,14 @@ export class OperationLogger {
       if (signal?.aborted) {
         await this.registry.flush();
         if (changed) await this.saveOpLog();
-        return;
+        stats.totalMs = nowMs() - startedAt;
+        return stats;
       }
       if (onProgress && ++scanned % CAPTURE_PROGRESS_EVERY === 0) onProgress(scanned, total);
       const path = ref.path;
       if (this.isExcluded(path)) continue;
       onDisk.add(path);
+      stats.files++;
 
       const entry = this.registry.getByPath(path);
 
@@ -167,9 +198,13 @@ export class OperationLogger {
       // metadata** forces a full re-hash for anyone who suspects a missed edit.
       if (entry && entry.mtime === ref.mtime && entry.size === ref.size) continue;
 
+      let t = nowMs();
       const content = await this.files.read(path);
+      stats.readMs += nowMs() - t;
       if (content === null) continue;
+      t = nowMs();
       const hash = await hashContent(content);
+      stats.hashMs += nowMs() - t;
 
       if (entry && entry.contentHash === hash) {
         // Content is unchanged but the stat drifted (a sync wrote this file, or the
@@ -182,13 +217,20 @@ export class OperationLogger {
         continue;
       }
 
-      await this.contentStore.put(hash, content);
+      // C2: first-enable bulk write — skip the always-miss `exists` probe. This is
+      // the capture's own drift scan; the registry starts empty on first enable, so
+      // every blob is genuinely new, and a content-addressed write is idempotent even
+      // on a later (non-empty) capture, so `putNew` is safe on every pass here.
+      t = nowMs();
+      await this.contentStore.putNew(hash, content);
+      stats.putMs += nowMs() - t;
       const hlcTs = this.hlc.now();
 
       if (!entry) {
         const id = await this.registry.registerFile(path, hlcTs, hash, ref);
         const op = Ops.create(id, path, hash, hlcTs);
         this.pendingOps.push(op);
+        stats.opsEmitted++;
         await this.registry.setHeadVersion(id, op.id);
       } else {
         // A drifted hash means either a placeholder from an older op-less
@@ -204,6 +246,7 @@ export class OperationLogger {
           ? Ops.create(entry.id, path, hash, hlcTs)
           : Ops.update(entry.id, path, hash, hlcTs, parentVersion);
         this.pendingOps.push(op);
+        stats.opsEmitted++;
         await this.registry.setHeadVersion(entry.id, op.id);
       }
       changed = true;
@@ -218,7 +261,10 @@ export class OperationLogger {
       // and never sync. Bounds that loss to <N and keeps the live pending count fresh.
       // Then drop the in-memory content cache: every blob is already on disk
       // (contentStore.put), so a later read re-loads it — this keeps the pass from
-      // accumulating the whole vault's content in RAM.
+      // accumulating the whole vault's content in RAM. The final sub-N window is never
+      // cleared (the counter never reaches N again), so the just-captured tail stays
+      // warm for the sync round that runs right after — it reads those blobs from
+      // memCache instead of a disk read + C4 hash-verify (keeps the round stat-gate hot).
       if (++sinceCheckpoint >= CAPTURE_CHECKPOINT_EVERY) {
         await this.registry.flush();
         await this.saveOpLog();
@@ -263,6 +309,7 @@ export class OperationLogger {
         if (entry.contentHash === '') continue;
         const op = Ops.delete(entry.id, entry.path, entry.contentHash, hlcTs, entry.headVersionId ?? undefined);
         this.pendingOps.push(op);
+        stats.opsEmitted++;
         await this.registry.setHeadVersion(entry.id, op.id);
         changed = true;
       }
@@ -273,6 +320,8 @@ export class OperationLogger {
     // leaving disk at the last checkpoint (registry and oplog consistent there).
     await this.registry.flush();
     if (changed) await this.saveOpLog();
+    stats.totalMs = nowMs() - startedAt;
+    return stats;
     } finally {
       this.registry.resumeSaves();
     }

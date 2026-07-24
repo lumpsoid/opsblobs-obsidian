@@ -472,10 +472,18 @@ export default class VaultSyncPlugin extends Plugin {
   private async captureOfflineWithPerf(): Promise<void> {
     const sink = this.perfSink('startup');
     const t0 = performance.now();
+    // Sub-phase accumulators for the dominant `putMs` (A3 §3.2): the base64 encode
+    // (in ContentStore.putNew) and the atomic-write ceremony's native sub-ops (in
+    // ObsidianMetadataStore.write, scoped to content blobs). Armed only when the perf
+    // sink is on so a normal enable pays nothing; read + logged + cleared after the pass.
+    const putPerf = sink ? { encodeMs: 0 } : null;
+    const writePerf = sink ? { writeMs: 0, writeTmpMs: 0, existsMs: 0, removeMs: 0, renameMs: 0 } : null;
+    this.contentStore.capturePutPerf = putPerf;
+    this.metadata.captureWritePerf = writePerf;
     // Only surface a progress UI for a *large* first-enable — a routine capture (a
     // handful of changed files) fires the callback at most once and should stay quiet.
     let announced = false;
-    await this.opLogger.captureOfflineChanges((scanned, total) => {
+    const stats = await this.opLogger.captureOfflineChanges((scanned, total) => {
       if (total > CAPTURE_PROGRESS_UI_MIN) {
         if (!announced) {
           announced = true;
@@ -491,7 +499,33 @@ export default class VaultSyncPlugin extends Plugin {
       // Diagnostics (Layer 3): per-phase heap + timing only when perfLog is on.
       sink?.(`captureOfflineChanges ${scanned}/${total}${heapNote()}`, performance.now() - t0);
     }, this.captureAbort.signal);
-    sink?.(`captureOfflineChanges total${heapNote()}`, performance.now() - t0);
+    // Diagnostics (Layer 3): the read/hash/put phase split of the capture total, so
+    // the first-enable cliff is attributed to the phase that dominates before we cut it
+    // (docs/startup-capture-optimization-spec.md §3). `otherMs` = registry flush + base64
+    // + loop overhead not in the three measured phases. Emitted only when perfLog is on.
+    sink?.(`captureOfflineChanges readMs (${stats.files} files)`, stats.readMs);
+    sink?.(`captureOfflineChanges hashMs`, stats.hashMs);
+    sink?.(`captureOfflineChanges putMs`, stats.putMs);
+    // The putMs sub-split (A3 §3.2): base64 encode (CPU) vs the atomic-write ceremony's
+    // native adapter sub-ops. `putOtherMs` = ensureShard + memCache + loop overhead not
+    // in the five measured sub-phases. This decides whether the temp-write + rename
+    // ceremony is worth replacing with a direct write for the disposable content store.
+    if (putPerf && writePerf) {
+      const { encodeMs } = putPerf;
+      const { writeMs, writeTmpMs, existsMs, removeMs, renameMs } = writePerf;
+      sink?.(`captureOfflineChanges put.encodeMs`, encodeMs);
+      sink?.(`captureOfflineChanges put.writeMs`, writeMs);           // C4 direct write
+      sink?.(`captureOfflineChanges put.writeTmpMs`, writeTmpMs);     // atomic ceremony — now 0
+      sink?.(`captureOfflineChanges put.existsMs`, existsMs);         // atomic ceremony — now 0
+      sink?.(`captureOfflineChanges put.removeMs`, removeMs);         // atomic ceremony — now 0
+      sink?.(`captureOfflineChanges put.renameMs`, renameMs);         // atomic ceremony — now 0
+      sink?.(`captureOfflineChanges put.otherMs`, stats.putMs - encodeMs - writeMs - writeTmpMs - existsMs - removeMs - renameMs);
+    }
+    sink?.(`captureOfflineChanges otherMs`, stats.totalMs - stats.readMs - stats.hashMs - stats.putMs);
+    sink?.(`captureOfflineChanges total${heapNote()}`, stats.totalMs);
+    // Disarm the diagnostics so nothing accumulates outside the capture pass.
+    this.contentStore.capturePutPerf = null;
+    this.metadata.captureWritePerf = null;
     // Capture done — the modal's indexing section clears itself once this reads null.
     this.indexingProgress = null;
     if (announced) {

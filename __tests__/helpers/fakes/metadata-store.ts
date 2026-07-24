@@ -36,6 +36,16 @@ export class FakeMetadataStore implements MetadataStore {
     if (!this.mtimes.has(path)) this.mtimes.set(path, this.clock);
   }
 
+  /** Non-atomic direct write. The in-memory fake has no torn-write window, so it is
+   *  behaviourally identical to `write`; counted separately so a test can assert the
+   *  content store took the direct path (C4) rather than the atomic ceremony. */
+  async writeDirect(path: string, data: string): Promise<void> {
+    this.io.writesDirect++;
+    this.io.bytesWritten += data.length;
+    this.files.set(path, data);
+    if (!this.mtimes.has(path)) this.mtimes.set(path, this.clock);
+  }
+
   async append(path: string, data: string): Promise<void> {
     this.io.appends++;
     this.io.bytesAppended += data.length;

@@ -9,9 +9,32 @@
 
 import { App, normalizePath } from 'obsidian';
 import { MetadataStore } from '../ports/metadata-store';
+import { nowMs } from '../core/perf-clock';
+
+/** Optional sub-phase accumulator for the atomic `write` ceremony, scoped to content
+ *  blobs (A3 first-enable capture diagnostics, §3.2). When set, `write` splits a
+ *  content-blob write into its native adapter sub-ops so `main.ts` can attribute the
+ *  dominant `putMs` — deciding whether the temp-write + rename ceremony (all cost, no
+ *  benefit for a disposable hash-addressed store) is worth replacing with a direct
+ *  write. Null by default → zero overhead beyond one branch per write. */
+export interface WritePerf {
+  writeMs: number;    // Σ adapter.write(target) via the direct path (C4)
+  writeTmpMs: number; // Σ adapter.write(tmp) via the atomic ceremony
+  existsMs: number;   // Σ adapter.exists(target)
+  removeMs: number;   // Σ adapter.remove(target) — rare on a fresh store
+  renameMs: number;   // Σ adapter.rename(tmp, target)
+}
+
+/** Content-blob path prefix the {@link WritePerf} split is scoped to — so the split
+ *  measures only the first-enable blob writes, not the oplog/registry/DAG checkpoints. */
+const CONTENT_PREFIX = '.vault-sync/content/';
 
 export class ObsidianMetadataStore implements MetadataStore {
   constructor(private app: App) {}
+
+  /** When non-null, `write` accumulates its content-blob sub-phase timings here
+   *  (A3 capture diagnostics). Set by `main.ts` around the first-enable capture. */
+  captureWritePerf: WritePerf | null = null;
 
   async read(path: string): Promise<string | null> {
     const adapter = this.app.vault.adapter;
@@ -43,9 +66,48 @@ export class ObsidianMetadataStore implements MetadataStore {
     const adapter = this.app.vault.adapter;
     const target = normalizePath(path);
     const tmp = `${target}.tmp`;
+    // Fast path — no diagnostics, or a non-content write (oplog/registry/DAG): keep
+    // the ceremony untimed. Only content-blob writes are split, and only when a
+    // capture set the accumulator.
+    const perf = this.captureWritePerf && target.startsWith(CONTENT_PREFIX) ? this.captureWritePerf : null;
+    if (!perf) {
+      await adapter.write(tmp, data);
+      if (await adapter.exists(target)) await adapter.remove(target);
+      await adapter.rename(tmp, target);
+      return;
+    }
+    let t = nowMs();
     await adapter.write(tmp, data);
-    if (await adapter.exists(target)) await adapter.remove(target);
+    perf.writeTmpMs += nowMs() - t;
+    t = nowMs();
+    const present = await adapter.exists(target);
+    perf.existsMs += nowMs() - t;
+    if (present) {
+      t = nowMs();
+      await adapter.remove(target);
+      perf.removeMs += nowMs() - t;
+    }
+    t = nowMs();
     await adapter.rename(tmp, target);
+    perf.renameMs += nowMs() - t;
+  }
+
+  async writeDirect(path: string, data: string): Promise<void> {
+    // Non-atomic single write — no temp file, no rename. The content store's blobs are
+    // content-addressed and disposable, and `ContentStore.get` hash-verifies on read, so
+    // a torn write degrades to a missing base (F1), not a corrupt one. On this bridge the
+    // rename the atomic path pays costs as much as this write itself (A3 split), so this
+    // ~halves the per-blob write cost. NEVER use for the durable singletons — `write`.
+    const adapter = this.app.vault.adapter;
+    const target = normalizePath(path);
+    const perf = this.captureWritePerf && target.startsWith(CONTENT_PREFIX) ? this.captureWritePerf : null;
+    if (!perf) {
+      await adapter.write(target, data);
+      return;
+    }
+    const t = nowMs();
+    await adapter.write(target, data);
+    perf.writeMs += nowMs() - t;
   }
 
   async append(path: string, data: string): Promise<void> {

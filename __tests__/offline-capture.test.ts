@@ -19,6 +19,7 @@ import { ServerSyncClient } from '../src/network/server-sync';
 import { FakeSyncServer } from '../src/network/fake-server';
 import { VaultCrypto } from '../src/network/encryption';
 import { TestDevice } from './helpers/test-device';
+import { uint8ToBase64 } from '../src/core/content-store';
 
 const SALT = new Uint8Array([9, 9, 9, 9, 9, 9, 9, 9, 8, 8, 8, 8, 8, 8, 8, 8]);
 
@@ -75,6 +76,32 @@ describe('first-enable on a pre-existing vault (H10)', () => {
     expect(B.activeEntries()).toHaveLength(3);
   });
 
+  test('captureOfflineChanges returns per-phase stats (files/ops counts, non-negative phase totals)', async () => {
+    const A = await TestDevice.create('dev-a');
+    const N = 5;
+    for (let i = 0; i < N; i++) {
+      await A.seedExistingFile(`note-${i}.md`, `body ${i}\n`);
+    }
+
+    const stats = await A.opLogger.captureOfflineChanges();
+
+    // One file scanned + one create op emitted per seeded file.
+    expect(stats.files).toBe(N);
+    expect(stats.opsEmitted).toBe(N);
+    // Every phase total is a non-negative accumulation, and the residual (otherMs)
+    // is non-negative too — the three phases can't sum past the wall total.
+    expect(stats.readMs).toBeGreaterThanOrEqual(0);
+    expect(stats.hashMs).toBeGreaterThanOrEqual(0);
+    expect(stats.putMs).toBeGreaterThanOrEqual(0);
+    expect(stats.totalMs).toBeGreaterThanOrEqual(0);
+    expect(stats.totalMs).toBeGreaterThanOrEqual(stats.readMs + stats.hashMs + stats.putMs);
+
+    // A second no-change scan scans the same files but emits no ops (O1 gate).
+    const again = await A.opLogger.captureOfflineChanges();
+    expect(again.files).toBe(N);
+    expect(again.opsEmitted).toBe(0);
+  });
+
   test('captureOfflineChanges is idempotent — a second scan with no change emits nothing', async () => {
     const A = await TestDevice.create('dev-a');
     await A.seedExistingFile('a.md', 'body\n');
@@ -88,6 +115,115 @@ describe('first-enable on a pre-existing vault (H10)', () => {
     expect(A.pendingOps).toHaveLength(2);
     expect(A.pendingOps.filter(op => op.path === 'a.md')).toHaveLength(1);
     expect(A.pendingOps.filter(op => op.path === 'b.md')).toHaveLength(1);
+  });
+});
+
+describe('C2 — first-enable bulk write skips the redundant `exists` probe', () => {
+  // On a fresh store every `ContentStore.put` exists-probe is a guaranteed miss, so the
+  // first-enable capture uses the `putNew` bulk path: no per-file blob `exists` round-trip,
+  // and duplicate-content files still write each distinct hash once (memCache dedup). See
+  // docs/startup-capture-optimization-spec.md §4.2 / §6.
+
+  test('capture writes via putNew (no per-file blob exists probe) and dedups duplicate content', async () => {
+    const A = await TestDevice.create('dev-a');
+
+    // Four files, two distinct contents — two duplicate pairs.
+    await A.seedExistingFile('a1.md', 'alpha\n');
+    await A.seedExistingFile('a2.md', 'alpha\n'); // dup of a1
+    await A.seedExistingFile('b1.md', 'beta\n');
+    await A.seedExistingFile('b2.md', 'beta\n');  // dup of b1
+
+    // Arm the encode sub-phase accumulator (A3 §3.2 diagnostics) — the capture must
+    // populate it through the real putNew path without disturbing the write.
+    const putPerf = { encodeMs: 0 };
+    A.contentStore.capturePutPerf = putPerf;
+
+    // The capture must take the exists-free bulk path, never the guarded `put`.
+    let putCalls = 0;
+    let putNewCalls = 0;
+    const origPut = A.contentStore.put.bind(A.contentStore);
+    const origPutNew = A.contentStore.putNew.bind(A.contentStore);
+    A.contentStore.put = async (h, c) => { putCalls++; return origPut(h, c); };
+    A.contentStore.putNew = async (h, c) => { putNewCalls++; return origPutNew(h, c); };
+
+    // The C2-removed cost: an `exists` probe on a content blob (`*.bin`) path. The
+    // shard-dir `exists` (a directory path) is a separate, session-amortised cost and
+    // is not counted here.
+    let blobExists = 0;
+    let blobDirectWrites = 0;
+    let blobAtomicWrites = 0;
+    const origExists = A.metadata.exists.bind(A.metadata);
+    const origWrite = A.metadata.write.bind(A.metadata);
+    const origWriteDirect = A.metadata.writeDirect.bind(A.metadata);
+    A.metadata.exists = async p => { if (p.endsWith('.bin')) blobExists++; return origExists(p); };
+    A.metadata.write = async (p, d) => { if (p.endsWith('.bin')) blobAtomicWrites++; return origWrite(p, d); };
+    A.metadata.writeDirect = async (p, d) => { if (p.endsWith('.bin')) blobDirectWrites++; return origWriteDirect(p, d); };
+
+    await A.opLogger.captureOfflineChanges();
+
+    // Bulk path taken for every scanned file; the exists-guarded `put` never called.
+    expect(putCalls).toBe(0);
+    expect(putNewCalls).toBe(4);
+    // No per-file blob exists probe at all — the whole point of C2.
+    expect(blobExists).toBe(0);
+    // C4: blobs take the non-atomic direct-write path, never the atomic ceremony. Two
+    // distinct hashes → exactly two writes; the duplicates dedup in memCache (no
+    // redundant write, no corruption of the already-written blob).
+    expect(blobDirectWrites).toBe(2);
+    expect(blobAtomicWrites).toBe(0);
+    // The encode accumulator was threaded through the two real writes (a finite,
+    // non-negative CPU total — the wiring works; exact ms is a device concern).
+    expect(Number.isFinite(putPerf.encodeMs)).toBe(true);
+    expect(putPerf.encodeMs).toBeGreaterThanOrEqual(0);
+
+    // Restore spies before reading content back through the store.
+    A.metadata.exists = origExists;
+
+    // Each file's blob is readable back by its registry hash — content intact.
+    for (const [path, text] of [['a1.md', 'alpha\n'], ['b1.md', 'beta\n']] as const) {
+      const hash = A.entryByPath(path)!.contentHash;
+      const bytes = await A.content(hash);
+      expect(bytes).not.toBeNull();
+      expect(new TextDecoder().decode(bytes!)).toBe(text);
+    }
+    // Duplicate pairs share the one blob (same hash).
+    expect(A.entryByPath('a1.md')!.contentHash).toBe(A.entryByPath('a2.md')!.contentHash);
+    expect(A.entryByPath('b1.md')!.contentHash).toBe(A.entryByPath('b2.md')!.contentHash);
+  });
+});
+
+describe('C4 — direct (non-atomic) blob write is made safe by hash-verify-on-read', () => {
+  // The direct write drops the atomic temp+rename ceremony, so a crash can leave a torn
+  // blob on disk. The safety net: `ContentStore.get` hashes the bytes it reads and, on a
+  // mismatch, reports the blob MISSING — so the merge degrades to a conflict (F1) instead
+  // of three-way-merging against corrupt content. docs/startup-capture-optimization-spec.md §4.
+
+  const blobPath = (hash: string): string => `.vault-sync/content/${hash.slice(0, 2)}/${hash}.bin`;
+
+  test('a blob whose on-disk bytes no longer hash to its name reads back as null', async () => {
+    const A = await TestDevice.create('dev-a');
+    await A.seedExistingFile('note.md', 'real content\n');
+    await A.opLogger.captureOfflineChanges();
+    const hash = A.entryByPath('note.md')!.contentHash;
+
+    // Intact blob round-trips from disk (memCache dropped first so the read hits disk).
+    A.contentStore.clearMemCache();
+    const good = await A.content(hash);
+    expect(good).not.toBeNull();
+    expect(new TextDecoder().decode(good!)).toBe('real content\n');
+
+    // Corrupt the on-disk blob (simulate a torn write): the bytes no longer hash to `hash`.
+    A.metadata.set(blobPath(hash), uint8ToBase64(new TextEncoder().encode('tampered / torn bytes')));
+    A.contentStore.clearMemCache();
+
+    // get() must catch the mismatch and report the base as missing, not hand back
+    // corrupt bytes that would silently poison a three-way merge.
+    expect(await A.content(hash)).toBeNull();
+  });
+
+  test('a genuinely absent blob still reads as null (unchanged)', async () => {
+    const A = await TestDevice.create('dev-a');
+    expect(await A.content('0'.repeat(64))).toBeNull();
   });
 });
 

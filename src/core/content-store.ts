@@ -13,6 +13,16 @@
 
 import { MetadataStore } from '../ports/metadata-store';
 import { uint8ToBase64, base64ToUint8 } from './encoding';
+import { nowMs } from './perf-clock';
+
+/** Optional per-`putNew` sub-phase accumulator (first-enable capture diagnostics,
+ *  A3 §3.2). When set on a {@link ContentStore}, `putNew` adds the base64-encode time
+ *  here so `main.ts` can attribute how much of `putMs` is CPU encode vs the native
+ *  `MetadataStore.write` (whose own sub-split — write-tmp / exists / rename — the
+ *  Obsidian adapter records separately). Null by default → zero overhead. */
+export interface PutPerf {
+  encodeMs: number; // Σ uint8ToBase64
+}
 
 // Re-exported so existing importers of these names from content-store keep working.
 export { uint8ToBase64, base64ToUint8 };
@@ -46,6 +56,10 @@ export class ContentStore {
   // pays at most one `mkdir` per shard (256 max) instead of one per file.
   private ensuredShards: Set<string> = new Set();
 
+  /** When non-null, `putNew` accumulates its base64-encode time here (A3 capture
+   *  diagnostics). Set by `main.ts` around the first-enable capture; null otherwise. */
+  capturePutPerf: PutPerf | null = null;
+
   constructor(private metadata: MetadataStore) {}
 
   async init(): Promise<void> {
@@ -67,7 +81,44 @@ export class ContentStore {
     }
   }
 
-  /** Retrieve content by hash. Returns null if not found. */
+  /**
+   * Bulk-write path for a KNOWN-EMPTY store (first-enable capture, C2). Skips the
+   * per-write `exists` disk probe that {@link put} uses to dedup: on a fresh store
+   * that probe is *always* a miss — one wasted native round-trip per file, and the
+   * write phase is ~74% of the first-enable capture with the `exists` stat a rough
+   * third of it (docs/startup-capture-optimization-spec.md §4.2, measured A3 split).
+   *
+   * Safe because a content-addressed write is idempotent: a hash names its exact
+   * bytes, so overwriting an already-present blob rewrites byte-identical content —
+   * it can never corrupt an existing blob. Still dedups *within the session* via
+   * `memCache` (an in-memory check, no disk round-trip), so duplicate-content files
+   * write each distinct hash at most once per checkpoint window. Use ONLY where the
+   * store is known-empty (the first-enable pass); the steady-state {@link put} keeps
+   * its disk `exists` dedup for the general case.
+   */
+  async putNew(hash: string, content: Uint8Array): Promise<void> {
+    // A memCache hit means this blob was already written (put/putNew) or loaded
+    // (get) this session — both imply it is on disk — so the write is redundant.
+    if (this.memCache.has(hash)) return;
+    this.memCache.set(hash, content);
+    await this.ensureShard(hash);
+    const t = nowMs();
+    const b64 = uint8ToBase64(content);
+    if (this.capturePutPerf) this.capturePutPerf.encodeMs += nowMs() - t;
+    // Direct (non-atomic) write — C4. Safe here because the blob is content-addressed
+    // and `get` hash-verifies on read: a torn write reads back as missing (F1), never as
+    // a corrupt base. Skips the temp-file + rename ceremony, whose rename alone costs as
+    // much as this write on the mobile bridge (A3 perf split).
+    await this.metadata.writeDirect(this.contentPath(hash), b64);
+  }
+
+  /** Retrieve content by hash. Returns null if not found — or if the stored bytes fail
+   *  to hash back to `hash` (a torn blob from an interrupted non-atomic `putNew` write,
+   *  C4). Treating a corrupt blob as *missing* is the safety net that lets the content
+   *  store use a non-atomic direct write: the merge sees a missing base and degrades to a
+   *  conflict (F1) rather than three-way-merging against corrupt bytes. Verification runs
+   *  only on the disk path — memCache content was just written/verified in-process, and
+   *  blob reads are rare (merge bases) so the extra SHA-256 (0.16 ms) is immaterial. */
   async get(hash: string): Promise<Uint8Array | null> {
     const cached = this.memCache.get(hash);
     if (cached) return cached;
@@ -75,6 +126,9 @@ export class ContentStore {
     const raw = await this.metadata.read(this.contentPath(hash));
     if (raw === null) return null;
     const content = base64ToUint8(raw);
+    // Integrity check: a content hash names its exact bytes, so a mismatch means the
+    // blob is torn/corrupt. Don't cache it and don't return it — report missing (F1).
+    if ((await hashContent(content)) !== hash) return null;
     this.memCache.set(hash, content);
     return content;
   }

@@ -20,6 +20,10 @@ export interface IoCounters {
    *  each one is an *atomic* write = write-temp + remove + rename ≈ 3 fs syscalls;
    *  see METADATA_WRITE_FS_AMPLIFICATION. */
   writes: number;
+  /** `writeDirect` calls (the content store's non-atomic single-write path, C4) — one
+   *  fs syscall each, NOT the 3-syscall atomic dance. Counted apart from `writes` so a
+   *  test can assert a blob took the direct path. */
+  writesDirect: number;
   /** `append` calls (the DAG journal's delta-sized writer — the one store that does
    *  NOT rewrite the whole file). */
   appends: number;
@@ -49,7 +53,7 @@ export const METADATA_WRITE_FS_AMPLIFICATION = 3;
 
 export function newIoCounters(): IoCounters {
   return {
-    reads: 0, writes: 0, appends: 0, removes: 0, renames: 0,
+    reads: 0, writes: 0, writesDirect: 0, appends: 0, removes: 0, renames: 0,
     lists: 0, stats: 0, exists: 0, bytesWritten: 0, bytesAppended: 0,
   };
 }
@@ -64,6 +68,7 @@ export function diffIoCounters(before: IoCounters, after: IoCounters): IoCounter
   return {
     reads: after.reads - before.reads,
     writes: after.writes - before.writes,
+    writesDirect: after.writesDirect - before.writesDirect,
     appends: after.appends - before.appends,
     removes: after.removes - before.removes,
     renames: after.renames - before.renames,

@@ -9,7 +9,7 @@
 //  the real SHA-256 content hashes.
 
 import { describe, test, expect } from 'vitest';
-import { ContentStore, uint8ToBase64 } from '../src/core/content-store';
+import { ContentStore, hashContent, uint8ToBase64 } from '../src/core/content-store';
 import { FileRegistry } from '../src/core/file-registry';
 import { VersionDag } from '../src/core/version-dag';
 import { FileEntry, HLC, SyncSettings } from '../src/types';
@@ -119,11 +119,13 @@ describe('ContentStore — sharded put/get/has/delete round-trip', () => {
     await store.init();
 
     const bytes = new TextEncoder().encode('hello');
-    const hash = 'deadbeefcafe';
+    // A real content hash — `get` now hash-verifies on read (C4), so the key must be the
+    // true SHA-256 of the bytes, exactly as production `put`/`putNew` always supply it.
+    const hash = await hashContent(bytes);
     await store.put(hash, bytes);
 
-    // Physically sharded on disk.
-    expect(meta.has(`${CONTENT_DIR}/de/${hash}.bin`)).toBe(true);
+    // Physically sharded on disk under the hash's first byte.
+    expect(meta.has(`${CONTENT_DIR}/${hash.slice(0, 2)}/${hash}.bin`)).toBe(true);
 
     // A fresh store (empty memCache) must find it purely from disk.
     const cold = new ContentStore(meta);
@@ -133,7 +135,7 @@ describe('ContentStore — sharded put/get/has/delete round-trip', () => {
 
     await cold.delete(hash);
     expect(await cold.has(hash)).toBe(false);
-    expect(meta.has(`${CONTENT_DIR}/de/${hash}.bin`)).toBe(false);
+    expect(meta.has(`${CONTENT_DIR}/${hash.slice(0, 2)}/${hash}.bin`)).toBe(false);
   });
 
   test('put is a no-op when the blob already exists on disk', async () => {
