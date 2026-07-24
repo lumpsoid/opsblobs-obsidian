@@ -423,12 +423,163 @@ size).
 `26af94b`/`b6230d2`); it does not recur. Note the first sync's identity is 99 ms and
 staging 5.8 ms — the A2 phases are cheap even here.
 
-**Next on-device target: startup capture (184 s).** The cold-start
+**Next on-device target: startup capture (was 184 s).** The cold-start
 `captureOfflineChanges` on this 8.4k-file vault (`startup … total heapMB=77/1940
-184027.5ms`) now dominates the whole session — bigger than either sync round. Post the
-O(F²) batching fix it is no longer a *cliff*, but it is still a long O(F) stat-scan +
-registry build. Separate from the round; the next thing to look at (append-only registry
-journal / persisted-identity snapshot, both already flagged as future work above).
+184027.5ms`) dominated the whole session — bigger than either sync round. Post the O(F²)
+batching fix it was no longer a *cliff* but still a long O(F) native-I/O pass. **This became
+the A3 optimization series (`docs/startup-capture-optimization-spec.md`): instrument →
+C2 (no-op) → C4 (direct write, −49%) → C1 next. Full breakdown + the per-call-latency finding
+in "The A3 capture phase split" immediately below; status in "Still to do".** The append-only
+registry journal / persisted-identity snapshot idea helps *subsequent* cold starts, not this
+first-enable pass (nothing is persisted yet on first enable), so it is out of A3's scope.
+
+### The A3 capture phase split — on-device, measured (`docs/startup-capture-optimization-spec.md` §3 step 1)
+
+Instrumented `captureOfflineChanges` to return a read/hash/put split and re-ran a
+**first-enable** (`.vault-sync/` deleted → empty registry, O1 gate never fires) on the same
+Android WebView vault, F = **8389** files:
+
+| phase | ms | share | per-file | what it is |
+|---|--:|--:|--:|---|
+| **readMs** | 36,214.8 | 18.2% | 4.32 ms | Σ `files.read` — one native fs read/file |
+| **hashMs** | 1,335.3 | **0.67%** | 0.16 ms | Σ `hashContent` — SHA-256, the only pure-CPU phase |
+| **putMs** | 147,522.1 | **74.2%** | 17.59 ms | Σ `contentStore.put` — `exists` stat + base64 encode + fs write |
+| otherMs | 13,737.7 | 6.9% | 1.64 ms | registry flush + loop overhead |
+| **total** | **198,809.9** | 100% | 23.70 ms | `heapMB=68/1940` |
+
+**Hypothesis confirmed — the cost is fs-round-trip-bound, not CPU-bound.** Hashing (the only
+CPU phase) is **0.67%**; `read + put` (native fs round-trips) are **92.4%**. `put` alone is
+**74%** and is ~4× a `read` per file (17.6 ms vs 4.3 ms) — consistent with `put` doing **two**
+round-trips (the `exists` stat + the write) plus a base64 encode, vs `read`'s one. (This run's
+198.8 s vs the earlier 184 s is device variance; same order.)
+
+**What the split decides** (spec §3.2): `readMs + putMs` dominate; `hashMs` negligible → no
+hashing offload. The initial read of this pointed at C2 (drop the `exists` probe) + C1
+(concurrency). **Both the C2 estimate and the C3 rationale turned out wrong on re-measure — see
+below.**
+
+### C2 landed and was a **no-op on device** — the `exists` probe was ~free
+
+`ContentStore.putNew` (skips the fresh-store `exists` dedup) shipped; re-measured `putMs` was
+**146.7 s** vs 147.5 s — flat within device noise. The "exists ≈ ⅓ of put" estimate was wrong:
+Obsidian answers a cold negative existence check from an in-memory index (no byte I/O), so the
+probe cost ~0. **Lesson (again): measure the sub-structure, don't estimate it.** C2 is harmless
+and correct (keep it), just not a win.
+
+### The `putMs` sub-split — the decisive measurement (rename ≈ write, both latency-bound)
+
+Instrumented `MetadataStore.write`'s atomic ceremony (scoped to content blobs) + the base64
+encode. Third first-enable run, F = 8389, `putMs` = **145,788 ms**:
+
+| put sub-phase | ms | % of put | per-file | what it is |
+|---|--:|--:|--:|---|
+| **renameMs** | 65,588 | **45.0%** | 7.82 ms | `adapter.rename(tmp→target)` — **moves zero bytes** |
+| **writeTmpMs** | 63,041 | **43.2%** | 7.51 ms | `adapter.write(tmp, data)` — the actual byte write |
+| existsMs | 14,460 | 9.9% | 1.72 ms | `adapter.exists(target)` inside the ceremony |
+| otherMs | 1,768 | 1.2% | 0.21 ms | ensureShard + memCache |
+| encodeMs | 755 | **0.5%** | 0.09 ms | base64 encode |
+| removeMs | 176 | 0.1% | 0.02 ms | `adapter.remove` (target rarely pre-exists) |
+
+**The finding that settles the strategy: `rename` (7.82 ms/file) costs as much as the byte
+`write` (7.51 ms) while transferring no data.** So every native fs call on the Android/Capacitor
+bridge is ~pure latency (~2–8 ms), independent of payload — the cost is the *number* of native
+calls, not their size. Consequences:
+
+- **The atomic-write ceremony is 3 native calls (write-tmp + exists + rename); a direct write is
+  1.** Eliminating exists + rename + remove = **~80 s of pure ceremony**, with the 63 s
+  byte-write the only irreducible part. The ceremony is crash-safety the **disposable,
+  hash-addressed** content store doesn't need (obtainable far cheaper via hash-verify-on-read →
+  F1). **This is the primary cut (C4, direct blob write): putMs 146 s → ~65 s, total → ~120 s.**
+- **C3 (raw-binary / drop base64) is dead.** `encodeMs` is 0.5 s and writes are latency- not
+  bandwidth-bound (rename proves it), so a 1.33× smaller payload saves almost nothing. Dropped —
+  not worth the port + adapter + on-disk-format change.
+- **C1 (bounded concurrency) still compounds** — overlap the remaining ~99 s of serial
+  read + direct-write round-trips; ~40–50 s total plausible at K=8.
+
+Curiosity (doesn't change the plan): the `exists` C2 removed was ~free, yet `exists(target)`
+*inside* `write` costs 1.72 ms — a cold negative lookup is cached, but the stat *after*
+`write(tmp)` hits disk. The direct write deletes that expensive one too.
+
+### C4 landed — on-device confirmed (`putMs` 146 s → 56 s, total 200 s → 102 s)
+
+`MetadataStore.writeDirect` (a single non-atomic write; `ContentStore.putNew` uses it, made safe
+by hash-verify-on-read in `get`) re-measured on the same first-enable, F=8389:
+
+| phase | pre-C4 | **post-C4** | note |
+|---|--:|--:|---|
+| **putMs** | 145,788 | **55,767** | −90 s |
+| — put.writeMs (direct) | — | 52,934 | the byte-write, now to target |
+| — put.renameMs | 65,588 | **0** | ceremony gone |
+| — put.existsMs | 14,460 | **0** | ceremony gone |
+| — put.writeTmpMs | 63,041 | **0** | → `writeMs` |
+| — put.encodeMs | 755 | 584 | base64 (0.6%) |
+| readMs | 36,215 | 31,612 | faster run (device variance) |
+| hashMs | 1,335 | 1,323 | — |
+| otherMs | 13,738 | 13,540 | checkpoint atomic writes (registry + oplog) |
+| **total** | ~199,000 | **102,242** | **−49%** |
+
+Ceremony confirmed eliminated (`rename/exists/writeTmp` = 0). The remaining profile is now two
+serial native-I/O phases — **write 55.8 s + read 31.6 s = 87 s** — plus **otherMs 13.5 s** (the
+per-200-op registry+oplog checkpoints, which correctly *keep* the atomic write — durable
+singletons). Both dominant phases are latency-bound serial round-trips → **C1 (bounded
+concurrency)** was the hypothesised last lever: overlap the 87 s K-wide.
+
+### C1 measured — concurrency REGRESSED; the bridge serializes fs (K defaulted to 1)
+
+C1's bounded-concurrency scan (K=8) re-measured on the same first-enable, F=8389:
+
+| phase | C4 serial | **C1 K=8** (Σ workers) | per-call | note |
+|---|--:|--:|--:|---|
+| readMs | 31,612 | **391,577** | 3.8 → 46.7 ms | inflated ~12× — see below |
+| putMs | 55,767 | **459,804** | 6.6 → 54.8 ms | writeMs 436,647 of it |
+| hashMs | 1,323 | 1,632 | — | CPU, unchanged |
+| otherMs | 13,540 | −732,735 | — | negative-residual tell (Σ > wall) |
+| **wall total** | **102,242** | **120,278** | | **+18 s REGRESSION** |
+
+**The bridge does not parallelize native fs.** The 851 s of aggregate read+put "busy" crammed into
+120 s wall is not parallelism — it is the *same serialized-bridge throughput* as C4, with each
+worker's `await` clock inflated ~8–12× because it now spends most of its time **blocked waiting for
+the other K−1 in-flight calls to drain through a single-threaded bridge** (the shared serial queue
+double-counted across workers). Real parallelism would have driven wall *down* toward ~15–25 s; it
+rose by 18 s (contention + per-chunk barrier + scheduling). **This settles the open A3 question and
+is a load-bearing environment constraint: Android/Capacitor native fs is a serial resource — cut
+call COUNT (batching), never call OVERLAP.** Same dead end as C3.
+
+**Disposition:** the C1 pipeline was **reverted** — `captureOfflineChanges` is back to the serial
+C4 loop (concurrency = complexity + risk for a measured regression). The finding is the deliverable.
+The write half's next lever is **pack-writes** (A3 endgame step 3 — batch many blobs per native
+write; parallelism-independent, so it works despite the serial bridge), targeting the ~56 s of
+serial `put.writeMs`. Full analysis: `docs/capture-concurrency-spec.md` §7/§9.
+
+### Read-path probe — `cachedRead` vs `readBinary` (measured; a modest, deferred win)
+
+The read phase (~31.6 s, 31%) is all `vault.readBinary` (disk). Hypothesis: since Obsidian reads
+every markdown file on startup to build its metadata cache, `vault.cachedRead` might serve content
+from a warm in-memory cache by the time capture runs. A/B diagnostic measured **both** paths per
+file in one first-enable run (cachedRead+encode timed first, then readBinary; bytes compared), F=8389:
+
+| metric | value | note |
+|---|--:|---|
+| read.mismatches | **0** | `encode(cachedRead)` byte-identical to disk across all 8016 md files — **hash-safe** |
+| read.cachedMs (8016 md) | 22,374 | 2.79 ms/file |
+| read.binaryMs (8016 md + 373 bin) | 31,721 | 3.78 ms/file avg |
+| read.binOnly (attachments) | 373 | stay on `readBinary` (cachedRead would corrupt binary) |
+
+**Isolating markdown: cachedRead 22.4 s vs ~30.3 s readBinary → ~8 s / ~25% off reads** (read phase
+~31.6 → ~24 s; total ~102 → ~94 s, ~8%). **Byte-safe** (0 mismatches).
+
+**The hypothesis was half-wrong, and that's the durable finding:** 2.79 ms/file is still
+**disk-read territory, not memory** — a warm-content-cache hit would be microseconds. Obsidian's
+metadata cache holds *parsed metadata* (links/tags/headings), **not raw file content**, so on a
+cold first-enable `cachedRead` still hits the filesystem; the ~25% is just a lighter read path
+(cached string vs binary ArrayBuffer marshalling), not a warm cache. So **reads are a ~24–31 s floor**
+even with cachedRead — there is no large read win to be had on first-enable.
+
+**Disposition: deferred, diagnostic reverted.** ~8 s for a one-time cost, and `cachedRead` adds a
+cache-coherence dependency (can return content Obsidian hasn't re-read after an unprocessed
+`modify`) to a data-safety tool — not worth it now relative to pack-writes' ~50 s. If revisited, wire
+cachedRead **capture-path-only** (keep the sync round on fresh `readBinary`). The A/B instrumentation
+was removed after this measurement.
 
 ---
 
@@ -532,9 +683,22 @@ so both would reproduce in the WebView.
       converged round **56.3 s → 3.1 s**, staging **52 s → 36 ms**; now pull-bound. The
       laptop's "R2 not warranted" (~8 ms on fake fs) was overturned by the real fs (52 s).
       See "The A2 fix" above.
-- [ ] **Startup `captureOfflineChanges` is the new session-dominant cost** — **184 s** on
-      the 8.4k-file WebView vault (no longer a cliff post-batching, but a long O(F) pass).
-      Next optimization target: append-only registry journal / persisted-identity snapshot.
+- [~] **Startup `captureOfflineChanges` — A3 optimization, in progress** (`docs/startup-capture-
+      optimization-spec.md`, then `docs/capture-concurrency-spec.md`). 8.4k-file WebView vault,
+      first-enable:
+  - [x] **Instrument** the read/hash/put split, then the `putMs` sub-split (see "The A3 capture
+        phase split" above). Found the cost is native-fs-**call-count**-bound (rename ≈ write
+        despite moving 0 bytes), not CPU or payload.
+  - [x] **C2** (skip the fresh-store `exists` dedup) — **no-op on device** (exists is ~free); kept.
+  - [x] **C4** (direct non-atomic blob write, replacing the atomic temp+rename ceremony; safe via
+        hash-verify-on-read) — **200 s → 102 s (−49%)**, `putMs` 146 s → 56 s. Confirmed on device.
+  - [x] **C3** (raw-binary / drop base64) — **dropped**; writes are latency- not bandwidth-bound.
+  - [ ] **C1** (bounded-concurrency capture pipeline) — **NEXT**, own spec
+        `docs/capture-concurrency-spec.md`. Overlap the remaining serial write 56 s + read 32 s.
+        Projected ~102 s → **~25 s**.
+  - [ ] **Post-C1: the checkpoint `otherMs` (13.5 s of per-200-op registry+oplog atomic rewrites)**
+        is the likely next-dominant cost (serial, non-parallelising) — fewer checkpoints / append-
+        only oplog journal. Pack-writes only if C1's write overlap disappoints.
 - [ ] **Re-confirm on device** — with the fix + `heapMB` line, verify the cliff is gone
       (or moved far out) on the 8.4k-file vault; pin the GC ceiling.
 - [ ] **Full Layer-3 matrix** — B1/B3/B4 at profiles S and M on a mid-range and a

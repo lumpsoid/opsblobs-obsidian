@@ -218,15 +218,64 @@ plan. If `otherMs` is large → the registry flush cadence is the target instead
 
 ### Later steps (after the measurement — see §4 for design detail)
 
-2. **C2** — drop the redundant `exists` probe on a first-enable bulk write path (§4.2).
-   Small, isolated, obviously safe; land first among the cuts.
-3. **C1** — bounded-concurrency capture pipeline (§4.1). The primary cut. Behind a
-   K-concurrency knob (test hook, sane default), serial consumer for ordered bookkeeping.
-4. `npm run build && npx vitest run` green + coverage glance; **re-measure on device**
-   (repeat 3.2), record the new breakdown in `docs/perf-baseline-2026-07-23.md`.
-5. **Decide on C3** (raw-binary storage, §4.3) from the re-measured split.
-6. Update `docs/sync-engineering-guide.md` §7 (capture gotcha) and the perf baseline's
-   "Still to do".
+**Step 1 measured, then re-measured twice — the plan changed materially.** Full record in
+`docs/perf-baseline-2026-07-23.md` → "The A3 capture phase split". Summary:
+
+- **Initial split** (F=8389): `putMs` **74%** (147.5 s), `readMs` 18% (36 s), `hashMs` **0.67%**,
+  `otherMs` 7%. Confirmed fs-round-trip-bound, hashing negligible.
+- **C2 landed and was a NO-OP on device** (`putMs` 147.5→146.7 s, flat). The `exists` probe the
+  estimate blamed for ⅓ of `put` is answered from an in-memory index — cost ~0. **Lesson: measure
+  the sub-structure, don't estimate it.** C2 is harmless + correct; kept, not a win.
+- **`putMs` sub-split** (the decisive run): `renameMs` **45%** + `writeTmpMs` **43%** + `existsMs`
+  10%; `encodeMs` 0.5%. **`rename` (7.82 ms/file) costs as much as the byte-write (7.51 ms) while
+  moving zero bytes** → every native fs call is ~pure latency; the cost is the *number* of calls,
+  not payload size. This inverts the original assumption.
+
+Revised cut list:
+
+2. **C2 — DONE, no-op** (kept; `ContentStore.putNew` skips the fresh-store `exists` dedup).
+3. **C4 (NEW) — DONE, code-complete: direct blob write.** The atomic `write` ceremony
+   (temp-write + `exists` + `rename` = 3 native calls) is all cost / no benefit for the disposable,
+   hash-addressed content store. `MetadataStore.writeDirect` writes straight to target (1 native
+   call); `ContentStore.putNew` uses it. Made safe by **hash-verify-on-read** in `ContentStore.get`:
+   a torn blob hashes wrong → reported missing → merge degrades to conflict (F1), push strands (F3),
+   never a corrupt base; a torn blob for a still-present file self-heals via `stageContent`'s
+   live-vault fallback. Build + 282 unit tests green (updated C2 test → direct-write path; new C4
+   integrity tests: torn blob → null, absent blob → null; `content-store-gc` fixture uses a real
+   content hash). **On-device confirmed: `putMs` 146 s → 56 s, total 200 s → 102 s (−49%);
+   `rename/exists/writeTmp` = 0.** Recorded in the perf baseline → "C4 landed".
+4. **C3 (raw-binary storage) — DROPPED.** Writes are latency-bound not bandwidth-bound (rename ≈
+   write despite moving no bytes), and `encodeMs` is 0.5%, so removing base64's 1.33× payload saves
+   almost nothing — not worth the port + adapter + on-disk-format change. See §4.3.
+5. **C1 — bounded-concurrency capture pipeline. BUILT, MEASURED, REVERTED** (own spec:
+   `docs/capture-concurrency-spec.md`). Hypothesis: overlap the two serial I/O phases (write 55.8 s
+   + read 31.6 s) K-wide. **On device K=8 REGRESSED 102 s → 120 s** — the Android/Capacitor fs
+   bridge does **not** parallelize native calls (services them one at a time), so overlap bought no
+   wall win and cost ~18 s of contention. Reverted. **Load-bearing finding: on this platform, cut
+   native-call COUNT (batching), never call OVERLAP.** §4.1 below is the original C1 sketch, kept
+   for provenance.
+6. **Read-path probe — `cachedRead` vs `readBinary`: DONE, deferred.** A/B measured on device:
+   `cachedRead`+encode is byte-safe (0 mismatches / 8016 md) and ~25% cheaper (~8 s off reads) but
+   **not** a warm-cache hit — Obsidian's metadata cache holds parsed metadata, not raw content, so
+   it's still disk-bound (2.79 ms/file). **Reads are a ~24–31 s floor** on first-enable; no large
+   win there. Deferred (adds cache-coherence risk for ~8 s). Diagnostic reverted. See perf baseline
+   → "Read-path probe".
+
+**The refined endgame order (post-C1 measurement — the bridge is a serial resource):**
+
+1. **Pack-writes (batch many blobs per native write) — NOW THE PRIMARY LEVER, own spec:
+   `docs/pack-writes-spec.md`.** Writes are ~50–56 s (the dominant phase) and, C1 having proven the
+   bridge won't parallelize, the ONLY way to cut them is fewer native writes: pack N blobs into one
+   write, so ~8389 writes → ~tens. Parallelism-independent — works *because* the bridge is serial.
+   Storage-format change (pack file + hash→offset index; `get`/`listHashes`/`gc` adapt; C4
+   hash-verify-on-read preserved per blob). Reincarnation of dropped-C3's "bigger change", now the
+   main event, not a conditional fallback.
+2. **Then re-measure and attack the next dominant.** Likely the **checkpoint `otherMs`** (~13 s of
+   per-200-op registry+oplog atomic rewrites — serial, O(F²) bytes as the log grows). Fix: fewer
+   checkpoints or an append-only oplog journal (delta appends vs full rewrites). New spec then.
+3. Reads (~24–31 s) are a floor — see step 6 above; no cut planned.
+
+7. Update `docs/sync-engineering-guide.md` §7 (capture gotcha) and the perf baseline's "Still to do".
 
 ---
 
@@ -237,6 +286,10 @@ the §3.1 measurement is expected to confirm as dominant. A larger storage-forma
 (C3) is scoped but deferred.
 
 ### 4.1 C1 — bounded-concurrency capture pipeline (the primary cut)
+
+> **Superseded — see `docs/capture-concurrency-spec.md` for the current, self-contained C1
+> design (this is the original sketch, kept for provenance). The numbers below predate the C4
+> measurement: the serial I/O to overlap is now ~87 s (write 56 + read 32), not ~99 s.**
 
 The scan loop is fully serial: `await files.read`, then `await hashContent`, then
 `await contentStore.put`, one file at a time, so ~25,000 native round-trips run
@@ -279,15 +332,33 @@ so skipping the check is safe for the first-enable pass. Removes ~1/3 of the per
 round-trips (3 → 2: read + write). The steady-state `put` keeps its `exists` dedup — the
 new path is used only where the store is known-empty.
 
-### 4.3 C3 — raw-binary blob storage (deferred, secondary)
+### 4.3 C3 — raw-binary blob storage — **DROPPED (measurement killed it)**
 
-`MetadataStore.write` is text-only (`metadata-store.ts:16`), so every blob is
-base64-encoded — a **1.33× size inflation** on every write plus the encode CPU/allocation
-(material for large attachments, and churn the checkpoint `clearMemCache` already fights).
-Extending the port with a binary `writeBinary`/`readBinary` (Capacitor supports it) and
-storing blobs raw removes both. Larger change — port + Obsidian adapter + on-disk
-content-dir format + `get`/`has`/GC read paths — so **scoped here but deferred**; land
-C1+C2 and re-measure before deciding whether C3 is warranted.
+The idea: `MetadataStore.write` is text-only, so every blob is base64-encoded — a **1.33×
+size inflation** plus encode CPU. Store blobs raw (binary `writeBinary`/`readBinary`) to
+remove both.
+
+**Dropped by the `putMs` sub-split.** `encodeMs` is **0.5%** of `put` (0.09 ms/file), and —
+decisively — `renameMs` (a pure metadata move, zero bytes) costs the *same* as the byte-write,
+proving the content-store write is **latency-bound, not bandwidth-bound**. A 1.33× smaller
+payload therefore saves almost nothing, while the change is large (port + Obsidian adapter +
+on-disk content-dir format + `get`/`has`/GC read paths). Not worth it. The write cost is attacked
+instead by **C4** (fewer native calls per write — §later-steps) and **C1** (overlap them).
+
+### 4.3a C4 — direct (non-atomic) blob write — **the primary cut (replaces C3)**
+
+`MetadataStore.write` is an *atomic* ceremony (`obsidian-metadata-store.ts`): `write(tmp)` →
+`exists(target)` → `rename(tmp→target)` = 3 native calls/blob, of which `exists`+`rename` are
+**~55% of `putMs` (~80 s)** and pure crash-safety. That safety is load-bearing for the durable
+singletons (version-DAG, oplog, registry, cursor, HLC — a torn one is unrecoverable) but
+**redundant for the content store**: blobs are content-addressed, write-once, and disposable
+(§0). Add `MetadataStore.writeDirect` — one `adapter.write(target)`, no temp/rename — and have
+`ContentStore.putNew` use it. Integrity is preserved *on the read side* by hash-verify-in-`get`:
+a torn blob hashes wrong → reported missing → merge degrades to a conflict (F1) and push strands
+(F3), never a corrupt base; a torn blob whose file still exists self-heals via `stageContent`'s
+live-vault fallback (`vault-sync-host.ts`). Reads are rare (merge bases) so the added SHA-256 is
+immaterial; the win is deleting one native round-trip (the `rename`, which costs as much as the
+write) from all ~8.4k blob writes.
 
 ### 4.4 Considered and rejected
 
