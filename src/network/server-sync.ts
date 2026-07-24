@@ -131,10 +131,6 @@ export interface VaultSyncHost {
    *  is O(touched), not O(vault). A genuinely-absent base is left unstaged and the
    *  merge degrades it to a conflict (F1). Already-present hashes are skipped. */
   stageContent(state: VaultState, hashes: Iterable<string>): Promise<void>;
-  /** TRANSITIONAL (A2 rollout step 2): pre-A2 whole-vault snapshot =
-   *  `buildLocalIdentity` + stage(all live bytes + all reachable bases). Kept only
-   *  until the scoped staging moves into the round (§4.3); deleted in step 3. */
-  buildLocalState(dag: VersionDag): Promise<VaultState>;
   /** Apply merge actions to the real vault (writes/deletes/moves, conflict
    *  prompts). Returns `deferred` (fileIds whose destructive action was skipped for
    *  on-disk drift (F5) or an auto-deferred conflict — the caller holds the cursor
@@ -366,10 +362,15 @@ export class ServerSyncClient {
     }
     timer?.lap('keycheck+dag-guard');
 
-    const local = await this.host.buildLocalState(dag);
+    // Build the local IDENTITY only (entries + pending ops + the A1 stat-gate hash
+    // correction) — no O(vault) byte staging. The bytes the merge actually needs are
+    // staged after the pull, scoped to the touched files (`stageMergeContent`, §4.3).
+    // This is the A2 cut: a converged round stages nothing here, collapsing the
+    // whole-vault snapshot to a cheap map build.
+    const local = await this.host.buildLocalIdentity(dag);
     const startCursor = await this.host.loadCursor();
     const pushed = local.pendingOps.length;
-    timer?.lap('buildLocalState');
+    timer?.lap('buildLocalIdentity');
 
     // ── 1. Pull remote ops since our cursor ──────────────────────────────────
     this.onProgress?.('Pulling changes…');
@@ -399,6 +400,18 @@ export class ServerSyncClient {
     // ── 3. Push our pending ops (blobs first, then the append) ───────────────
     if (local.pendingOps.length > 0) {
       this.onProgress?.(`Pushing ${local.pendingOps.length} change(s)…`);
+      // Stage the pending ops' content so `pushPendingOps` can upload their blobs.
+      // `buildLocalIdentity` staged no bytes, and these ops are local-only — the merge
+      // classifies such a file as `send_remote` without reading bytes (§4.1) and the
+      // scoped merge-stage runs only over remote-touched files — so without this their
+      // content would be absent from `local.contentStore` and the blobs would never
+      // upload (the op appended with no blob = data loss / a 422). Served from the
+      // content-cache; a live entry's own bytes fall back to a disk read on a miss.
+      const pendingContent = new Set<string>();
+      for (const op of local.pendingOps) {
+        if (op.type !== 'delete' && op.contentHash !== '') pendingContent.add(op.contentHash);
+      }
+      await this.host.stageContent(local, pendingContent);
       await this.pushPendingOps(local, startCursor);
       await this.host.clearPendingOps();
     }
@@ -412,6 +425,17 @@ export class ServerSyncClient {
     // is handed to the merge.
     dag = await this.host.recordVersionEdges([...local.pendingOps, ...pulled.map(p => p.op)], dag);
     timer?.lap('recordVersionEdges');
+
+    // ── Scoped content staging (A2, §4.3) ────────────────────────────────────
+    // `buildLocalIdentity` staged NO bytes; stage now exactly what the merge will
+    // read — the local bytes + DAG-reachable bases of the files it reconciles.
+    // recordVersionEdges just folded this round's heads into `dag`, so a fresh local
+    // head reaches its base here. An untouched file is absent from the scoped set, so
+    // its bytes are never staged: staging drops from O(vault) to O(touched this round
+    // + their bases), zero on a converged round. A genuinely-missing base stays
+    // unstaged and the merge degrades it to a conflict (F1), exactly as before.
+    await this.stageMergeContent(local, remote, dag);
+    timer?.lap('stageContent');
 
     this.onProgress?.('Merging…');
     const merge = mergeVaultStates(local, remote, dag);
@@ -778,6 +802,49 @@ export class ServerSyncClient {
   }
 
   /**
+   * Stage the local bytes the main merge will read this round (A2, §4.3). The merge
+   * reads `local.contentStore.get(hash)` only for a file it reconciles: one the remote
+   * projection names (touched since our cursor), plus — for an F2 create/create
+   * collision — a local-only live file whose PATH a live remote entry also occupies,
+   * whose bytes `resolveCreateCollision` reads under the LOCAL id (not the remote one).
+   * A local-only non-colliding file falls to `send_remote`, which reads no bytes
+   * (§4.1), so it is deliberately absent from the scope. Everything else is untouched
+   * and never read — the O(vault)→O(touched) cut.
+   */
+  private async stageMergeContent(local: VaultState, remote: VaultState, dag: VersionDag): Promise<void> {
+    const fileIds = new Set<string>(remote.fileEntries.keys());
+    const remoteLivePaths = new Set<string>();
+    for (const re of remote.fileEntries.values()) if (!re.deleted) remoteLivePaths.add(re.path);
+    if (remoteLivePaths.size > 0) {
+      for (const [id, le] of local.fileEntries) {
+        if (!le.deleted && remoteLivePaths.has(le.path)) fileIds.add(id);
+      }
+    }
+    await this.stageForFiles(local, fileIds, dag);
+  }
+
+  /**
+   * Stage, into `state.contentStore`, the local bytes + DAG-reachable bases for each
+   * of `fileIds` — the merge inputs for the files being reconciled. `dag` must already
+   * hold this round's heads (call after `recordVersionEdges`), so a fresh local head
+   * reaches its base. A base whose bytes are genuinely absent is left unstaged and the
+   * merge degrades it to a conflict (F1). Shared by the main round
+   * (`stageMergeContent`) and the multi-head reconcile sweep.
+   */
+  private async stageForFiles(state: VaultState, fileIds: Iterable<string>, dag: VersionDag): Promise<void> {
+    const needed = new Set<string>();
+    for (const id of fileIds) {
+      const le = state.fileEntries.get(id);
+      if (!le || le.deleted) continue;
+      if (le.contentHash !== '') needed.add(le.contentHash);
+      if (le.headVersionId) {
+        for (const h of dag.reachableContentHashes(le.headVersionId)) needed.add(h);
+      }
+    }
+    await this.host.stageContent(state, needed);
+  }
+
+  /**
    * Multi-head reconciliation sweep (causal audit Finding B). The remote projection
    * keeps only the HLC-max op per fileId, so a round that pulled ≥2 concurrent heads
    * for one file reconciled our head against just that one and left the rest as
@@ -845,10 +912,16 @@ export class ServerSyncClient {
     // pulled, so this terminates. The +touched guard covers the initial pass.
     const maxFolds = pulled.length + touched.size + 1;
     for (let step = 0; step < maxFolds; step++) {
-      const local = await this.host.buildLocalState(dag);
+      const local = await this.host.buildLocalIdentity(dag);
       // Fold any merge node a previous iteration minted (now a pending op, not yet
-      // in the persisted DAG) into the graph so this fold's LCA/leaf scan sees it.
+      // in the persisted DAG) into the graph so this fold's LCA/leaf scan AND the
+      // scoped staging below see it.
       dag = await this.host.recordVersionEdges(local.pendingOps, dag);
+      // Stage only the bytes the fold's pairwise merge reads: each multi-head file's
+      // local head bytes + its DAG-reachable bases (the LCA against the extra leaf).
+      // The extra leaf's own bytes are fetched separately below. Scoped to `touched`
+      // (the concurrent-divergence files), never the whole vault (A2, §4.3).
+      await this.stageForFiles(local, touched, dag);
 
       let folded = false;
       for (const fileId of [...touched].sort()) {

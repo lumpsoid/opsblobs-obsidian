@@ -43,11 +43,12 @@ describe('perfLog per-phase timing', () => {
     // Every instrumented boundary reported, in order, ending with the total.
     expect(names).toEqual([
       'keycheck+dag-guard',
-      'buildLocalState',
+      'buildLocalIdentity',
       'pull',
       'fetchBlobs',
       'push',
       'recordVersionEdges',
+      'stageContent',
       'merge',
       'applyMerge',
       'reconcileConcurrentHeads',

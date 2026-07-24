@@ -63,10 +63,11 @@ describe('reconcileConcurrentHeads — a non-collapsing conflict fold must not s
     //    text conflict with A's head. B then syncs, pulling A's whole K-op chain. ─
     await B.editFile(path, 'bbb\n2\n3\n', 1500);
 
-    // Count buildLocalState invocations during B's reconciling round.
+    // Count local snapshot builds during B's reconciling round. Post-A2 each build is
+    // a cheap `buildLocalIdentity` (no O(vault) staging); the bound is what matters.
     let buildCount = 0;
-    const origBuild = B.host.buildLocalState.bind(B.host);
-    B.host.buildLocalState = async (dag) => { buildCount++; return origBuild(dag); };
+    const origBuild = B.host.buildLocalIdentity.bind(B.host);
+    B.host.buildLocalIdentity = async (dag) => { buildCount++; return origBuild(dag); };
 
     await client(B).runSync();
 
@@ -104,8 +105,8 @@ describe('reconcileConcurrentHeads — a non-collapsing conflict fold must not s
     await client(A).runSync();       // A pushes a linear edit (single head)
 
     let buildCount = 0;
-    const origBuild = B.host.buildLocalState.bind(B.host);
-    B.host.buildLocalState = async (dag) => { buildCount++; return origBuild(dag); };
+    const origBuild = B.host.buildLocalIdentity.bind(B.host);
+    B.host.buildLocalIdentity = async (dag) => { buildCount++; return origBuild(dag); };
 
     await client(B).runSync();       // B pulls the fast-forward — no divergence to reconcile
 

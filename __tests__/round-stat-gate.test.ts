@@ -21,8 +21,38 @@ import { ServerSyncClient } from '../src/network/server-sync';
 import { VaultCrypto } from '../src/network/encryption';
 import { FakeSyncServer } from '../src/network/fake-server';
 import { TestDevice } from './helpers/test-device';
+import { VaultState } from '../src/types';
 
 const enc = (s: string) => new TextEncoder().encode(s);
+
+/**
+ * The pre-A2 whole-vault snapshot, reconstructed from the split host API
+ * (`buildLocalIdentity` for the stat-gate hash correction + `stageContent` of every
+ * live file's bytes and every head's DAG-reachable bases). A2 moved staging into the
+ * round scoped to touched files; these R1 tests still exercise the *gate* (which
+ * lives in `buildLocalIdentity`) plus the store-miss disk fallback (in
+ * `stageContent`), and staging all files reproduces the exact read/hash counts the
+ * pre-split `buildLocalState` produced, so the assertions are unchanged.
+ */
+async function snapshot(d: TestDevice): Promise<VaultState> {
+  const dag = await d.host.loadDag();
+  const state = await d.host.buildLocalIdentity(dag);
+  // This round's pending ops aren't in the persisted DAG yet — fold into a clone so a
+  // fresh head reaches its bases for staging, exactly as the round does.
+  const working = dag.clone();
+  for (const op of d.opLogger.getPendingOps()) {
+    if (op.type === 'move') continue;
+    working.addVersion(op.id, op.parents, op.contentHash, op.fileId);
+  }
+  const hashes = new Set<string>();
+  for (const e of state.fileEntries.values()) {
+    if (e.deleted) continue;
+    if (e.contentHash !== '') hashes.add(e.contentHash);
+    if (e.headVersionId) for (const h of working.reachableContentHashes(e.headVersionId)) hashes.add(h);
+  }
+  await d.host.stageContent(state, hashes);
+  return state;
+}
 const onDisk = async (d: TestDevice, path: string): Promise<string> => {
   const bytes = await d.files.read(path);
   return bytes ? new TextDecoder().decode(bytes) : '<deleted>';
@@ -63,7 +93,7 @@ describe('R1 round stat-gate', () => {
     // nothing — the steady-state ideal (capture already did the O(touched) work).
     {
       const readsBefore = A.files.io.reads;
-      const { sha256 } = await countSha256(async () => A.host.buildLocalState(await A.host.loadDag()));
+      const { sha256 } = await countSha256(async () => snapshot(A));
       expect(sha256).toBe(0);
       expect(A.files.io.reads - readsBefore).toBe(0);
     }
@@ -74,7 +104,7 @@ describe('R1 round stat-gate', () => {
     await A.files.write('notes/n-7.md', enc('a much longer, changed body for n-7\n'));
 
     const readsBefore = A.files.io.reads;
-    const { result: state, sha256 } = await countSha256(async () => A.host.buildLocalState(await A.host.loadDag()));
+    const { result: state, sha256 } = await countSha256(async () => snapshot(A));
     expect(sha256).toBe(1);                       // ≈1, NOT F+1 — the R1 win
     expect(A.files.io.reads - readsBefore).toBe(1);
 
@@ -94,7 +124,7 @@ describe('R1 round stat-gate', () => {
     expect(A.entryByPath('a.md')!.mtime).toBeUndefined();
 
     const readsBefore = A.files.io.reads;
-    const { sha256 } = await countSha256(async () => A.host.buildLocalState(await A.host.loadDag()));
+    const { sha256 } = await countSha256(async () => snapshot(A));
     expect(sha256).toBe(1);                       // hashed, not silently trusted
     expect(A.files.io.reads - readsBefore).toBe(1);
   });
@@ -204,7 +234,7 @@ describe('R1 round stat-gate', () => {
       expect(await A.contentStore.has(aHash)).toBe(false);
 
       const readsBefore = A.files.io.reads;
-      const { result: state, sha256 } = await countSha256(async () => A.host.buildLocalState(await A.host.loadDag()));
+      const { result: state, sha256 } = await countSha256(async () => snapshot(A));
 
       // Still zero hashes (the stat says unchanged — no re-hash on the fallback), and
       // the missing blob was staged from disk so the merge sees a.md's bytes.

@@ -161,38 +161,6 @@ export class PluginVaultSyncHost implements VaultSyncHost {
     }
   }
 
-  /**
-   * TRANSITIONAL (A2 rollout step 2): the pre-A2 whole-vault snapshot, reconstructed
-   * as `buildLocalIdentity` + staging every live file's bytes and every head's
-   * DAG-reachable bases. Kept only so the round + tests land the port split before
-   * the scoped staging moves into the round (§4.3, rollout step 3), which deletes
-   * this. Do not build new callers on it.
-   */
-  async buildLocalState(dag: VersionDag): Promise<VaultState> {
-    const state = await this.buildLocalIdentity(dag);
-
-    // This round's own edits aren't in the persisted DAG yet (recordVersionEdges runs
-    // later), so a fresh head can't reach its base for staging. Fold the pending ops
-    // into a CLONE — never the shared round DAG — so reachability from each head
-    // includes the base the merge will need.
-    const working = dag.clone();
-    for (const op of this.opLogger.getPendingOps()) {
-      if (op.type === 'move') continue;
-      working.addVersion(op.id, op.parents, op.contentHash, op.fileId);
-    }
-
-    const hashes = new Set<string>();
-    for (const entry of state.fileEntries.values()) {
-      if (entry.deleted) continue;
-      if (entry.contentHash !== '') hashes.add(entry.contentHash);
-      if (entry.headVersionId) {
-        for (const h of working.reachableContentHashes(entry.headVersionId)) hashes.add(h);
-      }
-    }
-    await this.stageContent(state, hashes);
-    return state;
-  }
-
   async applyMerge(actions: MergeAction[], local: VaultState, remote: VaultState): Promise<{ deferred: Set<string>; deferredConflicts: Set<string> }> {
     return this.applicator.applyActions(actions, local, remote);
   }
