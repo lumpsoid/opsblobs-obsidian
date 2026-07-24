@@ -29,6 +29,9 @@ export interface SettingsHost extends Plugin {
   rebaselineToServer(): Promise<void>;
   recheckConflicts(): Promise<void>;
   syncNow(): Promise<void>;
+  /** The current phase of an in-flight sync round, or null when idle — polled to show
+   *  live progress on the "Sync now" button so a long round reads as moving, not stuck. */
+  currentSyncActivity(): string | null;
   openSyncStatus(): void;
 }
 
@@ -296,9 +299,18 @@ export class SyncSettingTab extends PluginSettingTab {
       .addButton(btn => {
         btn.setButtonText('Sync now').setCta().onClick(async () => {
           btn.setButtonText('Syncing…').setDisabled(true);
+          // Poll the live phase onto the button so a minutes-long first sync reads as
+          // progressing ("Uploading files 340/8000…"), not a frozen spinner. The
+          // interval is cleared in the finally, which also always re-enables the button
+          // — so the "spinner" reliably stops the moment the round settles.
+          const poll = window.setInterval(() => {
+            const phase = this.host.currentSyncActivity();
+            if (phase) btn.setButtonText(phase);
+          }, 1000);
           try {
             await this.host.syncNow();
           } finally {
+            window.clearInterval(poll);
             btn.setButtonText('Sync now').setDisabled(false);
           }
         });

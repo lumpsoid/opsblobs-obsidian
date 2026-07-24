@@ -82,4 +82,34 @@ describe('reconcileConcurrentHeads — a non-collapsing conflict fold must not s
     //    was ≈ K + 1 (~41); the fix keeps it in the single digits regardless of K. ─
     expect(buildCount).toBeLessThanOrEqual(6);
   });
+
+  test('a converged pull (no concurrent divergence) skips the reconcile buildLocalState', async () => {
+    // The common case: B pulls a peer edit that fast-forwards, with no second open head.
+    // reconcileConcurrentHeads has nothing to fold, so its DAG pre-check must short-circuit
+    // BEFORE the whole-vault buildLocalState (~69s on a large mobile vault in the perf
+    // logs). Only the main merge's single build should run this round — not a second one.
+    const api = new FakeSyncServer();
+    const client = (d: TestDevice) =>
+      new ServerSyncClient({ api, crypto: vc, host: d.host, hlc: d.hlc });
+
+    const A = await TestDevice.create('dev-a2');
+    const B = await TestDevice.create('dev-b2');
+    const path = 'note.md';
+
+    await A.seedFile(path, 'base\n', 1000);
+    await client(A).runSync();
+    await client(B).runSync();       // B converges on A's create
+
+    await A.editFile(path, 'edited\n', 2000);
+    await client(A).runSync();       // A pushes a linear edit (single head)
+
+    let buildCount = 0;
+    const origBuild = B.host.buildLocalState.bind(B.host);
+    B.host.buildLocalState = async (dag) => { buildCount++; return origBuild(dag); };
+
+    await client(B).runSync();       // B pulls the fast-forward — no divergence to reconcile
+
+    expect(await onDisk(B, path)).toBe('edited\n'); // the edit still applied…
+    expect(buildCount).toBe(1);                     // …with NO extra reconcile build
+  });
 });

@@ -317,6 +317,30 @@ describe('ServerSyncClient — full round against the fake', () => {
     }
   });
 
+  test('onUploadProgress reports cumulative blob-upload counts, ending exactly at total', async () => {
+    // The status modal draws a determinate progress bar from these counts; the settings
+    // "Sync now" button and status bar show the twin string. Assert the wire: the counts
+    // rise monotonically and finish at the total (so the bar can reach 100%).
+    const inner = new FakeSyncServer();
+    const deviceA = await device('dev-a');
+    for (let i = 0; i < 10; i++) await deviceA.seedFile(`n${i}.md`, `body ${i}`, 1000 + i);
+
+    const ticks: Array<{ uploaded: number; total: number }> = [];
+    await new ServerSyncClient({
+      api: inner, crypto: vc, host: deviceA.host, hlc: deviceA.hlc,
+      // >1 wave (the report guard) and multiple batches so `uploaded` climbs in steps.
+      blobUploadConcurrency: 3, blobBatchMaxCount: 2,
+      onUploadProgress: (uploaded, total) => ticks.push({ uploaded, total }),
+    }).runSync();
+
+    expect(ticks.length).toBeGreaterThan(0);
+    expect(ticks.every(t => t.total === 10)).toBe(true);           // stable denominator
+    for (let i = 1; i < ticks.length; i++) {
+      expect(ticks[i]!.uploaded).toBeGreaterThanOrEqual(ticks[i - 1]!.uploaded); // monotonic
+    }
+    expect(ticks[ticks.length - 1]!.uploaded).toBe(10);            // reaches 100%
+  });
+
   test('a temporarily-unavailable blob is retried; the cursor never strands the op (F3)', async () => {
     const inner = new FakeSyncServer();
     const gated = new BlobGatedServer(inner);

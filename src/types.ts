@@ -153,6 +153,42 @@ export type MergeAction =
   | { type: 'binary_conflict'; fileId: string; localPath: string; remotePath: string; localContent: Uint8Array; remoteContent: Uint8Array; localHlc: HLC; remoteHlc: HLC; parents?: string[] }
   | { type: 'no_op'; fileId: string };
 
+/**
+ * Does applying this action change the LOCAL vault — write, move, or trash a file, or
+ * write conflict markers? `send_remote`/`delete_remote` are transport-only (the
+ * applicator no-ops them, the push handles the wire) and `no_op` is nothing.
+ *
+ * This lives with the type it classifies (Tell, Don't Ask) so callers never re-derive
+ * the set by hand. It matters because the merge emits ONE action per file: on a single
+ * self-syncing device — whose own re-pulled ops are excluded from the remote projection
+ * — every file classifies as `send_remote`, so any "applying N changes" progress/UX
+ * that counted raw actions reported the whole vault on an unchanged sync. Count only the
+ * actions for which this returns true. Exhaustive by construction: a new `MergeAction`
+ * variant fails to compile here until it is classified.
+ */
+export function affectsLocalVault(action: MergeAction): boolean {
+  switch (action.type) {
+    case 'write_local':
+    case 'write_merge':
+    case 'delete_local':
+    case 'move_local':
+    case 'conflict':
+    case 'delete_conflict':
+    case 'binary_conflict':
+      return true;
+    case 'send_remote':
+    case 'delete_remote':
+    case 'no_op':
+      return false;
+    default: {
+      // Compile-time exhaustiveness: if a new MergeAction type is added, `action` is no
+      // longer `never` here and this assignment errors until the type is classified above.
+      const _exhaustive: never = action;
+      return _exhaustive;
+    }
+  }
+}
+
 export interface StateMergeResult {
   actions: MergeAction[];
   mergedHlc: HLC;

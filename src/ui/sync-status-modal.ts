@@ -20,6 +20,14 @@ export interface IndexingProgress {
   total: number;
 }
 
+/** Live progress of the blob-upload phase of a push `(uploaded, total)` — the first
+ *  sync of a large vault uploads one blob per note and can run for minutes, so the
+ *  modal draws a determinate bar from these counts. */
+export interface UploadProgress {
+  uploaded: number;
+  total: number;
+}
+
 /** The read-only snapshot the modal renders, plus the one action it can trigger. */
 export interface SyncStatusSnapshot {
   serverUrl: string;
@@ -32,16 +40,27 @@ export interface SyncStatusSnapshot {
   /** Live progress of the first-enable capture, or null when it isn't running. Read on
    *  each refresh tick (not captured once) so the bar advances while the modal is open. */
   getIndexingProgress: () => IndexingProgress | null;
+  /** The current phase of an in-flight sync round ("Pulling changes…", "Uploading
+   *  files 340/8000…", "Merging…"), or null when no round is running. Read on each tick
+   *  so the modal is a live "what's happening right now" surface — the mobile answer to
+   *  the missing status bar. */
+  getSyncActivity: () => string | null;
+  /** Live blob-upload counts for a determinate bar during the push, or null. The phase
+   *  label from {@link getSyncActivity} carries the same counts as text. */
+  getUploadProgress: () => UploadProgress | null;
   /** Open the Conflicts panel — where delete/binary conflicts are resolved (§3).
    *  Closes the modal first. */
   onOpenConflicts: () => void;
 }
 
 export class SyncStatusModal extends Modal {
-  /** Container for the indexing section, re-rendered on a timer while the first-enable
-   *  capture runs so its progress bar advances live. */
+  /** Containers for the two live sections (first-enable indexing and the in-flight sync
+   *  round), re-rendered on a timer while the modal is open so their progress advances
+   *  live. A single timer runs for the whole time the modal is open — so activity that
+   *  *starts* after the modal opens (or the indexing→push transition) is still caught. */
   private indexingEl: HTMLElement | null = null;
-  private indexingTimer: number | null = null;
+  private activityEl: HTMLElement | null = null;
+  private liveTimer: number | null = null;
 
   constructor(app: App, private snap: SyncStatusSnapshot) {
     super(app);
@@ -52,14 +71,16 @@ export class SyncStatusModal extends Modal {
     contentEl.empty();
     contentEl.createEl('h2', { text: 'Vault Sync status' });
 
-    // ── Building sync index (first-enable capture) ────────────────────────────
-    // Rendered at the top: while it's running nothing else can sync yet, so it's the
-    // most relevant thing. Self-updates on a timer and removes itself when done.
+    // ── Live progress (first-enable indexing, then the in-flight round) ───────────
+    // Rendered at the top: while either is running it's the most relevant thing. Both
+    // self-update on one shared timer and remove themselves when nothing is running.
     this.indexingEl = contentEl.createDiv();
-    this.renderIndexing();
-    if (this.snap.getIndexingProgress()) {
-      this.indexingTimer = window.setInterval(() => this.renderIndexing(), 2000);
-    }
+    this.activityEl = contentEl.createDiv();
+    this.renderLive();
+    // Poll while the modal is open (cheap DOM diff). Unconditional so a round that
+    // begins *after* the modal is open still shows — the user's common flow is to
+    // start a long sync, then open this to check it's moving.
+    this.liveTimer = window.setInterval(() => this.renderLive(), 2000);
 
     const s = this.snap.state;
 
@@ -160,29 +181,29 @@ export class SyncStatusModal extends Modal {
   }
 
   onClose() {
-    if (this.indexingTimer !== null) {
-      window.clearInterval(this.indexingTimer);
-      this.indexingTimer = null;
+    if (this.liveTimer !== null) {
+      window.clearInterval(this.liveTimer);
+      this.liveTimer = null;
     }
     this.contentEl.empty();
   }
 
-  /** (Re)render the indexing section from live progress. Empties when the capture isn't
-   *  running — so the section shows during the first sync and vanishes once it finishes,
-   *  at which point the timer is stopped. */
+  /** Re-render both live sections from the latest progress. Called on open and on every
+   *  timer tick; the timer itself only stops when the modal closes, so a section can
+   *  appear, advance, and vanish (and a later one appear) all within one open modal. */
+  private renderLive(): void {
+    this.renderIndexing();
+    this.renderActivity();
+  }
+
+  /** (Re)render the first-enable indexing section, or empty it when the capture isn't
+   *  running — so it shows during the initial scan and vanishes once that finishes. */
   private renderIndexing(): void {
     const el = this.indexingEl;
     if (!el) return;
     const p = this.snap.getIndexingProgress();
     el.empty();
-    if (!p) {
-      // Capture finished (or never large enough to report) — nothing more to poll for.
-      if (this.indexingTimer !== null) {
-        window.clearInterval(this.indexingTimer);
-        this.indexingTimer = null;
-      }
-      return;
-    }
+    if (!p) return;
     const pct = p.total > 0 ? Math.min(100, Math.round((p.scanned / p.total) * 100)) : 0;
     el.createEl('h3', { text: 'Building sync index' });
     el.createEl('p', {
@@ -196,6 +217,35 @@ export class SyncStatusModal extends Modal {
       text: `${p.scanned} of ${p.total} files (${pct}%)`,
       cls: 'setting-item-description',
     });
+  }
+
+  /** (Re)render the in-flight sync-round section: the current phase label, plus a
+   *  determinate bar while uploading (the minutes-long push) and an indeterminate
+   *  moving bar for phases without a count (pull/merge). Empties when idle — so opening
+   *  the modal mid-sync answers "what's happening right now?" without a status bar. */
+  private renderActivity(): void {
+    const el = this.activityEl;
+    if (!el) return;
+    const label = this.snap.getSyncActivity();
+    el.empty();
+    if (!label) return;
+    el.createEl('h3', { text: 'Sync in progress' });
+    el.createEl('p', { text: label, cls: 'setting-item-description' });
+    const upload = this.snap.getUploadProgress();
+    if (upload && upload.total > 0) {
+      // Determinate: the push is the long phase, and a filling bar shows real headway.
+      const pct = Math.min(100, Math.round((upload.uploaded / upload.total) * 100));
+      const bar = el.createDiv({ cls: 'vault-sync-indexing-bar' });
+      bar.createDiv({ cls: 'vault-sync-indexing-fill' }).style.width = `${pct}%`;
+      el.createEl('div', {
+        text: `${upload.uploaded} of ${upload.total} files (${pct}%)`,
+        cls: 'setting-item-description',
+      });
+    } else {
+      // Indeterminate: a moving stripe just says "working" for a phase with no count.
+      const bar = el.createDiv({ cls: 'vault-sync-indexing-bar' });
+      bar.createDiv({ cls: 'vault-sync-indexing-fill vault-sync-indexing-indeterminate' });
+    }
   }
 
   private pathList(paths: string[]): void {

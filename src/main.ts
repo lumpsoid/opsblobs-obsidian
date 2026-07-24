@@ -26,7 +26,7 @@ import { PluginVaultSyncHost } from './network/vault-sync-host';
 import { SyncStatusModal } from './ui/sync-status-modal';
 import { ConfirmModal } from './ui/confirm-modal';
 import { SyncSettingTab } from './ui/settings-tab';
-import { SyncCoordinator } from './network/sync-coordinator';
+import { SyncCoordinator, SyncOutcome } from './network/sync-coordinator';
 import { ObsidianEditorSaver } from './network/obsidian-editor-saver';
 import { ObsidianNotifier } from './network/obsidian-notifier';
 import { ConflictsView, CONFLICTS_VIEW_TYPE, ConflictsViewHost } from './ui/conflicts-view';
@@ -66,6 +66,17 @@ export default class VaultSyncPlugin extends Plugin {
    *  it isn't running. Surfaced in the status modal so a minutes-long first pass shows
    *  how far along it is. Only set for a *large* capture (see CAPTURE_PROGRESS_UI_MIN). */
   private indexingProgress: { scanned: number; total: number } | null = null;
+  /** The current phase of an in-flight sync round ("Pulling changes…", "Uploading
+   *  files 340/8000…", "Merging…"), or null when no round is running. Fed by the sync
+   *  client's per-phase `onProgress`; surfaced in the status modal (and on the settings
+   *  "Sync now" button) so a long round — the first sync can run for minutes — reads as
+   *  progressing, not frozen. This is the mobile-visible twin of the desktop status bar,
+   *  which doesn't exist on mobile. */
+  private syncActivity: string | null = null;
+  /** Live progress of the first-sync blob upload (pushing note content to the server),
+   *  or null when no push is uploading. Drives a determinate bar in the status modal;
+   *  the phase label in {@link syncActivity} carries the same counts as text. */
+  private uploadProgress: { uploaded: number; total: number } | null = null;
   /** Aborts the in-flight first-enable capture when the plugin is disabled/unloaded.
    *  The capture walks every vault file (O(F·B) hashing) and can run for minutes on a
    *  large mobile vault; without this it would run to completion after the user has
@@ -410,7 +421,14 @@ export default class VaultSyncPlugin extends Plugin {
       crypto: this.crypto,
       host,
       hlc: this.hlc,
-      onProgress: (label) => this.setStatusBarText(label, 'syncing'),
+      onProgress: (label) => {
+        // The desktop status bar (absent on mobile) …
+        this.setStatusBarText(label, 'syncing');
+        // … and the mobile-visible surfaces: the status modal's live section and the
+        // settings "Sync now" button both read this.
+        this.syncActivity = label;
+      },
+      onUploadProgress: (uploaded, total) => { this.uploadProgress = { uploaded, total }; },
       // Per-phase round timings (perf baseline, Layer 3) — `undefined` unless the
       // `perfLog` diagnostic is on, so the client installs no timer by default.
       perfLog: this.perfSink('round'),
@@ -534,12 +552,9 @@ export default class VaultSyncPlugin extends Plugin {
     // Conflicts panel now lists both — so a rise maps to a new item the user must
     // resolve, and a persisting conflict (same count) doesn't re-nag.
     const conflictsBefore = this.conflictCount();
+    let outcome: SyncOutcome | undefined;
     try {
-      const outcome = await this.coordinator.sync(source);
-      // Land on the conflict state (not idle) if the round left conflicts the user
-      // still needs to resolve, so the indicator doesn't silently go green.
-      if (!outcome.ok) this.updateRibbonState('error');
-      else this.updateRibbonState(this.conflictCount() > 0 ? 'conflict' : 'idle');
+      outcome = await this.coordinator.sync(source);
       // Surface newly-introduced conflicts (§3): only on a rise, so a periodic
       // auto-sync doesn't nag every round while the same conflicts sit unresolved.
       if (outcome.ok && this.conflictCount() > conflictsBefore) {
@@ -547,12 +562,29 @@ export default class VaultSyncPlugin extends Plugin {
       }
     } finally {
       this.syncInProgress = false;
+      // Clear the in-flight activity so the modal's live section and the settings
+      // "Sync now" button both settle back — this is what makes the "spinner" stop.
+      this.syncActivity = null;
+      this.uploadProgress = null;
+      // Always leave the 'syncing' ribbon spinner from the *finally*, not the try — so
+      // a throw between here and the settle (e.g. in conflictCount) can't strand the
+      // ribbon mid-spin. Land on the state the round actually produced: error if it
+      // failed (or threw before returning), conflict if any remain, else idle.
+      if (!outcome || !outcome.ok) this.updateRibbonState('error');
+      else this.updateRibbonState(this.conflictCount() > 0 ? 'conflict' : 'idle');
       this.updateStatusBar();
       // A round can surface NEW two-headed files (the applicator writes markers) or
       // clear them (a peer's resolution adopted) — neither goes through
       // opLogger.onChange, so refresh the panel explicitly here.
       this.emitConflictChange();
     }
+  }
+
+  /** The current phase of an in-flight sync round, or null when idle. Read by the
+   *  settings "Sync now" button (to show live progress and prove it isn't frozen) and
+   *  available to any other glue that needs the live label. */
+  currentSyncActivity(): string | null {
+    return this.syncActivity;
   }
 
   /** Make newly-introduced text conflicts impossible to miss (§3). A manual round is
@@ -816,6 +848,8 @@ export default class VaultSyncPlugin extends Plugin {
       pendingPaths: this.opLogger.getPendingOps().map(op => op.path),
       state: this.syncState.get(),
       getIndexingProgress: () => this.indexingProgress,
+      getSyncActivity: () => this.syncActivity,
+      getUploadProgress: () => this.uploadProgress,
       onOpenConflicts: () => { void this.activateConflictsView(); },
     }).open();
   }

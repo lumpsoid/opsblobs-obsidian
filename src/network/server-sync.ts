@@ -14,7 +14,7 @@
 //    · VaultSyncHost — the local vault (registry/content-store/applicator), so
 //                      the orchestrator never touches Obsidian directly.
 
-import { VaultState, FileEntry, MergeAction, Operation, HLC } from '../types';
+import { VaultState, FileEntry, MergeAction, Operation, HLC, affectsLocalVault } from '../types';
 import { HybridLogicalClock } from '../core/hlc';
 import { hlcCompare } from '../core/hlc';
 import { mergeVaultStates } from '../merge/state-merge';
@@ -182,6 +182,14 @@ export interface ServerSyncOptions {
    *  hook; defaults to {@link DEFAULT_BLOB_BATCH_THRESHOLD}. */
   blobBatchThreshold?: number;
   onProgress?: (label: string) => void;
+  /** Structured blob-upload progress `(uploaded, total)`, fired as each batch/PUT
+   *  settles during the push — the numeric twin of the `Uploading files …` string
+   *  `onProgress` emits. Lets the plugin drive a *determinate* progress bar in the
+   *  status modal: the first sync of a large baseline uploads one blob per note and
+   *  can run for minutes, so a filling bar shows it's actually making headway. Fired
+   *  only for an upload worth showing (more than one concurrency wave), matching the
+   *  string's guard. */
+  onUploadProgress?: (uploaded: number, total: number) => void;
   /** Diagnostic per-phase wall-clock sink (perf baseline, Layer 3). When omitted
    *  (the default) `runSync` installs no timer and does no timing work — inert. The
    *  plugin wires this only when the `perfLog` setting is on. */
@@ -265,6 +273,7 @@ export class ServerSyncClient {
   private readonly blobBatchMaxBytes: number;
   private readonly blobBatchThreshold: number;
   private readonly onProgress?: (label: string) => void;
+  private readonly onUploadProgress?: (uploaded: number, total: number) => void;
   private readonly perfLog?: PhaseTimingSink;
 
   constructor(opts: ServerSyncOptions) {
@@ -282,6 +291,7 @@ export class ServerSyncClient {
     this.blobBatchMaxBytes = Math.max(1, opts.blobBatchMaxBytes ?? DEFAULT_BLOB_BATCH_MAX_BYTES);
     this.blobBatchThreshold = Math.max(0, opts.blobBatchThreshold ?? DEFAULT_BLOB_BATCH_THRESHOLD);
     this.onProgress = opts.onProgress;
+    this.onUploadProgress = opts.onUploadProgress;
     this.perfLog = opts.perfLog;
   }
 
@@ -400,6 +410,15 @@ export class ServerSyncClient {
     // rather than re-conflicting. Doing this after apply would let the
     // resolution be timestamped below the remote it resolves.
     this.hlc.setCurrent(merge.mergedHlc);
+    // Apply is its own phase — a first sync writes every pulled file to disk, which can
+    // run far longer than the merge computation itself. Label it so the UI stops showing
+    // "Merging…" (a sub-second step) for what is actually minutes of disk writes. Count
+    // only the actions that touch the local vault (`affectsLocalVault` owns that
+    // classification): the merge emits one action per file, and on a single self-syncing
+    // device every file is a transport-only `send_remote`, so counting raw actions made
+    // an unchanged vault report "Applying 8390 changes" when nothing local was written.
+    const localChanges = merge.actions.filter(affectsLocalVault).length;
+    if (localChanges > 0) this.onProgress?.(`Applying ${localChanges} change(s)…`);
     const { deferred, deferredConflicts } = await this.host.applyMerge(merge.actions, local, remote);
     timer?.lap('applyMerge');
 
@@ -417,6 +436,7 @@ export class ServerSyncClient {
     // Files the main apply deferred (F5 drift, or an auto-deferred delete/binary
     // conflict) are skipped: their cursor is held so the whole round re-pulls, and
     // reconciling them here would write over the very in-window edit F5 protects.
+    this.onProgress?.('Reconciling…');
     await this.reconcileConcurrentHeads(pulled, dag, local.deviceId, missingContent, deferred);
     timer?.lap('reconcileConcurrentHeads');
 
@@ -642,6 +662,7 @@ export class ServerSyncClient {
       done += n;
       if (total > this.blobUploadConcurrency) {
         this.onProgress?.(`Uploading files ${done}/${total}…`);
+        this.onUploadProgress?.(done, total);
       }
     };
 
@@ -783,6 +804,17 @@ export class ServerSyncClient {
       if (op.hlcTimestamp.deviceId !== ownDeviceId) touched.add(op.fileId);
     }
     if (touched.size === 0) return;
+
+    // Cheap pre-check on the in-memory DAG before paying for a full O(vault)
+    // `buildLocalState` (the perf logs show this at ~69s on a large mobile vault):
+    // reconciliation only has work when some touched file has ≥2 open leaves — a
+    // genuine concurrent divergence. A converged file has exactly one leaf. Without
+    // this, EVERY round that merely pulled a peer op ran one whole-vault buildLocalState
+    // below just to discover there was nothing to fold. `leaves(fileId) < 2` is a safe
+    // under-approximation: the loop's "extra leaf" scan needs ≥2 leaves, so this never
+    // hides real work — it only skips the provable no-op case.
+    const anyMultiHead = [...touched].some(fileId => dag.leaves(fileId).length >= 2);
+    if (!anyMultiHead) return;
 
     // Leaves we've already tried to fold this round, keyed `fileId leafId` (both are
     // space-free — a UUID and an op-id). A clean

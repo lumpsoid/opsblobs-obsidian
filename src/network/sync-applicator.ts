@@ -73,6 +73,17 @@ export class SyncApplicator {
     // Pause op logging while we apply sync changes (we don't want to re-log them)
     this.opLogger.stopListening();
 
+    // Batch registry persistence across the ENTIRE apply. Every registry mutation
+    // (adoptRemote per write_local, setSyncedPath per no_op/send_remote) otherwise
+    // rewrites the whole registry file (flush() serializes all entries). A first sync
+    // touches every file, so that was N full-file writes — O(N²): minutes on a large
+    // mobile vault, long enough that the user force-closed mid-apply and the round
+    // never reached saveCursor, so the cursor never advanced and the WHOLE vault
+    // re-pulled and re-applied on every restart (the "applying 8390 changes forever"
+    // report). One flush at the end makes it O(N). Mirrors the capture-pass batching
+    // in operation-logger. Restored in the outer finally, always (even on throw).
+    this.registry.suspendSaves();
+
     // User-resolved conflicts are re-emitted as ops (below) so peers learn the
     // resolution instead of diverging. Collected here and recorded only *after*
     // clearOps, which would otherwise wipe them.
@@ -86,47 +97,54 @@ export class SyncApplicator {
     const deferredConflicts = new Set<string>();
 
     try {
-      for (const action of actions) {
-        const resolved = await this.applyAction(action, localState, remoteState, deferred, deferredConflicts);
-        if (resolved) resolutions.push(resolved);
+      try {
+        for (const action of actions) {
+          const resolved = await this.applyAction(action, localState, remoteState, deferred, deferredConflicts);
+          if (resolved) resolutions.push(resolved);
+        }
+      } finally {
+        // Clear pending ops before resuming listeners so that vault events
+        // fired asynchronously by our writes (modify/create/delete) don't get
+        // re-logged as new pending changes after clearOps returns.
+        await this.opLogger.clearOps();
+        // Yield to the event loop so Obsidian's async vault events from the
+        // writes above are dispatched and silently dropped (listeners are still
+        // off at this point), then re-attach.
+        await new Promise(resolve => setTimeout(resolve, 0));
+        this.opLogger.startListening();
+      }
+
+      // Advance each synced file's last-synced path (but never for a deferred one:
+      // its destructive action was skipped, so its synced state must stay the
+      // pre-round base for next round's merge).
+      await this.updateSyncedPaths(actions, localState, deferred);
+
+      // Persist the resolution ops now that the already-pushed pending log is
+      // clear — they become pending for the next round and replicate the manual
+      // resolution to peers as two-parent merge nodes. The registry was already
+      // updated to the resolved hash during apply, so the resumed modify listener
+      // suppresses the echo. `deleted` picks the tombstone vs update merge variant.
+      for (const r of resolutions) {
+        if (r.deleted) {
+          await this.opLogger.recordMergeDelete(r.fileId, r.path, r.contentHash, r.hlc, r.parents, r.id);
+        } else {
+          await this.opLogger.recordMergeOp(r.fileId, r.path, r.contentHash, r.hlc, r.parents, r.id);
+        }
+      }
+
+      // Re-capture each in-window edit we declined to overwrite as a durable
+      // pending op (F5), so next round it is a proper three-way merge / conflict
+      // against the remote change rather than a silently lost edit. Mirrors the
+      // resolution re-emit above: done after clearOps + startListening.
+      for (const fileId of deferred) {
+        const entry = localState.fileEntries.get(fileId);
+        if (entry) await this.opLogger.recaptureLocalEdit(entry.path);
       }
     } finally {
-      // Clear pending ops before resuming listeners so that vault events
-      // fired asynchronously by our writes (modify/create/delete) don't get
-      // re-logged as new pending changes after clearOps returns.
-      await this.opLogger.clearOps();
-      // Yield to the event loop so Obsidian's async vault events from the
-      // writes above are dispatched and silently dropped (listeners are still
-      // off at this point), then re-attach.
-      await new Promise(resolve => setTimeout(resolve, 0));
-      this.opLogger.startListening();
-    }
-
-    // Advance each synced file's last-synced path (but never for a deferred one:
-    // its destructive action was skipped, so its synced state must stay the
-    // pre-round base for next round's merge).
-    await this.updateSyncedPaths(actions, localState, deferred);
-
-    // Persist the resolution ops now that the already-pushed pending log is
-    // clear — they become pending for the next round and replicate the manual
-    // resolution to peers as two-parent merge nodes. The registry was already
-    // updated to the resolved hash during apply, so the resumed modify listener
-    // suppresses the echo. `deleted` picks the tombstone vs update merge variant.
-    for (const r of resolutions) {
-      if (r.deleted) {
-        await this.opLogger.recordMergeDelete(r.fileId, r.path, r.contentHash, r.hlc, r.parents, r.id);
-      } else {
-        await this.opLogger.recordMergeOp(r.fileId, r.path, r.contentHash, r.hlc, r.parents, r.id);
-      }
-    }
-
-    // Re-capture each in-window edit we declined to overwrite as a durable
-    // pending op (F5), so next round it is a proper three-way merge / conflict
-    // against the remote change rather than a silently lost edit. Mirrors the
-    // resolution re-emit above: done after clearOps + startListening.
-    for (const fileId of deferred) {
-      const entry = localState.fileEntries.get(fileId);
-      if (entry) await this.opLogger.recaptureLocalEdit(entry.path);
+      // Persist every batched registry mutation in a single write, then restore the
+      // per-mutation autosave — always, even if flush throws (else deferSave sticks
+      // on and later mutations would silently never persist).
+      try { await this.registry.flush(); } finally { this.registry.resumeSaves(); }
     }
 
     return { deferred, deferredConflicts };
