@@ -138,6 +138,16 @@ export interface VaultSyncHost {
    *  is O(touched), not O(vault). A genuinely-absent base is left unstaged and the
    *  merge degrades it to a conflict (F1). Already-present hashes are skipped. */
   stageContent(state: VaultState, hashes: Iterable<string>): Promise<void>;
+  /** Stage into `state.contentStore` every hash the persistent local content store
+   *  (the packs) ALREADY durably holds, and return the set it served. The pull uses
+   *  it to serve a blob from local packs instead of re-downloading it (Tier 1). Unlike
+   *  {@link stageContent} there is NO live-path fallback: a pack miss means "not held",
+   *  never a disk read of a same-hash-keyed vault path — which for a REMOTE projection
+   *  would read this device's file at the remote entry's path and stage those (possibly
+   *  diverged) bytes under the remote hash, unverified. Serving only from the
+   *  hash-verified `ContentStore.get` (F1-safe) keeps a locally-sourced blob exactly as
+   *  trustworthy as a downloaded-and-verified one. Already-present hashes count served. */
+  stageLocalContent(state: VaultState, hashes: Iterable<string>): Promise<Set<string>>;
   /** Apply merge actions to the real vault (writes/deletes/moves, conflict
    *  prompts). Returns `deferred` (fileIds whose destructive action was skipped for
    *  on-disk drift (F5) or an auto-deferred conflict — the caller holds the cursor
@@ -608,14 +618,46 @@ export class ServerSyncClient {
    * back so the ops referencing them are re-pulled and retried (F3).
    */
   private async fetchRemoteBlobs(remote: VaultState, local: VaultState): Promise<Set<string>> {
-    const wanted = new Set<string>();
-    for (const entry of remote.fileEntries.values()) {
-      if (entry.deleted) continue;
-      if (!local.contentStore.has(entry.contentHash)) wanted.add(entry.contentHash);
-    }
+    // Which live remote hashes must land in `remote.contentStore` for the merge? A
+    // content hash is a cryptographic content identity, so "do I already have this?"
+    // is answerable without a byte read or a network round-trip. Three tiers, cheapest
+    // first — this is what stops a device re-downloading blobs it already holds (a
+    // fresh DAG build over an existing vault, or a cursor-rewind DAG rebuild).
     const missing = new Set<string>();
+
+    // ── Tier 0 — registry match (no I/O, no bytes, no network) ────────────────
+    // A remote entry whose file (SAME id) already holds the same content locally is
+    // converged: the merge fast-forwards/no-ops it, sourcing any bytes it needs from
+    // the LOCAL side (staged scoped at step 5, `stageMergeContent`). So it needs
+    // nothing in `remote.contentStore` — skip it entirely. Keyed on (fileId, hash),
+    // NOT bare hash membership: a REMOTE-ONLY file whose bytes equal some other local
+    // file still reads `remote.contentStore` exclusively (`state-merge.ts` write_local
+    // at :84), so it must fall through to Tier 1/2 to get its bytes staged.
+    // The skip is against `remote.contentStore`, NOT `local.contentStore`: the two are
+    // separate maps, and a remote-only file's write reads `remote.contentStore`
+    // exclusively (`state-merge.ts` :84). A hash held only in `local.contentStore` (e.g.
+    // an un-opped-edit's drift bytes) does NOT make it available to that read, so keying
+    // the skip on local would leave remote empty and silently no-op the write.
+    const wanted = new Set<string>();
+    for (const [id, entry] of remote.fileEntries) {
+      if (entry.deleted) continue;
+      if (remote.contentStore.has(entry.contentHash)) continue; // already staged this round
+      const le = local.fileEntries.get(id);
+      if (le && !le.deleted && le.contentHash === entry.contentHash) continue; // Tier 0: converged
+      wanted.add(entry.contentHash);
+    }
     if (wanted.size === 0) return missing;
 
+    // ── Tier 1 — pack store (local read, no network) ──────────────────────────
+    // Serve every wanted hash the local packs already durably hold straight into
+    // `remote.contentStore` (hash-verified, F1-safe), replacing a network round-trip
+    // with an amortized local read. Covers remote-only files whose content this device
+    // already holds and divergent files whose remote bytes the merge needs.
+    const served = await this.host.stageLocalContent(remote, wanted);
+    for (const h of served) wanted.delete(h);
+    if (wanted.size === 0) return missing;
+
+    // ── Tier 2 — download the genuine gaps from the server ────────────────────
     this.onProgress?.(`Downloading ${wanted.size} file(s)…`);
 
     // Blind every wanted content hash once, keeping the reverse map so a returned

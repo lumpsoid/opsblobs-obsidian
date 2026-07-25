@@ -161,6 +161,30 @@ export class PluginVaultSyncHost implements VaultSyncHost {
     }
   }
 
+  /**
+   * Stage every hash the persistent pack store already durably holds into
+   * `state.contentStore`, returning the set served so the pull can drop them from its
+   * download list (Tier 1). NO live-path fallback (contrast {@link stageContent}): a
+   * pack miss is "not held", never a disk read of a vault path keyed by this hash —
+   * for a REMOTE projection that path is this device's own file, whose bytes may have
+   * diverged from the remote hash, and staging them unverified would corrupt the
+   * merge's view of remote. `ContentStore.get` hash-verifies (F1-safe), so a blob
+   * served here is exactly as trustworthy as one downloaded and re-verified.
+   */
+  async stageLocalContent(state: VaultState, hashes: Iterable<string>): Promise<Set<string>> {
+    const served = new Set<string>();
+    for (const hash of hashes) {
+      if (hash === '') continue;
+      if (state.contentStore.has(hash)) { served.add(hash); continue; }
+      const bytes = await this.contentStore.get(hash);
+      if (bytes !== null) {
+        state.contentStore.set(hash, bytes);
+        served.add(hash);
+      }
+    }
+    return served;
+  }
+
   async applyMerge(actions: MergeAction[], local: VaultState, remote: VaultState): Promise<{ deferred: Set<string>; deferredConflicts: Set<string> }> {
     return this.applicator.applyActions(actions, local, remote);
   }
