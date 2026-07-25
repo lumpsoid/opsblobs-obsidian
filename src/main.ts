@@ -46,6 +46,25 @@ const PERF_LOG_PATH = '.vault-sync/perf-log.txt';
 const SYNC_ICON_ID = 'vault-sync-icon';
 const SYNC_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"/></svg>`;
 
+/**
+ * Collapses the sync client's per-phase `onProgress` labels — which carry live
+ * per-batch counters, e.g. "Downloading files 3/57…" — down to one of a handful of
+ * coarse phase names. The desktop status bar is continuously visible, so a raw label
+ * would repaint it on every batch; a coarse phase is enough of a gesture that a round
+ * is progressing, and `setStatusBarText`'s exact-match guard then skips the DOM write
+ * entirely between batches of the same phase. Fine-grained detail (counts included)
+ * still reaches the status modal via {@link VaultSyncPlugin.syncActivity}.
+ */
+function coarseSyncPhase(label: string): string {
+  if (label.startsWith('Rebuilding')) return 'Rebuilding…';
+  if (label.startsWith('Pulling') || label.startsWith('Downloading')) return 'Pulling…';
+  if (label.startsWith('Pushing') || label.startsWith('Uploading')) return 'Pushing…';
+  if (label.startsWith('Merging')) return 'Merging…';
+  if (label.startsWith('Applying')) return 'Applying…';
+  if (label.startsWith('Reconciling')) return 'Reconciling…';
+  return 'Syncing…';
+}
+
 export default class VaultSyncPlugin extends Plugin {
   settings!: SyncSettings;
   private hlc!: HybridLogicalClock;
@@ -76,8 +95,9 @@ export default class VaultSyncPlugin extends Plugin {
    *  files 340/8000…", "Merging…"), or null when no round is running. Fed by the sync
    *  client's per-phase `onProgress`; surfaced in the status modal (and on the settings
    *  "Sync now" button) so a long round — the first sync can run for minutes — reads as
-   *  progressing, not frozen. This is the mobile-visible twin of the desktop status bar,
-   *  which doesn't exist on mobile. */
+   *  progressing, not frozen. Unlike the desktop status bar (see {@link coarseSyncPhase}),
+   *  this keeps the full per-batch counters — it's the fine-grained surface, and it's
+   *  the only progress surface on mobile, where the status bar doesn't exist. */
   private syncActivity: string | null = null;
   /** Live progress of the first-sync blob upload (pushing note content to the server),
    *  or null when no push is uploading. Drives a determinate bar in the status modal;
@@ -447,10 +467,13 @@ export default class VaultSyncPlugin extends Plugin {
       host,
       hlc: this.hlc,
       onProgress: (label) => {
-        // The desktop status bar (absent on mobile) …
-        this.setStatusBarText(label, 'syncing');
+        // The desktop status bar (absent on mobile) is a continuously-visible strip —
+        // it only ever shows which coarse phase the round is in, not the fine-grained
+        // per-batch label (e.g. "Downloading files 3/57…"), which would otherwise
+        // repaint it on every batch. Fine-grained detail belongs in the status modal.
+        this.setStatusBarText(coarseSyncPhase(label), 'syncing');
         // … and the mobile-visible surfaces: the status modal's live section and the
-        // settings "Sync now" button both read this.
+        // settings "Sync now" button both read the full, uncollapsed label.
         this.syncActivity = label;
       },
       onUploadProgress: (uploaded, total) => { this.uploadProgress = { uploaded, total }; },
