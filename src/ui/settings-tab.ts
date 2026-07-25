@@ -311,7 +311,7 @@ export class SyncSettingTab extends PluginSettingTab {
       .setDesc('Run a full sync against the server.')
       .addButton(btn => {
         btn.setButtonText('Sync now').setCta().onClick(async () => {
-          btn.setButtonText('Syncing…').setDisabled(true);
+          btn.setButtonText('Syncing…').setDisabled(true).removeCta();
           // Poll the live phase onto the button so a minutes-long first sync reads as
           // progressing ("Uploading files 340/8000…"), not a frozen spinner. The
           // interval is cleared in the finally, which also always re-enables the button
@@ -324,7 +324,7 @@ export class SyncSettingTab extends PluginSettingTab {
             await this.host.syncNow();
           } finally {
             window.clearInterval(poll);
-            btn.setButtonText('Sync now').setDisabled(false);
+            btn.setButtonText('Sync now').setDisabled(false).setCta();
           }
         });
       });
