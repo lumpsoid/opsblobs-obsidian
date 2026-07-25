@@ -226,7 +226,10 @@ export interface ServerSyncOptions {
   perfLog?: PhaseTimingSink;
 }
 
-const DEFAULT_OPS_LIMIT = 500;
+/** Default page size for the pull loop's `GET /ops?limit=`. Set to the server's
+ *  default `MaxPullLimit` (`SYNC_MAX_PULL_LIMIT`, spec §9.6) so a full-sync drain
+ *  moves the most ops per round-trip; a server with a lower cap clamps this down. */
+const DEFAULT_OPS_LIMIT = 2000;
 
 /** Default batch size for the append loop. A whole-vault offline capture (e.g. a
  *  fresh vault's first sync) can queue thousands of pending ops; posting them in
