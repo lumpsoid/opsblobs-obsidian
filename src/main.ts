@@ -31,12 +31,17 @@ import { SyncCoordinator, SyncOutcome } from './network/sync-coordinator';
 import { ObsidianEditorSaver } from './network/obsidian-editor-saver';
 import { ObsidianNotifier } from './network/obsidian-notifier';
 import { ConflictsView, CONFLICTS_VIEW_TYPE, ConflictsViewHost } from './ui/conflicts-view';
+import { PerfLogView, PERF_LOG_VIEW_TYPE, PerfLogViewHost } from './ui/perf-log-view';
 import { listTwoHeadedConflicts, ConflictListItem } from './core/conflict-inventory';
 
 // ─── Ribbon icon SVG ────────────────────────────────────────────────────────
 /** Above this file count, a first-enable capture surfaces indexing progress in the
  *  status bar (and a notice) so a minutes-long pass doesn't look like a freeze. */
 const CAPTURE_PROGRESS_UI_MIN = 500;
+
+/** The perf log (perf baseline, Layer 3). A dotfolder, so effectively unreachable
+ *  through the iOS Files app — {@link PerfLogView} surfaces it as an in-app tab. */
+const PERF_LOG_PATH = '.vault-sync/perf-log.txt';
 
 const SYNC_ICON_ID = 'vault-sync-icon';
 const SYNC_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"/></svg>`;
@@ -233,6 +238,9 @@ export default class VaultSyncPlugin extends Plugin {
     // The non-blocking conflicts panel (Step 6). Registered before the ribbon so a
     // restored leaf of this type re-attaches to a live host.
     this.registerView(CONFLICTS_VIEW_TYPE, leaf => new ConflictsView(leaf, this.conflictsHost()));
+    // The perf log viewer (Layer 3) — an in-app tab over the otherwise iOS-unreachable
+    // `.vault-sync/perf-log.txt`. Registered so a restored leaf re-attaches to a live host.
+    this.registerView(PERF_LOG_VIEW_TYPE, leaf => new PerfLogView(leaf, this.perfLogHost()));
 
     this.ribbonIcon = this.addRibbonIcon(SYNC_ICON_ID, 'Vault Sync', () => {
       // In the error state the tooltip promises "click for details" — honor that by
@@ -280,6 +288,12 @@ export default class VaultSyncPlugin extends Plugin {
       id: 'open-conflicts-panel',
       name: 'Open conflicts',
       callback: () => { void this.activateConflictsView(); },
+    });
+
+    this.addCommand({
+      id: 'open-perf-log',
+      name: 'Open perf log',
+      callback: () => { void this.activatePerfLogView(); },
     });
 
     // Diagnostic (A3 pack-writes): measure whether the native `append` is O(delta)
@@ -458,7 +472,7 @@ export default class VaultSyncPlugin extends Plugin {
     return (phase, ms) => {
       const line = `${Date.now()} ${scope} ${phase} ${ms.toFixed(1)}ms`;
       console.log(`[vault-sync perf] ${line}`);
-      void this.metadata.append('.vault-sync/perf-log.txt', line + '\n').catch(() => {});
+      void this.metadata.append(PERF_LOG_PATH, line + '\n').catch(() => {});
     };
   }
 
@@ -490,7 +504,7 @@ export default class VaultSyncPlugin extends Plugin {
       // to perf-log.txt for a post-hoc pull.
       console.log('[vault-sync] append-bench:\n' + lines.join('\n'));
       for (const line of lines) {
-        await this.metadata.append('.vault-sync/perf-log.txt', line + '\n').catch(() => {});
+        await this.metadata.append(PERF_LOG_PATH, line + '\n').catch(() => {});
       }
       const verdict = (lines[0] ?? '').replace('append-bench VERDICT: ', '');
       new Notice(`Vault Sync append-bench: ${verdict}`, 12000);
@@ -902,6 +916,35 @@ export default class VaultSyncPlugin extends Plugin {
     };
   }
 
+  /** The narrow surface the {@link PerfLogView} needs — reads and clears the perf log
+   *  through the metadata store. Pure glue; a diagnostics read must never break sync. */
+  private perfLogHost(): PerfLogViewHost {
+    return {
+      perfLogPath: PERF_LOG_PATH,
+      perfLogEnabled: () => this.settings.perfLog,
+      readPerfLog: () => this.metadata.read(PERF_LOG_PATH).catch(() => null),
+      clearPerfLog: async () => {
+        if (await this.metadata.exists(PERF_LOG_PATH)) await this.metadata.remove(PERF_LOG_PATH);
+      },
+    };
+  }
+
+  /** Reveal the perf log viewer as a main-area tab (creating it if needed), reusing an
+   *  existing leaf so repeated triggers don't spawn duplicates — mirrors
+   *  {@link activateConflictsView}. Public so the settings tab can open it. */
+  async activatePerfLogView(): Promise<void> {
+    const { workspace } = this.app;
+    let leaf = workspace.getLeavesOfType(PERF_LOG_VIEW_TYPE)[0] ?? null;
+    if (!leaf) {
+      leaf = workspace.getLeaf('tab');
+      await leaf.setViewState({ type: PERF_LOG_VIEW_TYPE, active: true });
+    } else {
+      // An already-open tab may be stale — the log grows out-of-band as sync runs.
+      if (leaf.view instanceof PerfLogView) leaf.view.refresh();
+    }
+    void workspace.revealLeaf(leaf);
+  }
+
   /** Reveal the conflicts view, creating it as a main-area tab if needed. A tab (not
    *  a right-sidebar drawer) makes it a first-class view and reads far better on
    *  mobile, where the sidebar is a cramped slide-over. Reuses an existing leaf if one
@@ -948,5 +991,12 @@ export default class VaultSyncPlugin extends Plugin {
       getUploadProgress: () => this.uploadProgress,
       onOpenConflicts: () => { void this.activateConflictsView(); },
     }).open();
+  }
+
+  /** Open the perf log viewer tab (SettingsHost). The `.vault-sync/perf-log.txt`
+   *  dotfolder is effectively unreachable on iOS, so the settings button routes here
+   *  instead of asking the user to hunt for a hidden file. */
+  openPerfLog(): void {
+    void this.activatePerfLogView();
   }
 }

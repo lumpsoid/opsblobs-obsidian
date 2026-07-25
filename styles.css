@@ -126,6 +126,21 @@ a.vault-sync-notice-link { display: inline-block; margin-top: 0.4rem; text-decor
 .vault-sync-conflict-preview > summary { cursor: pointer; font-size: 0.8rem; font-weight: 600; color: var(--text-muted); }
 .vault-sync-conflict-preview-code { margin-top: 0.4rem; background: var(--background-primary-alt); padding: 0.4rem 0.6rem; border-radius: 4px; max-height: 200px; }
 
+/* Perf log viewer — an in-app tab over the iOS-unreachable .vault-sync/perf-log.txt. */
+.vault-sync-perf-log-view { padding: 0.75rem; overflow-y: auto; }
+.vault-sync-perf-log-header h3 { margin: 0 0 0.25rem; }
+.vault-sync-perf-log-path { font-family: var(--font-monospace); font-size: 0.78rem; color: var(--text-muted); overflow-wrap: anywhere; word-break: break-word; }
+.vault-sync-perf-log-count { color: var(--text-muted); font-size: 0.85rem; margin: 0.25rem 0 0.75rem; }
+.vault-sync-perf-log-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
+.vault-sync-perf-log-empty { display: flex; justify-content: center; text-align: center; padding: 1.5rem; color: var(--text-muted); }
+.vault-sync-perf-log-body { margin: 0; font-family: var(--font-monospace); font-size: 0.78rem; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; background: var(--background-primary-alt); padding: 0.6rem 0.75rem; border-radius: 6px; }
+
+@media (max-width: 700px) {
+  .vault-sync-perf-log-body { font-size: 0.85rem; }
+  .vault-sync-perf-log-actions { gap: 0.6rem; }
+  .vault-sync-perf-log-actions button { min-height: 44px; padding-left: 1rem; padding-right: 1rem; }
+}
+
 /* Mobile / narrow width — the 3-way compare (UX audit §6). Three columns in a
    phone-width view are unreadable, so stack the Mine/Original/Theirs panes vertically:
    each becomes full-width with a bottom divider instead of a right one, and the code
