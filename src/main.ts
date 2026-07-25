@@ -736,6 +736,13 @@ export default class VaultSyncPlugin extends Plugin {
     await this.triggerSync('manual');
   }
 
+  /** Whether a sync round is currently running — read by the settings tab when the
+   *  "Sync now" button (re)renders, since reopening the tab mid-round would otherwise
+   *  show a fresh, idle-looking button for a round it isn't driving. */
+  isSyncing(): boolean {
+    return this.syncInProgress;
+  }
+
   // ─── Auto-sync ──────────────────────────────────────────────────────────────
 
   /** (Re)arm the periodic sync timer from settings. Idempotent — safe to call

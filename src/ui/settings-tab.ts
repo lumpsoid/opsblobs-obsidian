@@ -29,6 +29,10 @@ export interface SettingsHost extends Plugin {
   rebaselineToServer(): Promise<void>;
   recheckConflicts(): Promise<void>;
   syncNow(): Promise<void>;
+  /** Whether a sync round is currently running — read when the "Sync now" button is
+   *  (re)rendered so it opens already disabled/de-colored if the tab is reopened
+   *  mid-round, instead of looking idle for a round it isn't driving. */
+  isSyncing(): boolean;
   openSyncStatus(): void;
   /** Open the in-app perf log viewer tab (the `.vault-sync/perf-log.txt` dotfolder is
    *  unreachable on iOS, so we surface it as a tab rather than a hidden file). */
@@ -307,7 +311,12 @@ export class SyncSettingTab extends PluginSettingTab {
       .setName('Sync now')
       .setDesc('Run a full sync against the server.')
       .addButton(btn => {
-        btn.setButtonText('Sync now').setCta().onClick(async () => {
+        btn.setButtonText('Sync now').setCta();
+        // The tab re-renders from scratch every time it's opened, so a round already
+        // running (started before this open, e.g. auto-sync or a prior manual click)
+        // would otherwise look idle. Reflect the live state on render, not just on click.
+        if (this.host.isSyncing()) btn.setDisabled(true).removeCta();
+        btn.onClick(async () => {
           // Disable + drop CTA color to read as inactive while syncing — no text
           // changes here; live phase is surfaced via the status bar/modal instead.
           btn.setDisabled(true).removeCta();
