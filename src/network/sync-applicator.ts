@@ -200,8 +200,28 @@ export class SyncApplicator {
         // no_op whenever a winner's bytes are actually missing (F1), so it never
         // emits a fabricated empty write. Writing empty is therefore the correct
         // propagation of a user emptying a file — not a truncation to refuse (G13).
-        await this.files.write(action.path, action.content);
-        await this.contentStore.putBuffered(hash, action.content);
+        //
+        // Content-equality skip: if `action.path` already holds these exact bytes,
+        // the write only churns the disk. This is the dominant cost of a cross-device
+        // first sync — two devices that independently created the same byte-identical
+        // files mint different UUIDs, so every path is a create/create collision
+        // (state-merge `resolveCreateCollision`) whose winning remote id carries
+        // content identical to what is already on disk under the losing local id.
+        // Without this guard `write_local` rewrites all N files to themselves (the
+        // ~23 s `applyMerge` on an 8k-note vault). The read+hash is far cheaper than
+        // the write; `adoptRemote` below still converges the identity and the H5
+        // rename trash still runs. Judged at `action.path` (the write target), not
+        // `currentPath`, so a rename to a new/other-content path still writes.
+        const onDisk = await this.files.read(action.path);
+        if (onDisk === null || (await hashContent(onDisk)) !== hash) {
+          await this.files.write(action.path, action.content);
+        }
+        // Likewise skip re-packing a blob we already hold durably (memCache or a
+        // pack): the losing local id's identical content is already in the store, so
+        // `adoptRemote`'s hash stays resolvable without a redundant base64+append.
+        if (!(await this.contentStore.has(hash))) {
+          await this.contentStore.putBuffered(hash, action.content);
+        }
         // Adopt the remote file's identity (its UUID) so both devices track this
         // path under ONE id. The merge is id-keyed; without this each device
         // keeps its own id for the same path and their edits never reconcile —

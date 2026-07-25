@@ -119,7 +119,13 @@ describe('create/create path collision (F2)', () => {
 
     await client(A).runSync();
     await client(B).runSync();
+    // A now pulls B's higher-HLC id and applies a `write_local` to converge identity.
+    // The bytes on disk are already 'identical\n', so the content-equality skip must
+    // elide the redundant whole-file write: the action fires but no disk write does.
+    const aWritesBefore = A.files.io.writes;
     await client(A).runSync();
+    expect(A.applied.some(x => x.type === 'write_local')).toBe(true);
+    expect(A.files.io.writes).toBe(aWritesBefore);
 
     // No conflict is ever surfaced — same bytes are the same file.
     expect(A.applied.some(x => x.type === 'conflict')).toBe(false);
