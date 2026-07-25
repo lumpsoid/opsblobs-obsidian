@@ -1,6 +1,6 @@
 {
 	"name": "obsidian-vault-sync",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "End-to-end-encrypted vault sync for Obsidian with client-side CRDT conflict resolution",
 	"main": "main.js",
 	"type": "module",
