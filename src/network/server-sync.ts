@@ -58,6 +58,7 @@ import {
   StaleCursorError,
   KeyMismatchError,
   DecryptError,
+  BatchTooLargeError,
 } from './sync-errors';
 export {
   StaleCursorError,
@@ -93,6 +94,12 @@ export interface ServerApi {
    *  base64 JSON batch — sent as raw `application/octet-stream` instead. */
   putBlob(hash: string, bytes: Uint8Array): Promise<void>;
   getBlob(hash: string): Promise<Uint8Array | null>;
+  /** Download many blobs in one request (spec §5.5) — the download-side mirror of
+   *  `putBlobBatch`, collapsing a first sync's thousands of one-blob GETs into
+   *  ⌈N/batch⌉. Returns the bytes for every requested hash the vault holds (keyed
+   *  by hash); a hash the vault doesn't hold is reported in `missing`, not an
+   *  error. Over the combined-size cap the transport throws `BatchTooLargeError`. */
+  getBlobBatch(hashes: string[]): Promise<{ blobs: Map<string, Uint8Array>; missing: string[] }>;
 }
 
 /** A pulled, decrypted op paired with its server `seq`. The decrypted
@@ -189,6 +196,11 @@ export interface ServerSyncOptions {
    *  `putBlob` rather than batched, so a big attachment can't bloat a batch. Test
    *  hook; defaults to {@link DEFAULT_BLOB_BATCH_THRESHOLD}. */
   blobBatchThreshold?: number;
+  /** Max `blobs:fetch` requests in flight at once during the pull. The download-side
+   *  twin of {@link blobUploadConcurrency}: a fresh vault's first sync downloads the
+   *  whole baseline, so overlapping a handful of batch round-trips cuts wall-clock.
+   *  Test hook; defaults to {@link DEFAULT_BLOB_DOWNLOAD_CONCURRENCY}. */
+  blobDownloadConcurrency?: number;
   onProgress?: (label: string) => void;
   /** Structured blob-upload progress `(uploaded, total)`, fired as each batch/PUT
    *  settles during the push — the numeric twin of the `Uploading files …` string
@@ -219,6 +231,12 @@ const DEFAULT_MAX_OPS_PER_APPEND = 1000;
  *  modest (near the classic ~6 connections-per-host ceiling) so a mobile `requestUrl`
  *  and the per-blob AES-GCM encrypt aren't swamped. */
 const DEFAULT_BLOB_UPLOAD_CONCURRENCY = 8;
+
+/** Default number of concurrent `blobs:fetch` requests during the pull. Same
+ *  reasoning as the upload pool: each batch is one latency-bound round-trip, so a
+ *  fresh vault's baseline download overlaps a handful of them without swamping a
+ *  mobile `requestUrl`. */
+const DEFAULT_BLOB_DOWNLOAD_CONCURRENCY = 8;
 
 /** Default max blobs per `blobs:batch` request. Matches the server's default
  *  `MaxBlobsPerBatch` (256); a fresh vault's thousands of tiny notes upload in
@@ -280,6 +298,7 @@ export class ServerSyncClient {
   private readonly blobBatchMaxCount: number;
   private readonly blobBatchMaxBytes: number;
   private readonly blobBatchThreshold: number;
+  private readonly blobDownloadConcurrency: number;
   private readonly onProgress?: (label: string) => void;
   private readonly onUploadProgress?: (uploaded: number, total: number) => void;
   private readonly perfLog?: PhaseTimingSink;
@@ -298,6 +317,10 @@ export class ServerSyncClient {
     this.blobBatchMaxCount = Math.max(1, opts.blobBatchMaxCount ?? DEFAULT_BLOB_BATCH_MAX_COUNT);
     this.blobBatchMaxBytes = Math.max(1, opts.blobBatchMaxBytes ?? DEFAULT_BLOB_BATCH_MAX_BYTES);
     this.blobBatchThreshold = Math.max(0, opts.blobBatchThreshold ?? DEFAULT_BLOB_BATCH_THRESHOLD);
+    this.blobDownloadConcurrency = Math.max(
+      1,
+      opts.blobDownloadConcurrency ?? DEFAULT_BLOB_DOWNLOAD_CONCURRENCY,
+    );
     this.onProgress = opts.onProgress;
     this.onUploadProgress = opts.onUploadProgress;
     this.perfLog = opts.perfLog;
@@ -594,12 +617,98 @@ export class ServerSyncClient {
     if (wanted.size === 0) return missing;
 
     this.onProgress?.(`Downloading ${wanted.size} file(s)…`);
+
+    // Blind every wanted content hash once, keeping the reverse map so a returned
+    // (or absent) blinded key resolves back to the content hash the store is keyed
+    // by. `blobs:fetch` collapses ⌈N/blobBatchMaxCount⌉ requests out of N GETs.
+    const byBlinded = new Map<string, string>(); // blinded → contentHash
     for (const contentHash of wanted) {
-      const content = await this.fetchBlob(contentHash);
-      if (!content) { missing.add(contentHash); continue; } // absent — merge no-ops it; hold the cursor (F3)
+      byBlinded.set(await this.crypto.blindHash(contentHash), contentHash);
+    }
+    const blinded = [...byBlinded.keys()];
+
+    // Partition into count-bounded chunks (≤ the server's per-batch cap); the
+    // combined-byte cap is unknowable ahead of a download, so an oversized batch is
+    // recovered by split-and-retry inside `getBlobBatchSplit`, not planned around.
+    const chunks: string[][] = [];
+    for (let i = 0; i < blinded.length; i += this.blobBatchMaxCount) {
+      chunks.push(blinded.slice(i, i + this.blobBatchMaxCount));
+    }
+
+    const total = wanted.size;
+    let done = 0;
+    const bump = (n: number): void => {
+      done += n;
+      if (total > this.blobBatchMaxCount) this.onProgress?.(`Downloading files ${done}/${total}…`);
+    };
+
+    // Overlap the chunk round-trips with a bounded worker pool, mirroring the
+    // upload path. Each chunk decrypts + hash-verifies its blobs and stages them;
+    // a hash absent from the response strands its content hash (F3).
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        const i = next++;
+        if (i >= chunks.length) return;
+        await this.fetchBlobChunk(chunks[i]!, byBlinded, remote, missing, bump);
+      }
+    };
+    const workers = Math.min(this.blobDownloadConcurrency, chunks.length);
+    await Promise.all(Array.from({ length: workers }, () => worker()));
+    return missing;
+  }
+
+  /**
+   * Download one chunk of blinded hashes in a single `blobs:fetch`, then for each:
+   * decrypt, verify it hashes back to the asserted content hash, and stage it in
+   * the remote content store. A hash the server didn't return is absent — its
+   * content hash goes to `missing` so the caller holds the cursor and retries (F3).
+   */
+  private async fetchBlobChunk(
+    chunk: string[],
+    byBlinded: Map<string, string>,
+    remote: VaultState,
+    missing: Set<string>,
+    bump: (n: number) => void,
+  ): Promise<void> {
+    const blobs = await this.getBlobBatchSplit(chunk);
+    for (const blinded of chunk) {
+      const contentHash = byBlinded.get(blinded)!;
+      const envelope = blobs.get(blinded);
+      if (!envelope) { missing.add(contentHash); continue; } // absent — merge no-ops it; hold the cursor (F3)
+      const content = await this.crypto.decryptBlob(envelope);
+      if ((await sha256Hex(content)) !== contentHash) {
+        throw new Error(`Blob ${blinded} failed content-hash verification`);
+      }
       remote.contentStore.set(contentHash, content);
     }
-    return missing;
+    bump(chunk.length);
+  }
+
+  /**
+   * `getBlobBatch` for a chunk, recovering the server's combined-size 413
+   * (`BatchTooLargeError`) by halving the chunk and retrying each half. A single
+   * blob still over the cap can't ride any batch, so it streams via single `getBlob`
+   * — the download analogue of the upload path routing a large blob to `putBlob`.
+   */
+  private async getBlobBatchSplit(hashes: string[]): Promise<Map<string, Uint8Array>> {
+    try {
+      return (await this.api.getBlobBatch(hashes)).blobs;
+    } catch (err) {
+      if (!(err instanceof BatchTooLargeError)) throw err;
+      if (hashes.length <= 1) {
+        const one = new Map<string, Uint8Array>();
+        const bytes = await this.api.getBlob(hashes[0]!);
+        if (bytes) one.set(hashes[0]!, bytes);
+        return one;
+      }
+      const mid = Math.floor(hashes.length / 2);
+      const [a, b] = await Promise.all([
+        this.getBlobBatchSplit(hashes.slice(0, mid)),
+        this.getBlobBatchSplit(hashes.slice(mid)),
+      ]);
+      return new Map<string, Uint8Array>([...a, ...b]);
+    }
   }
 
   /**

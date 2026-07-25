@@ -20,6 +20,16 @@ export class StaleCursorError extends Error {
   }
 }
 
+/** A `blobs:fetch` (or `blobs:batch`) response would exceed the server's
+ *  combined-size cap (413, spec §5.5). Internal — the download path catches it and
+ *  splits the chunk (down to a single-blob stream), so it never reaches the user. */
+export class BatchTooLargeError extends Error {
+  constructor() {
+    super('Server rejected blob batch: response too large, split and retry');
+    this.name = 'BatchTooLargeError';
+  }
+}
+
 /** The vault on the server was established under a different key than this device
  *  derived — a mistyped passphrase (or wrong salt). Thrown *before* any remote op is
  *  trusted or any local op is pushed, so a key mismatch is a clean, self-explaining

@@ -40,6 +40,10 @@ class BlobGatedServer implements ServerApi {
   async getBlob(hash: string): Promise<Uint8Array | null> {
     return this.blobAvailable ? this.inner.getBlob(hash) : null;
   }
+  async getBlobBatch(hashes: string[]): Promise<{ blobs: Map<string, Uint8Array>; missing: string[] }> {
+    // Gated off → every hash reads as absent (the batch analogue of getBlob → null).
+    return this.blobAvailable ? this.inner.getBlobBatch(hashes) : { blobs: new Map(), missing: [...hashes] };
+  }
 }
 
 /** Wraps a FakeSyncServer so its first `appendOps` 409s with a StaleCursorError
@@ -59,6 +63,7 @@ class StaleOnceServer implements ServerApi {
   putBlob(hash: string, bytes: Uint8Array): Promise<void> { return this.inner.putBlob(hash, bytes); }
   putBlobBatch(blobs: BlobUpload[]): Promise<void> { return this.inner.putBlobBatch(blobs); }
   getBlob(hash: string): Promise<Uint8Array | null> { return this.inner.getBlob(hash); }
+  getBlobBatch(hashes: string[]): Promise<{ blobs: Map<string, Uint8Array>; missing: string[] }> { return this.inner.getBlobBatch(hashes); }
 }
 
 /** Wraps a FakeSyncServer recording the op-count of every `appendOps` call, so a
@@ -77,6 +82,7 @@ class BatchRecordingServer implements ServerApi {
   putBlob(hash: string, bytes: Uint8Array): Promise<void> { return this.inner.putBlob(hash, bytes); }
   putBlobBatch(blobs: BlobUpload[]): Promise<void> { return this.inner.putBlobBatch(blobs); }
   getBlob(hash: string): Promise<Uint8Array | null> { return this.inner.getBlob(hash); }
+  getBlobBatch(hashes: string[]): Promise<{ blobs: Map<string, Uint8Array>; missing: string[] }> { return this.inner.getBlobBatch(hashes); }
 }
 
 /** Wraps a FakeSyncServer recording the peak number of blob-upload *requests* in
@@ -93,6 +99,7 @@ class ConcurrencyProbeServer implements ServerApi {
   appendOps(baseCursor: number, ops: AppendOp[]): Promise<AppendResult> { return this.inner.appendOps(baseCursor, ops); }
   checkBlobs(hashes: string[]): Promise<{ missing: string[] }> { return this.inner.checkBlobs(hashes); }
   getBlob(hash: string): Promise<Uint8Array | null> { return this.inner.getBlob(hash); }
+  getBlobBatch(hashes: string[]): Promise<{ blobs: Map<string, Uint8Array>; missing: string[] }> { return this.inner.getBlobBatch(hashes); }
   private async track<T>(run: () => Promise<T>): Promise<T> {
     this.inFlight++;
     this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);

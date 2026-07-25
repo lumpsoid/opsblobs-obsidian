@@ -112,6 +112,31 @@ export function runContractSuite(label: string, newServer: () => ContractServer)
       expect(await api.getBlob(absentHash)).toBeNull();
     });
 
+    test('batch blob download: held come back keyed by hash, absent land in missing', async () => {
+      const api = freshApi();
+      const a = new TextEncoder().encode('blob A');
+      const b = new TextEncoder().encode('blob B');
+      const hashA = await sha256Hex(a);
+      const hashB = await sha256Hex(b);
+      const absentHash = await sha256Hex(new TextEncoder().encode('absent'));
+
+      await api.putBlobBatch([{ hash: hashA, bytes: a }, { hash: hashB, bytes: b }]);
+
+      // A mix of held and unheld, with a duplicate — held return once, keyed by
+      // hash; the rest land in `missing`; the call still succeeds.
+      const res = await api.getBlobBatch([hashA, absentHash, hashB, hashA]);
+      expect(new TextDecoder().decode(res.blobs.get(hashA))).toBe('blob A');
+      expect(new TextDecoder().decode(res.blobs.get(hashB))).toBe('blob B');
+      expect(res.blobs.size).toBe(2);
+      expect(res.missing).toContain(absentHash);
+      expect(res.missing).not.toContain(hashA);
+
+      // Empty request → both arrays empty.
+      const empty = await api.getBlobBatch([]);
+      expect(empty.blobs.size).toBe(0);
+      expect(empty.missing).toEqual([]);
+    });
+
     test('two devices: A pushes a file, B pulls and converges', async () => {
       const server = newServer();
       const vault = server.freshVault();

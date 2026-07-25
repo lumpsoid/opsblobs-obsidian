@@ -10,7 +10,8 @@
 //  FakeSyncServer, which is what keeps the fake honest.
 
 import { ServerApi, PullOpsResult, AppendOp, AppendResult, BlobUpload } from '../../src/network/server-sync';
-import { bytesToBase64 } from '../../src/core/encoding';
+import { BatchTooLargeError } from '../../src/network/sync-errors';
+import { bytesToBase64, base64ToBytes } from '../../src/core/encoding';
 
 export class FetchServerApi implements ServerApi {
   constructor(
@@ -86,5 +87,19 @@ export class FetchServerApi implements ServerApi {
     if (resp.status === 404) return null;
     if (resp.status !== 200) throw new Error(`GET /blobs failed: ${resp.status}`);
     return new Uint8Array(await resp.arrayBuffer());
+  }
+
+  async getBlobBatch(hashes: string[]): Promise<{ blobs: Map<string, Uint8Array>; missing: string[] }> {
+    const resp = await fetch(`${this.vaultBase()}/blobs:fetch`, {
+      method: 'POST',
+      headers: { ...this.auth(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hashes }),
+    });
+    if (resp.status === 413) throw new BatchTooLargeError();
+    if (resp.status !== 200) throw new Error(`POST /blobs:fetch failed: ${resp.status}`);
+    const json = (await resp.json()) as { blobs: { hash: string; data: string }[]; missing: string[] };
+    const blobs = new Map<string, Uint8Array>();
+    for (const b of json.blobs) blobs.set(b.hash, base64ToBytes(b.data));
+    return { blobs, missing: json.missing };
   }
 }

@@ -73,6 +73,19 @@ export class FakeSyncServer implements ServerApi {
     return this.blobs.get(hash) ?? null;
   }
 
+  async getBlobBatch(hashes: string[]): Promise<{ blobs: Map<string, Uint8Array>; missing: string[] }> {
+    // Download-side twin of putBlobBatch: return the bytes for every held hash
+    // (once, even if requested twice) and list the rest as missing, in request order.
+    const blobs = new Map<string, Uint8Array>();
+    const missing: string[] = [];
+    for (const hash of hashes) {
+      const bytes = this.blobs.get(hash);
+      if (bytes) blobs.set(hash, bytes);
+      else missing.push(hash);
+    }
+    return { blobs, missing };
+  }
+
   // ── Test/harness introspection ────────────────────────────────────────────
   get opCount(): number { return this.log.length; }
   get blobCount(): number { return this.blobs.size; }

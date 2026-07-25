@@ -16,13 +16,14 @@ import {
   AppendResult,
   BlobUpload,
 } from './server-sync';
-import { bytesToBase64 } from '../core/encoding';
+import { bytesToBase64, base64ToBytes } from '../core/encoding';
 import {
   StaleCursorError,
   AuthError,
   NotFoundError,
   ServerError,
   NetworkError,
+  BatchTooLargeError,
 } from './sync-errors';
 import { withTimeout } from './with-timeout';
 
@@ -148,6 +149,23 @@ export class HttpServerApi implements ServerApi {
     if (resp.status === 404) return null; // absent — a legitimate "not held", not an error
     if (resp.status !== 200) throw this.statusError(resp.status, 'downloading a file');
     return new Uint8Array(resp.arrayBuffer);
+  }
+
+  async getBlobBatch(hashes: string[]): Promise<{ blobs: Map<string, Uint8Array>; missing: string[] }> {
+    const resp = await this.request('downloading your files', {
+      url: `${this.vaultBase()}/blobs:fetch`,
+      method: 'POST',
+      headers: { ...this.authHeader(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ hashes }),
+    }, this.blobTimeout);
+    // 413 = the combined response would exceed the server's batch cap; the caller
+    // splits the chunk (down to a single-blob GET) rather than failing the round.
+    if (resp.status === 413) throw new BatchTooLargeError();
+    if (resp.status !== 200) throw this.statusError(resp.status, 'downloading your files');
+    const json = resp.json as { blobs: { hash: string; data: string }[]; missing: string[] };
+    const blobs = new Map<string, Uint8Array>();
+    for (const b of json.blobs) blobs.set(b.hash, base64ToBytes(b.data));
+    return { blobs, missing: json.missing };
   }
 }
 
