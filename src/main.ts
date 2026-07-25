@@ -566,7 +566,7 @@ export default class VaultSyncPlugin extends Plugin {
       if (total > CAPTURE_PROGRESS_UI_MIN) {
         if (!announced) {
           announced = true;
-          new Notice(`Vault Sync: preparing ${total} files for first sync — this can take a moment.`, 8000);
+          new Notice(`Vault Sync: preparing ${total} files for first sync…`, 8000);
         }
         // The status bar is the always-visible surface; reflect indexing progress
         // there so the vault doesn't look frozen during a minutes-long capture.
