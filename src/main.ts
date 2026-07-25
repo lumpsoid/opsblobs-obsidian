@@ -86,6 +86,13 @@ export default class VaultSyncPlugin extends Plugin {
   private statusBarItem: HTMLElement | null = null;
   private statusBarText = '';
   private syncInProgress = false;
+  /** True only while the one-time startup offline-changes scan (before
+   *  `opLogger.startListening()`) is running. Not covered by `syncInProgress` — that
+   *  flag is set/cleared inside `triggerSync` and this scan runs outside it — so
+   *  `triggerSync` and `isSyncing()` check this separately to keep a "Sync now" click
+   *  during this window from racing a second, concurrent `captureOfflineChanges()`
+   *  pass against the same registry/oplog state. */
+  private startupCaptureInProgress = false;
   private autoSyncHandle: number | null = null;
   /** Live progress of the first-enable capture (building the local DAG), or null when
    *  it isn't running. Surfaced in the status modal so a minutes-long first pass shows
@@ -245,7 +252,12 @@ export default class VaultSyncPlugin extends Plugin {
         // run for many minutes on mobile, so under perfLog it streams scan progress
         // (not just a single on-completion timing, which a still-running phase never
         // reaches).
-        await this.captureOfflineWithPerf();
+        this.startupCaptureInProgress = true;
+        try {
+          await this.captureOfflineWithPerf();
+        } finally {
+          this.startupCaptureInProgress = false;
+        }
         // Start listening for vault changes.
         this.opLogger.startListening();
       })();
@@ -662,6 +674,10 @@ export default class VaultSyncPlugin extends Plugin {
    *  and ribbon transitions. The round's actual work (capture → run → record) lives
    *  in the obsidian-free {@link SyncCoordinator}. */
   private async triggerSync(source: 'manual' | 'auto'): Promise<void> {
+    if (this.startupCaptureInProgress) {
+      if (source === 'manual') new Notice('Vault Sync: still preparing the vault for first sync — try again shortly.');
+      return;
+    }
     if (this.syncInProgress) {
       if (source === 'manual') new Notice('Sync already in progress.');
       return;
@@ -736,11 +752,12 @@ export default class VaultSyncPlugin extends Plugin {
     await this.triggerSync('manual');
   }
 
-  /** Whether a sync round is currently running — read by the settings tab when the
-   *  "Sync now" button (re)renders, since reopening the tab mid-round would otherwise
-   *  show a fresh, idle-looking button for a round it isn't driving. */
+  /** Whether a sync round — or the startup offline-changes scan that precedes it — is
+   *  currently running. Read by the settings tab when the "Sync now" button (re)renders,
+   *  since reopening the tab mid-round (or during the startup scan) would otherwise show
+   *  a fresh, idle-looking button for work it isn't driving. */
   isSyncing(): boolean {
-    return this.syncInProgress;
+    return this.syncInProgress || this.startupCaptureInProgress;
   }
 
   // ─── Auto-sync ──────────────────────────────────────────────────────────────
