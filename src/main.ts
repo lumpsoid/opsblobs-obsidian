@@ -507,7 +507,7 @@ export default class VaultSyncPlugin extends Plugin {
     const sink = this.perfSink('startup');
     const t0 = performance.now();
     // Sub-phase accumulators for the dominant `putMs` (A3 §3.2): the base64 encode
-    // (in ContentStore.putNew) and the atomic-write ceremony's native sub-ops (in
+    // (in ContentStore.putBuffered) and the atomic-write ceremony's native sub-ops (in
     // ObsidianMetadataStore.write, scoped to content blobs). Armed only when the perf
     // sink is on so a normal enable pays nothing; read + logged + cleared after the pass.
     const putPerf = sink ? { encodeMs: 0 } : null;
@@ -552,7 +552,7 @@ export default class VaultSyncPlugin extends Plugin {
     // per-blob writes. This is where the old ~50 s putMs write phase now lives (~1–2 s).
     sink?.(`captureOfflineChanges flushMs`, stats.flushMs);
     // The putMs sub-split (A3 §3.2): base64 encode (CPU) vs the atomic-write ceremony's
-    // native adapter sub-ops. `putOtherMs` = ensureShard + memCache + loop overhead not
+    // native adapter sub-ops. `putOtherMs` = memCache + buffer push + loop overhead not
     // in the five measured sub-phases. This decides whether the temp-write + rename
     // ceremony is worth replacing with a direct write for the disposable content store.
     if (putPerf && writePerf) {

@@ -119,12 +119,12 @@ describe('first-enable on a pre-existing vault (H10)', () => {
 });
 
 describe('C2 — first-enable bulk write skips the redundant `exists` probe', () => {
-  // On a fresh store every `ContentStore.put` exists-probe is a guaranteed miss, so the
-  // first-enable capture uses the `putNew` bulk path: no per-file blob `exists` round-trip,
-  // and duplicate-content files still write each distinct hash once (memCache dedup). See
+  // The first-enable capture uses the `putBuffered` bulk path: no per-file blob `exists`
+  // round-trip, blobs buffered and appended in packs, and duplicate-content files still
+  // write each distinct hash once (memCache dedup). See
   // docs/startup-capture-optimization-spec.md §4.2 / §6.
 
-  test('capture writes via putNew (no per-file blob exists probe) and dedups duplicate content', async () => {
+  test('capture writes via putBuffered (no per-file blob exists probe) and dedups duplicate content', async () => {
     const A = await TestDevice.create('dev-a');
 
     // Four files, two distinct contents — two duplicate pairs.
@@ -134,17 +134,17 @@ describe('C2 — first-enable bulk write skips the redundant `exists` probe', ()
     await A.seedExistingFile('b2.md', 'beta\n');  // dup of b1
 
     // Arm the encode sub-phase accumulator (A3 §3.2 diagnostics) — the capture must
-    // populate it through the real putNew path without disturbing the write.
+    // populate it through the real putBuffered path without disturbing the write.
     const putPerf = { encodeMs: 0 };
     A.contentStore.capturePutPerf = putPerf;
 
-    // The capture must take the exists-free bulk path, never the guarded `put`.
+    // The capture must take the buffered bulk path, never the flush-per-blob `put`.
     let putCalls = 0;
-    let putNewCalls = 0;
+    let putBufferedCalls = 0;
     const origPut = A.contentStore.put.bind(A.contentStore);
-    const origPutNew = A.contentStore.putNew.bind(A.contentStore);
+    const origPutBuffered = A.contentStore.putBuffered.bind(A.contentStore);
     A.contentStore.put = async (h, c) => { putCalls++; return origPut(h, c); };
-    A.contentStore.putNew = async (h, c) => { putNewCalls++; return origPutNew(h, c); };
+    A.contentStore.putBuffered = async (h, c) => { putBufferedCalls++; return origPutBuffered(h, c); };
 
     // The C2-removed cost: an `exists` probe on a content blob (`*.bin`) path. The
     // shard-dir `exists` (a directory path) is a separate, session-amortised cost and
@@ -173,11 +173,11 @@ describe('C2 — first-enable bulk write skips the redundant `exists` probe', ()
 
     // Bulk path taken for every scanned file; the exists-guarded `put` never called.
     expect(putCalls).toBe(0);
-    expect(putNewCalls).toBe(4);
+    expect(putBufferedCalls).toBe(4);
     // No per-file blob exists probe at all — the whole point of C2.
     expect(blobExists).toBe(0);
     // A3 pack-writes: NO per-blob `.bin` write of either kind. All four files (two
-    // distinct hashes) are buffered by putNew and flushed into ONE pack at the final
+    // distinct hashes) are buffered by putBuffered and flushed into ONE pack at the final
     // checkpoint (4 < CAPTURE_CHECKPOINT_EVERY), with one index-delta append alongside.
     // This is the whole point: ~F blob writes → ~2 appends per 200-blob chunk.
     expect(blobDirectWrites).toBe(0);
@@ -249,28 +249,34 @@ describe('C2 — first-enable bulk write skips the redundant `exists` probe', ()
   });
 });
 
-describe('C4 — direct (non-atomic) blob write is made safe by hash-verify-on-read', () => {
-  // The direct write drops the atomic temp+rename ceremony, so a crash can leave a torn
-  // blob on disk. The safety net: `ContentStore.get` hashes the bytes it reads and, on a
-  // mismatch, reports the blob MISSING — so the merge degrades to a conflict (F1) instead
-  // of three-way-merging against corrupt content. docs/startup-capture-optimization-spec.md §4.
+describe('C4 — non-atomic pack append is made safe by hash-verify-on-read', () => {
+  // A pack append is non-atomic, so a crash can leave a torn blob in the pack. The safety
+  // net: `ContentStore.get` hashes the bytes it extracts and, on a mismatch, reports the
+  // blob MISSING — so the merge degrades to a conflict (F1) instead of three-way-merging
+  // against corrupt content. docs/unify-on-packs-spec.md §3.
 
-  const blobPath = (hash: string): string => `.vault-sync/content/${hash.slice(0, 2)}/${hash}.bin`;
+  const PACK0 = '.vault-sync/content/pack/0.pack';
 
-  test('a blob whose on-disk bytes no longer hash to its name reads back as null', async () => {
+  test('a blob whose packed bytes no longer hash to its name reads back as null', async () => {
     const A = await TestDevice.create('dev-a');
     await A.seedExistingFile('note.md', 'real content\n');
     await A.opLogger.captureOfflineChanges();
     const hash = A.entryByPath('note.md')!.contentHash;
 
-    // Intact blob round-trips from disk (memCache dropped first so the read hits disk).
+    // Intact blob round-trips from the pack (memCache dropped first so the read hits disk).
     A.contentStore.clearMemCache();
     const good = await A.content(hash);
     expect(good).not.toBeNull();
     expect(new TextDecoder().decode(good!)).toBe('real content\n');
 
-    // Corrupt the on-disk blob (simulate a torn write): the bytes no longer hash to `hash`.
-    A.metadata.set(blobPath(hash), uint8ToBase64(new TextEncoder().encode('tampered / torn bytes')));
+    // Corrupt the blob's payload in the pack (simulate a torn append) WITHOUT changing its
+    // length, so the index offset/len still align and the read reaches — and fails — the
+    // hash-verify (not the earlier length-mismatch skip). 'real content\n' and 'tampered
+    // byte' are both 13 bytes ⇒ identical base64 length.
+    const good64 = uint8ToBase64(new TextEncoder().encode('real content\n'));
+    const bad64 = uint8ToBase64(new TextEncoder().encode('tampered byte'));
+    const pack = (await A.metadata.read(PACK0))!;
+    A.metadata.set(PACK0, pack.replace(good64, bad64));
     A.contentStore.clearMemCache();
 
     // get() must catch the mismatch and report the base as missing, not hand back

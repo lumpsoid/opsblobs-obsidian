@@ -1,6 +1,6 @@
 # Vault Sync — Unify-on-Packs Spec (one blob format, packs only)
 
-**Status:** PROPOSED · **Date:** 2026-07-25 · **Owner:** client/perf
+**Status:** IMPLEMENTED (2026-07-25) · **Proposed:** 2026-07-25 · **Owner:** client/perf
 
 **One sentence:** the content store keeps **two** on-disk blob formats — loose `.bin`
 (one file per blob, the steady-state write path) and packs (many blobs per file, the
@@ -31,6 +31,46 @@ store this reshapes). `src/main.ts` `clearContentCache` (the one GC caller).
 the clean pack-only end-state; write **no migration code** and **remove the loose format
 outright** — do not keep a loose-read fallback "just in case." A dev vault with stale loose
 `.bin` files is reset, not migrated.
+
+---
+
+## 0. Implementation status (as-built, 2026-07-25)
+
+**Landed in `src/core/content-store.ts`.** Packs are now the sole on-disk format; the loose
+`.bin` surface is deleted end-to-end. Verified: `tsc --noEmit` clean, production build green,
+full suite **317 pass / 1 skip (57 files)**.
+
+- **Write API (§2.1).** `putNew` → **`putBuffered`** (buffer-only, no I/O) is the single write
+  mechanism; `put` = `putBuffered` + immediate `flushPack` (a durable 1-blob pack). All nine
+  `put` callers unchanged; the one `putNew` caller (`operation-logger.ts` capture loop) now
+  calls `putBuffered`.
+- **Removals (§2.2).** Deleted `put`'s loose body, `contentPath`, `ensureShard`/`ensuredShards`,
+  `SHARD_PREFIXES`, `listLooseHashes`, and the loose arms of `get`/`has`/`delete`/`gc`. Now
+  `get` = memCache → `getFromPack`; `has` = memCache ‖ index; `listHashes` = `[...index.keys()]`;
+  `delete` drops the index entry (bytes reclaimed by GC).
+- **GC (§4).** `gc` is pack-only with per-pack age (`stat(pack).mtime`): **whole-pack retirement**
+  (aged, zero-live) + **mark-and-compact** (`compactPack`) for aged, mixed packs below
+  `COMPACT_LIVE_FRACTION` = 0.5. Compaction flushes the fresh pack + index delta *before*
+  removing the old pack (crash ordering, §4.2), then `rewriteIndex` folds the drops.
+- **As-built deviations.** `compactPack` re-buffers a live blob by reading it through `get()`
+  (whole-pack read + C4 verify) and pushing the re-encoded base64 straight into `packBuffer` —
+  bypassing `putBuffered`'s memCache-present guard, which would otherwise no-op a re-pack. A
+  torn/missing live blob returns null from `get()` and is simply dropped (F1-safe). No
+  per-pass compaction cap was added (§8 Q4): memory is already bounded to one pack because each
+  `compactPack` flushes before the next runs.
+- **Contract change surfaced in tests.** Cross-session `put` of an already-packed hash is **no
+  longer deduped** (loose's on-disk `exists` probe is gone) — it re-appends a byte-identical
+  duplicate, last-wins on reload, reclaimed by compaction (§3 "idempotent re-append"). In-session
+  re-`put` is still a memCache no-op.
+- **Tests.** `content-store-pack` + `content-store-gc` rewritten pack-only (added mark-and-compact,
+  compact crash-safety, "no `.bin` ever written" spy); `offline-capture` C4 test retargets its
+  corruption from the removed `.bin` to the pack payload. The amortised-read assertion dropped
+  2 → 1 native read (no loose miss probe precedes the pack read).
+
+**Still open:** the companion `docs/apply-path-pack-writes-spec.md` (batch the applicator's five
+`put` callers onto `putBuffered` + per-checkpoint flush) is **not yet done** — land next. And the
+on-device re-measure (§6 last bullet) is pending: first-enable is unchanged (already packs), but
+steady-state edit + apply now taking pack appends instead of loose writes is unconfirmed on device.
 
 ---
 
@@ -248,17 +288,20 @@ reuse `retentionMs` from settings (`ancestorRetentionDays`). No new settings UI.
 
 ---
 
-## 8. Open questions
+## 8. Open questions (with as-built resolutions)
 
-- **`COMPACT_LIVE_FRACTION` value.** 0.5 is a guess. Too high → churny repacking; too low →
-  slow reclamation. Could start conservative (0.25 — only repack near-dead packs) and measure
-  disk over a churn simulation. Not load-bearing for correctness.
-- **1-blob-pack proliferation between GCs.** Steady-state `put` makes one pack per edit; that
-  is the same file count loose had, and compaction folds them — but confirm the `index` append
-  per single edit stays flat (append-bench already showed small appends are O(delta)).
-- **Compaction trigger cadence.** Today GC is manual (`clearContentCache` from settings). Is
-  that frequent enough to keep churn bounded, or should a sync round trigger a cheap
-  opportunistic compact when sparse-pack count crosses a threshold? Leaning: keep it in GC for
-  now; revisit if disk grows in practice.
-- **Whole-pack read on compaction.** Compacting reads each stale pack fully once; fine off the
-  hot path, but if many packs compact in one GC, cap the number per pass to bound wall-clock.
+- **`COMPACT_LIVE_FRACTION` value.** *Shipped 0.5* — the spec default, a top-of-file constant.
+  Still a guess (too high → churny repacking; too low → slow reclamation). Not load-bearing for
+  correctness; revisit against a disk-over-churn simulation, and consider starting more
+  conservative (0.25 — only repack near-dead packs) if repack churn shows up.
+- **1-blob-pack proliferation between GCs.** *Accepted.* Steady-state `put` makes one pack per
+  edit — the same file count loose had — and compaction folds them. The per-edit `index` append
+  is O(delta) (confirmed by append-bench for small appends); a fresh on-device confirmation of
+  the steady-state edit path is still pending (§6).
+- **Compaction trigger cadence.** *Kept in GC for now.* GC stays manual (`clearContentCache` from
+  settings); no opportunistic per-round compact was added. Revisit if disk grows in practice — a
+  cheap trigger when sparse-pack count crosses a threshold is the fallback.
+- **Whole-pack read on compaction.** *No per-pass cap added.* Each `compactPack` reads its stale
+  pack fully once and flushes before the next runs, so memory is bounded to one pack regardless of
+  how many compact in a GC; wall-clock across many compactions in one pass is unbounded but off the
+  hot path. Add a per-pass cap only if a real GC is observed to stall.

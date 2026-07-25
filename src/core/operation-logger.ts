@@ -41,7 +41,7 @@ export interface CaptureStats {
   opsEmitted: number;   // create/update/delete ops pushed
   readMs: number;       // Σ files.read
   hashMs: number;       // Σ hashContent
-  putMs: number;        // Σ contentStore.putNew (base64 encode + buffer push; pack-writes moved the fs write to flushMs)
+  putMs: number;        // Σ contentStore.putBuffered (base64 encode + buffer push; pack-writes moved the fs write to flushMs)
   flushMs: number;      // Σ contentStore.flushPack (the per-checkpoint pack + index appends — A3 pack-writes)
   regFlushMs: number;   // Σ registry.flush wall time at capture checkpoints (the OTHER half of otherMs — registry-checkpoint-cost-spec.md)
   oplogSaveMs: number;  // Σ oplog-persist wall time (serialize + append the delta) at capture checkpoints (THIS spec — oplog-append-journal-spec.md §4)
@@ -275,12 +275,12 @@ export class OperationLogger {
         continue;
       }
 
-      // C2: first-enable bulk write — skip the always-miss `exists` probe. This is
-      // the capture's own drift scan; the registry starts empty on first enable, so
-      // every blob is genuinely new, and a content-addressed write is idempotent even
-      // on a later (non-empty) capture, so `putNew` is safe on every pass here.
+      // C2: first-enable bulk write — buffer into the pack and flush per checkpoint.
+      // This is the capture's own drift scan; the registry starts empty on first enable,
+      // so every blob is genuinely new, and a content-addressed write is idempotent even
+      // on a later (non-empty) capture, so `putBuffered` is safe on every pass here.
       t = nowMs();
-      await this.contentStore.putNew(hash, content);
+      await this.contentStore.putBuffered(hash, content);
       stats.putMs += nowMs() - t;
       const hlcTs = this.hlc.now();
 
