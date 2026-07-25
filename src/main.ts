@@ -93,11 +93,11 @@ export default class VaultSyncPlugin extends Plugin {
   private indexingProgress: { scanned: number; total: number } | null = null;
   /** The current phase of an in-flight sync round ("Pulling changes…", "Uploading
    *  files 340/8000…", "Merging…"), or null when no round is running. Fed by the sync
-   *  client's per-phase `onProgress`; surfaced in the status modal (and on the settings
-   *  "Sync now" button) so a long round — the first sync can run for minutes — reads as
-   *  progressing, not frozen. Unlike the desktop status bar (see {@link coarseSyncPhase}),
-   *  this keeps the full per-batch counters — it's the fine-grained surface, and it's
-   *  the only progress surface on mobile, where the status bar doesn't exist. */
+   *  client's per-phase `onProgress`; surfaced in the status modal so a long round — the
+   *  first sync can run for minutes — reads as progressing, not frozen. Unlike the
+   *  desktop status bar (see {@link coarseSyncPhase}), this keeps the full per-batch
+   *  counters — it's the fine-grained surface, and it's the only progress surface on
+   *  mobile, where the status bar doesn't exist. */
   private syncActivity: string | null = null;
   /** Live progress of the first-sync blob upload (pushing note content to the server),
    *  or null when no push is uploading. Drives a determinate bar in the status modal;
@@ -472,8 +472,8 @@ export default class VaultSyncPlugin extends Plugin {
         // per-batch label (e.g. "Downloading files 3/57…"), which would otherwise
         // repaint it on every batch. Fine-grained detail belongs in the status modal.
         this.setStatusBarText(coarseSyncPhase(label), 'syncing');
-        // … and the mobile-visible surfaces: the status modal's live section and the
-        // settings "Sync now" button both read the full, uncollapsed label.
+        // … and the mobile-visible surface: the status modal's live section reads
+        // the full, uncollapsed label.
         this.syncActivity = label;
       },
       onUploadProgress: (uploaded, total) => { this.uploadProgress = { uploaded, total }; },
@@ -695,8 +695,7 @@ export default class VaultSyncPlugin extends Plugin {
       }
     } finally {
       this.syncInProgress = false;
-      // Clear the in-flight activity so the modal's live section and the settings
-      // "Sync now" button both settle back — this is what makes the "spinner" stop.
+      // Clear the in-flight activity so the modal's live section settles back.
       this.syncActivity = null;
       this.uploadProgress = null;
       // Always leave the 'syncing' ribbon spinner from the *finally*, not the try — so
@@ -711,13 +710,6 @@ export default class VaultSyncPlugin extends Plugin {
       // opLogger.onChange, so refresh the panel explicitly here.
       this.emitConflictChange();
     }
-  }
-
-  /** The current phase of an in-flight sync round, or null when idle. Read by the
-   *  settings "Sync now" button (to show live progress and prove it isn't frozen) and
-   *  available to any other glue that needs the live label. */
-  currentSyncActivity(): string | null {
-    return this.syncActivity;
   }
 
   /** Make newly-introduced text conflicts impossible to miss (§3). A manual round is
