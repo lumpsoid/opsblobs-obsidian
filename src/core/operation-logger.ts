@@ -75,6 +75,21 @@ const CAPTURE_PROGRESS_EVERY = 100;
  *  trades a bounded write cost for durability — kept modest to stay mobile-friendly. */
 const CAPTURE_CHECKPOINT_EVERY = 200;
 
+/** How many extra reconcile passes {@link captureOfflineChangesAndReconcile} runs
+ *  after the main capture pass, to pick up edits that landed while it was running
+ *  (docs/startup-capture-live-edits-spec.md §2). 1, not more: a reconcile pass is
+ *  already O1-stat-gated over everything except the handful of touched paths, so
+ *  the marginal cost of trying is small — but so is the marginal benefit of
+ *  chasing convergence. Any edit a bounded number of passes fails to catch isn't
+ *  lost — it self-heals on the very next sync round's pre-round capture (§1.1),
+ *  the same safety net the single-pass version already relied on. Spending more
+ *  passes only shrinks an already-cheap tail, while a higher bound raises the
+ *  worst case (a vault under continuous concurrent writes, e.g. another sync
+ *  client racing this one) for no correctness gain — so this stays at the
+ *  cheapest value that still catches the common case (one edit made during the
+ *  main pass) in one extra pass. */
+export const MAX_RECONCILE_PASSES = 1;
+
 export class OperationLogger {
   private pendingOps: Operation[] = [];
   /** How many leading ops of {@link pendingOps} are already durable in the on-disk
@@ -461,6 +476,68 @@ export class OperationLogger {
     }
 
     if (changed) await this.appendOpLog();
+  }
+
+  /**
+   * The startup sequence: run {@link captureOfflineChanges}, then reconcile any
+   * edits that landed *during* that pass, before the caller hands off to the real
+   * listener via {@link startListening}. See
+   * docs/startup-capture-live-edits-spec.md.
+   *
+   * A live edit during the main pass can't be routed through the real
+   * create/modify/delete handlers — they'd mutate the registry concurrently with
+   * the pass's own await-interleaved mutations of that same state (spec §1.2, a
+   * real DAG-corruption hazard: the pass would overwrite the edit's registry
+   * update with its own stale snapshot). So for the duration of this whole
+   * sequence, a disposable path-only watcher — no I/O, no registry access, just a
+   * `Set<string>` — tracks touched paths instead of routing them through those
+   * handlers. Once the main pass finishes, `captureOfflineChanges` — already
+   * idempotent — reruns against current disk state; a path discovered via the
+   * dirty set gets exactly the same treatment as one discovered by the pass's own
+   * listing, because it's the same code path. This repeats (swapping the dirty
+   * set before each rescan, so edits landing *during* a reconcile rescan aren't
+   * lost) until the set goes quiet or `maxReconcilePasses` is hit — at which point
+   * any remaining drift is not a correctness gap: it self-heals on the very next
+   * sync round's pre-round capture (spec §1.1), the same as it does today for the
+   * single-pass case.
+   *
+   * Does NOT call {@link startListening} itself — the caller attaches the real
+   * listener after this resolves, once the registry is quiescent again.
+   *
+   * @returns One {@link CaptureStats} per pass run — index 0 is the main pass,
+   *  any further entries are reconcile passes — so a caller with a perf sink can
+   *  attribute cost per pass. Callers that don't care can just ignore the array.
+   */
+  async captureOfflineChangesAndReconcile(
+    onProgress?: (scanned: number, total: number) => void,
+    signal?: AbortSignal,
+    maxReconcilePasses: number = MAX_RECONCILE_PASSES,
+  ): Promise<CaptureStats[]> {
+    let dirty = new Set<string>();
+    this.watcher.start({
+      onCreate: path => { dirty.add(path); },
+      onModify: path => { dirty.add(path); },
+      onDelete: path => { dirty.add(path); },
+      onRename: (path, oldPath) => { dirty.add(path); dirty.add(oldPath); },
+    });
+    const passes: CaptureStats[] = [];
+    try {
+      passes.push(await this.captureOfflineChanges(onProgress, signal));
+      for (let i = 0; i < maxReconcilePasses; i++) {
+        if (dirty.size === 0 || signal?.aborted) break;
+        // Swap before rescanning so edits landing *during* this rescan land in the
+        // fresh set and (if passes remain) get their own pass, rather than being
+        // silently dropped by a rescan already in flight.
+        dirty = new Set();
+        passes.push(await this.captureOfflineChanges(undefined, signal));
+      }
+      return passes;
+    } finally {
+      // Always detach, even on an aborted/thrown pass — the real listener (or the
+      // next enable's fresh sequence) is the only thing that should ever be
+      // subscribed once this returns.
+      this.watcher.stop();
+    }
   }
 
   startListening(): void {

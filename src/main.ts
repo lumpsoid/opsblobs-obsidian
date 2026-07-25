@@ -251,7 +251,10 @@ export default class VaultSyncPlugin extends Plugin {
         // over every pre-existing file (perf baseline B3). On a large vault this can
         // run for many minutes on mobile, so under perfLog it streams scan progress
         // (not just a single on-completion timing, which a still-running phase never
-        // reaches).
+        // reaches). `captureOfflineWithPerf` also runs the bounded reconcile passes
+        // (docs/startup-capture-live-edits-spec.md) that pick up edits made *during*
+        // this window, before the real listener attaches below — so this flag (and
+        // the try/finally) must wrap that whole sequence, not just the main pass.
         this.startupCaptureInProgress = true;
         try {
           await this.captureOfflineWithPerf();
@@ -548,10 +551,12 @@ export default class VaultSyncPlugin extends Plugin {
     }
   }
 
-  /** Run the first-enable capture, streaming scan progress to the `perfLog` diagnostic
-   *  (Layer 3) so a long-running pass on a large vault yields the throughput curve
-   *  instead of a single line that only prints if/when it finishes. Untimed and with
-   *  no progress callback when the diagnostic is off. */
+  /** Run the first-enable capture — plus its live-edit reconcile passes
+   *  (`captureOfflineChangesAndReconcile`, docs/startup-capture-live-edits-spec.md) —
+   *  streaming scan progress to the `perfLog` diagnostic (Layer 3) so a long-running
+   *  pass on a large vault yields the throughput curve instead of a single line that
+   *  only prints if/when it finishes. Untimed and with no progress callback when the
+   *  diagnostic is off. */
   private async captureOfflineWithPerf(): Promise<void> {
     const sink = this.perfSink('startup');
     const t0 = performance.now();
@@ -573,8 +578,11 @@ export default class VaultSyncPlugin extends Plugin {
     this.registry.captureFlushPerf = flushPerf;
     // Only surface a progress UI for a *large* first-enable — a routine capture (a
     // handful of changed files) fires the callback at most once and should stay quiet.
+    // This one closure is reused for every pass `captureOfflineChangesAndReconcile`
+    // runs (main + any reconcile passes) — `announced` therefore still fires the
+    // notice at most once across the whole startup sequence, not once per pass.
     let announced = false;
-    const stats = await this.opLogger.captureOfflineChanges((scanned, total) => {
+    const passes = await this.opLogger.captureOfflineChangesAndReconcile((scanned, total) => {
       if (total > CAPTURE_PROGRESS_UI_MIN) {
         if (!announced) {
           announced = true;
@@ -594,35 +602,46 @@ export default class VaultSyncPlugin extends Plugin {
     // the first-enable cliff is attributed to the phase that dominates before we cut it
     // (docs/startup-capture-optimization-spec.md §3). `otherMs` = registry flush + base64
     // + loop overhead not in the three measured phases. Emitted only when perfLog is on.
-    sink?.(`captureOfflineChanges readMs (${stats.files} files)`, stats.readMs);
-    sink?.(`captureOfflineChanges hashMs`, stats.hashMs);
-    sink?.(`captureOfflineChanges putMs`, stats.putMs);
-    // A3 pack-writes: the per-checkpoint pack + index appends that replaced the ~8389
-    // per-blob writes. This is where the old ~50 s putMs write phase now lives (~1–2 s).
-    sink?.(`captureOfflineChanges flushMs`, stats.flushMs);
+    // `passes[0]` is the main pass; any further entries are reconcile passes over paths
+    // touched while it was running (docs/startup-capture-live-edits-spec.md §2) — logged
+    // per pass so a reconcile pass's cost is visible on its own, not folded into the
+    // main pass's numbers (spec §5's open question on reconcile-loop timing).
+    for (const [i, stats] of passes.entries()) {
+      const label = i === 0 ? 'captureOfflineChanges' : `captureOfflineChanges reconcile#${i}`;
+      sink?.(`${label} readMs (${stats.files} files)`, stats.readMs);
+      sink?.(`${label} hashMs`, stats.hashMs);
+      sink?.(`${label} putMs`, stats.putMs);
+      // A3 pack-writes: the per-checkpoint pack + index appends that replaced the ~8389
+      // per-blob writes. This is where the old ~50 s putMs write phase now lives (~1–2 s).
+      sink?.(`${label} flushMs`, stats.flushMs);
+      sink?.(`${label} otherMs`, stats.totalMs - stats.readMs - stats.hashMs - stats.putMs - stats.flushMs);
+      // The otherMs split (oplog-append-journal-spec §3 Step 1): the two per-checkpoint
+      // rewrites that make up otherMs, so both this spec and the registry one act on numbers.
+      sink?.(`${label} regFlushMs`, stats.regFlushMs);
+      sink?.(`${label} oplogSaveMs`, stats.oplogSaveMs);
+      // The residual after attributing the two rewrites — expect ≈ 0, confirming the
+      // checkpoint rewrites ARE the whole of otherMs (not hidden loop overhead).
+      sink?.(`${label} otherResidualMs`, stats.totalMs - stats.readMs - stats.hashMs - stats.putMs - stats.flushMs - stats.regFlushMs - stats.oplogSaveMs);
+      sink?.(`${label} total${heapNote()}`, stats.totalMs);
+    }
     // The putMs sub-split (A3 §3.2): base64 encode (CPU) vs the atomic-write ceremony's
     // native adapter sub-ops. `putOtherMs` = memCache + buffer push + loop overhead not
     // in the five measured sub-phases. This decides whether the temp-write + rename
     // ceremony is worth replacing with a direct write for the disposable content store.
+    // These accumulators are shared across every pass (armed once above, read once
+    // here), so this is the total across the main pass AND any reconcile passes.
     if (putPerf && writePerf) {
       const { encodeMs } = putPerf;
       const { writeMs, writeTmpMs, existsMs, removeMs, renameMs } = writePerf;
+      const totalPutMs = passes.reduce((sum, s) => sum + s.putMs, 0);
       sink?.(`captureOfflineChanges put.encodeMs`, encodeMs);
       sink?.(`captureOfflineChanges put.writeMs`, writeMs);           // C4 direct write
       sink?.(`captureOfflineChanges put.writeTmpMs`, writeTmpMs);     // atomic ceremony — now 0
       sink?.(`captureOfflineChanges put.existsMs`, existsMs);         // atomic ceremony — now 0
       sink?.(`captureOfflineChanges put.removeMs`, removeMs);         // atomic ceremony — now 0
       sink?.(`captureOfflineChanges put.renameMs`, renameMs);         // atomic ceremony — now 0
-      sink?.(`captureOfflineChanges put.otherMs`, stats.putMs - encodeMs - writeMs - writeTmpMs - existsMs - removeMs - renameMs);
+      sink?.(`captureOfflineChanges put.otherMs`, totalPutMs - encodeMs - writeMs - writeTmpMs - existsMs - removeMs - renameMs);
     }
-    sink?.(`captureOfflineChanges otherMs`, stats.totalMs - stats.readMs - stats.hashMs - stats.putMs - stats.flushMs);
-    // The otherMs split (oplog-append-journal-spec §3 Step 1): the two per-checkpoint
-    // rewrites that make up otherMs, so both this spec and the registry one act on numbers.
-    sink?.(`captureOfflineChanges regFlushMs`, stats.regFlushMs);
-    sink?.(`captureOfflineChanges oplogSaveMs`, stats.oplogSaveMs);
-    // The residual after attributing the two rewrites — expect ≈ 0, confirming the
-    // checkpoint rewrites ARE the whole of otherMs (not hidden loop overhead).
-    sink?.(`captureOfflineChanges otherResidualMs`, stats.totalMs - stats.readMs - stats.hashMs - stats.putMs - stats.flushMs - stats.regFlushMs - stats.oplogSaveMs);
     // The serialize-vs-write sub-split within each rewrite — decides whether the cost is
     // serialize CPU (quadratic JSON.stringify) or the MB-scale native write on the bridge.
     if (oplogPerf && flushPerf) {
@@ -631,7 +650,7 @@ export default class VaultSyncPlugin extends Plugin {
       sink?.(`captureOfflineChanges reg.stringifyMs`, flushPerf.stringifyMs);
       sink?.(`captureOfflineChanges reg.writeMs`, flushPerf.writeMs);
     }
-    sink?.(`captureOfflineChanges total${heapNote()}`, stats.totalMs);
+    sink?.(`captureOfflineChanges total (all passes)${heapNote()}`, passes.reduce((sum, s) => sum + s.totalMs, 0));
     // Disarm the diagnostics so nothing accumulates outside the capture pass.
     this.contentStore.capturePutPerf = null;
     this.metadata.captureWritePerf = null;
