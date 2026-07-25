@@ -81,6 +81,7 @@ class CrashOnFirstAppendServer implements ServerApi {
   putBlobBatch(blobs: BlobUpload[]): Promise<void> { return this.inner.putBlobBatch(blobs); }
   getBlob(hash: string): Promise<Uint8Array | null> { return this.inner.getBlob(hash); }
   getBlobBatch(hashes: string[]): Promise<{ blobs: Map<string, Uint8Array>; missing: string[] }> { return this.inner.getBlobBatch(hashes); }
+  preflight(keyCheckKey: string): Promise<{ claimed: boolean; keyCheck: Uint8Array | null }> { return this.inner.preflight(keyCheckKey); }
 }
 
 describe('round interruption & durability (C1–C4)', () => {

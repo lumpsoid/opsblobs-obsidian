@@ -100,6 +100,15 @@ export interface ServerApi {
    *  by hash); a hash the vault doesn't hold is reported in `missing`, not an
    *  error. Over the combined-size cap the transport throws `BatchTooLargeError`. */
   getBlobBatch(hashes: string[]): Promise<{ blobs: Map<string, Uint8Array>; missing: string[] }>;
+  /** Read-only, side-effect-free probe of server URL + token + vault access
+   *  (spec preflight endpoint). Unlike every other call it does **not** claim an
+   *  unclaimed vault — it only reads the ownership verdict, so "Test connection"
+   *  can run any number of times without staking a claim. `claimed` is true when
+   *  this account owns the vault; a vault owned by *another* account surfaces as
+   *  the transport's `AuthError`. When `keyCheckKey` names the vault's key-check
+   *  blob and the owned vault holds it, `keyCheck` is that blob's bytes; otherwise
+   *  (unclaimed vault, absent slot, or oversized non-record) it is null. */
+  preflight(keyCheckKey: string): Promise<{ claimed: boolean; keyCheck: Uint8Array | null }>;
 }
 
 /** A pulled, decrypted op paired with its server `seq`. The decrypted
@@ -545,19 +554,22 @@ export class ServerSyncClient {
   /**
    * Preflight the configured server + token + vault + passphrase WITHOUT mutating
    * anything — the settings "Test connection" affordance, so a setup mistake is
-   * caught before the first real round wedges on it. A read-only `blobs:check([])`
-   * validates URL + token + vault reachability (server-http maps any failure to the
-   * typed error family). Then it reads the key-check record to report whether this
-   * device's passphrase matches the vault already on the server.
+   * caught before the first real round wedges on it. One read-only `preflight`
+   * round-trip validates URL + token + vault reachability (server-http maps any
+   * failure to the typed error family) *and* returns the key-check record, so we
+   * report whether this device's passphrase matches the vault already on the server.
+   *
+   * This replaces the earlier `blobs:check([])` + `getBlob(keyCheck)` pair — both
+   * of which ran the *claiming* access path, so the old "Test connection" would
+   * claim an unclaimed vault. `preflight` reads the ownership verdict without ever
+   * claiming, so the check is truly side-effect-free.
    */
   async preflight(): Promise<PreflightResult> {
     if (!this.crypto.isReady()) throw new Error('Vault key not derived');
-    // Reachability + auth, side-effect-free: the server must answer an empty check 200.
-    await this.api.checkBlobs([]);
-    const record = await this.api.getBlob(await this.keyCheckBlobKey());
+    const { keyCheck } = await this.api.preflight(await this.keyCheckBlobKey());
     const keyState: PreflightKeyState =
-      record === null ? 'unstamped'
-        : (await this.crypto.verifyKeyCheck(record)) ? 'match' : 'mismatch';
+      keyCheck === null ? 'unstamped'
+        : (await this.crypto.verifyKeyCheck(keyCheck)) ? 'match' : 'mismatch';
     return { keyState };
   }
 

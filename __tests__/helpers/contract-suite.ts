@@ -137,6 +137,31 @@ export function runContractSuite(label: string, newServer: () => ContractServer)
       expect(empty.missing).toEqual([]);
     });
 
+    test('preflight: read-only, reports claim + key-check without ever claiming', async () => {
+      const server = newServer();
+      const vault = server.freshVault();
+      // A well-known, valid-hex key-check slot (shape-compatible with a content hash).
+      const keyCheckKey = await sha256Hex(new TextEncoder().encode('vault-sync:keycheck:v1'));
+      const record = new TextEncoder().encode('key-check-record');
+
+      // Unclaimed vault: not owned, no key-check, and — critically — preflight must
+      // NOT stake a claim, so a second preflight still sees it unclaimed.
+      const a = server.connect(vault);
+      expect(await a.preflight(keyCheckKey)).toEqual({ claimed: false, keyCheck: null });
+      expect(await a.preflight(keyCheckKey)).toEqual({ claimed: false, keyCheck: null });
+
+      // A real upload claims the vault and stamps the key-check slot.
+      await a.putBlob(keyCheckKey, record);
+
+      const held = await a.preflight(keyCheckKey);
+      expect(held.claimed).toBe(true);
+      expect(held.keyCheck && new TextDecoder().decode(held.keyCheck)).toBe('key-check-record');
+
+      // A claimed vault that doesn't hold the named slot → claimed, keyCheck null.
+      const absent = await sha256Hex(new TextEncoder().encode('no-such-slot'));
+      expect(await a.preflight(absent)).toEqual({ claimed: true, keyCheck: null });
+    });
+
     test('two devices: A pushes a file, B pulls and converges', async () => {
       const server = newServer();
       const vault = server.freshVault();

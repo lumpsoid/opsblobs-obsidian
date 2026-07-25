@@ -23,6 +23,7 @@ import { FakeSyncServer, MissingBlobError } from '../src/network/fake-server';
 import { VaultCrypto } from '../src/network/encryption';
 import { Operation } from '../src/types';
 import { TestDevice } from './helpers/test-device';
+import { sha256Hex } from './helpers/hash';
 
 const SALT = new Uint8Array([9, 9, 9, 9, 9, 9, 9, 9, 8, 8, 8, 8, 8, 8, 8, 8]);
 
@@ -44,6 +45,7 @@ class BlobGatedServer implements ServerApi {
     // Gated off → every hash reads as absent (the batch analogue of getBlob → null).
     return this.blobAvailable ? this.inner.getBlobBatch(hashes) : { blobs: new Map(), missing: [...hashes] };
   }
+  preflight(keyCheckKey: string): Promise<{ claimed: boolean; keyCheck: Uint8Array | null }> { return this.inner.preflight(keyCheckKey); }
 }
 
 /** Wraps a FakeSyncServer so its first `appendOps` 409s with a StaleCursorError
@@ -64,6 +66,7 @@ class StaleOnceServer implements ServerApi {
   putBlobBatch(blobs: BlobUpload[]): Promise<void> { return this.inner.putBlobBatch(blobs); }
   getBlob(hash: string): Promise<Uint8Array | null> { return this.inner.getBlob(hash); }
   getBlobBatch(hashes: string[]): Promise<{ blobs: Map<string, Uint8Array>; missing: string[] }> { return this.inner.getBlobBatch(hashes); }
+  preflight(keyCheckKey: string): Promise<{ claimed: boolean; keyCheck: Uint8Array | null }> { return this.inner.preflight(keyCheckKey); }
 }
 
 /** Wraps a FakeSyncServer recording the op-count of every `appendOps` call, so a
@@ -83,6 +86,7 @@ class BatchRecordingServer implements ServerApi {
   putBlobBatch(blobs: BlobUpload[]): Promise<void> { return this.inner.putBlobBatch(blobs); }
   getBlob(hash: string): Promise<Uint8Array | null> { return this.inner.getBlob(hash); }
   getBlobBatch(hashes: string[]): Promise<{ blobs: Map<string, Uint8Array>; missing: string[] }> { return this.inner.getBlobBatch(hashes); }
+  preflight(keyCheckKey: string): Promise<{ claimed: boolean; keyCheck: Uint8Array | null }> { return this.inner.preflight(keyCheckKey); }
 }
 
 /** Wraps a FakeSyncServer recording the peak number of blob-upload *requests* in
@@ -100,6 +104,7 @@ class ConcurrencyProbeServer implements ServerApi {
   checkBlobs(hashes: string[]): Promise<{ missing: string[] }> { return this.inner.checkBlobs(hashes); }
   getBlob(hash: string): Promise<Uint8Array | null> { return this.inner.getBlob(hash); }
   getBlobBatch(hashes: string[]): Promise<{ blobs: Map<string, Uint8Array>; missing: string[] }> { return this.inner.getBlobBatch(hashes); }
+  preflight(keyCheckKey: string): Promise<{ claimed: boolean; keyCheck: Uint8Array | null }> { return this.inner.preflight(keyCheckKey); }
   private async track<T>(run: () => Promise<T>): Promise<T> {
     this.inFlight++;
     this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
@@ -524,5 +529,42 @@ describe('ServerSyncClient — full round against the fake', () => {
     // The op was pulled but its content couldn't be fetched — reported as stranded.
     expect(summary.pulled).toBe(1);
     expect(summary.stranded).toContain(hash);
+  });
+});
+
+describe('ServerSyncClient.preflight — passphrase verdict from one read-only round-trip', () => {
+  let vc: VaultCrypto;
+  // The well-known key-check slot the client resolves (see keyCheckBlobKey): a fixed,
+  // non-secret string hashed to a content-hash-shaped key, identical across vaults.
+  let keyCheckKey: string;
+  beforeAll(async () => {
+    vc = new VaultCrypto();
+    await vc.deriveFromPassphrase('correct horse battery staple', SALT);
+    keyCheckKey = await sha256Hex(new TextEncoder().encode('vault-sync:keycheck:v1'));
+  });
+
+  const preflightClient = (api: ServerApi, d: TestDevice) =>
+    new ServerSyncClient({ api, crypto: vc, host: d.host, hlc: d.hlc });
+
+  test('unstamped: an empty/unclaimed vault reports no key-check', async () => {
+    const server = new FakeSyncServer();
+    const d = await device('dev-a');
+    expect(await preflightClient(server, d).preflight()).toEqual({ keyState: 'unstamped' });
+  });
+
+  test('match: this device stamped the slot, so its key verifies', async () => {
+    const server = new FakeSyncServer();
+    const d = await device('dev-a');
+    await server.putBlob(keyCheckKey, await vc.buildKeyCheck());
+    expect(await preflightClient(server, d).preflight()).toEqual({ keyState: 'match' });
+  });
+
+  test('mismatch: a record from a different passphrase fails our key', async () => {
+    const server = new FakeSyncServer();
+    const d = await device('dev-a');
+    const other = new VaultCrypto();
+    await other.deriveFromPassphrase('a different passphrase entirely', SALT);
+    await server.putBlob(keyCheckKey, await other.buildKeyCheck());
+    expect(await preflightClient(server, d).preflight()).toEqual({ keyState: 'mismatch' });
   });
 });

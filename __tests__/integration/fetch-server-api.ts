@@ -89,6 +89,16 @@ export class FetchServerApi implements ServerApi {
     return new Uint8Array(await resp.arrayBuffer());
   }
 
+  async preflight(keyCheckKey: string): Promise<{ claimed: boolean; keyCheck: Uint8Array | null }> {
+    const q = keyCheckKey ? `?keyCheck=${encodeURIComponent(keyCheckKey)}` : '';
+    const resp = await fetch(`${this.vaultBase()}/preflight${q}`, {
+      method: 'GET', headers: this.auth(),
+    });
+    if (resp.status !== 200) throw new Error(`GET /preflight failed: ${resp.status}`);
+    const json = (await resp.json()) as { claimed: boolean; keyCheck: string | null };
+    return { claimed: json.claimed, keyCheck: json.keyCheck ? base64ToBytes(json.keyCheck) : null };
+  }
+
   async getBlobBatch(hashes: string[]): Promise<{ blobs: Map<string, Uint8Array>; missing: string[] }> {
     const resp = await fetch(`${this.vaultBase()}/blobs:fetch`, {
       method: 'POST',

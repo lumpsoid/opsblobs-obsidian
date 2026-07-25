@@ -151,6 +151,20 @@ export class HttpServerApi implements ServerApi {
     return new Uint8Array(resp.arrayBuffer);
   }
 
+  async preflight(keyCheckKey: string): Promise<{ claimed: boolean; keyCheck: Uint8Array | null }> {
+    const q = keyCheckKey ? `?keyCheck=${encodeURIComponent(keyCheckKey)}` : '';
+    const resp = await this.request('checking the server', {
+      url: `${this.vaultBase()}/preflight${q}`,
+      method: 'GET',
+      headers: this.authHeader(),
+    }, this.metaTimeout);
+    // 401 (bad token) / 403 (vault owned by another account) → AuthError; other
+    // non-200 → ServerError. A reachable 200 with no throw is the full URL+token+vault check.
+    if (resp.status !== 200) throw this.statusError(resp.status, 'checking the server');
+    const json = resp.json as { claimed: boolean; keyCheck: string | null };
+    return { claimed: json.claimed, keyCheck: json.keyCheck ? base64ToBytes(json.keyCheck) : null };
+  }
+
   async getBlobBatch(hashes: string[]): Promise<{ blobs: Map<string, Uint8Array>; missing: string[] }> {
     const resp = await this.request('downloading your files', {
       url: `${this.vaultBase()}/blobs:fetch`,
