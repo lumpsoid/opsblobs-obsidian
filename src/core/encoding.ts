@@ -7,8 +7,16 @@
 //  the same low-level logic isn't reimplemented per module.
 
 export function bytesToBase64(bytes: Uint8Array): string {
+  // Build the binary string in 32 KB chunks via `String.fromCharCode.apply`
+  // instead of appending one char at a time. The per-byte version reallocates
+  // the growing string on every iteration (O(n²)-ish for large blobs); batching
+  // turns it into a handful of `apply` calls. 0x8000 stays well under the
+  // engine's argument-count ceiling so `apply` never overflows the stack.
   let binary = '';
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]!);
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK) as unknown as number[]);
+  }
   return btoa(binary);
 }
 
