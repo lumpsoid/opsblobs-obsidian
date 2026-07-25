@@ -16,11 +16,11 @@
 
 import { VaultState, FileEntry, MergeAction, Operation, HLC, affectsLocalVault } from '../types';
 import { HybridLogicalClock } from '../core/hlc';
-import { hlcCompare } from '../core/hlc';
+import { hlcCompare, hlcMax } from '../core/hlc';
 import { mergeVaultStates } from '../merge/state-merge';
 import { VersionDag } from '../core/version-dag';
 import { VaultCrypto } from './encryption';
-import { PhaseTimer, PhaseTimingSink } from './perf-timer';
+import { PhaseTimer, PhaseTimingSink, nowMs } from './perf-timer';
 
 // ─── Wire records (server-facing; all ciphertext/hashes, no plaintext) ──────────
 
@@ -961,14 +961,45 @@ export class ServerSyncClient {
    * A local-only non-colliding file falls to `send_remote`, which reads no bytes
    * (§4.1), so it is deliberately absent from the scope. Everything else is untouched
    * and never read — the O(vault)→O(touched) cut.
+   *
+   * Stage-side Tier 0 (stage-merge-converged-skip-spec): a file both sides already
+   * agree on — same content, same head op-id, same path — is reconciled by the merge
+   * as a bytes-free `no_op` (state-merge.ts :133 → :177; the byte-reading :161/:170
+   * branches are gated on differing heads), so it is dropped from the projection here
+   * rather than read. On a whole-vault re-pull (cursor rewind → the remote projection
+   * IS the vault) this removes the residual O(vault) local pack read A2's scoping still
+   * incurred, mirroring the pull-download Tier 0 in `fetchRemoteBlobs`.
    */
   private async stageMergeContent(local: VaultState, remote: VaultState, dag: VersionDag): Promise<void> {
-    const fileIds = new Set<string>(remote.fileEntries.keys());
+    const fileIds = new Set<string>();
+    for (const [id, re] of remote.fileEntries) {
+      const le = local.fileEntries.get(id);
+      // Stage-side Tier 0: a file both sides agree on — same content, same head, same
+      // path — is reconciled by the merge as a bytes-free no_op (state-merge.ts :133 →
+      // :177; the byte-reading :161/:170 branches are gated on differing heads). Staging
+      // its local bytes + bases is wasted pack I/O. `headVersionId` must be present and
+      // equal (two absent heads compare === but are not a proven no_op → do NOT skip).
+      if (
+        le && !le.deleted && !re.deleted &&
+        le.headVersionId != null && le.headVersionId === re.headVersionId &&
+        le.contentHash === re.contentHash &&
+        le.path === re.path
+      ) {
+        continue;
+      }
+      fileIds.add(id);
+    }
+
+    // Unchanged intent: a LOCAL-ONLY file colliding by path with a live remote entry
+    // (F2 create/create) is a genuine reconciliation whose bytes the merge reads — always
+    // stage it. `!remote.fileEntries.has(id)` keeps this to genuinely local-only ids: a
+    // file already named by the remote projection was decided by the loop above (staged
+    // unless converged), so re-adding it here would undo the converged skip.
     const remoteLivePaths = new Set<string>();
     for (const re of remote.fileEntries.values()) if (!re.deleted) remoteLivePaths.add(re.path);
     if (remoteLivePaths.size > 0) {
       for (const [id, le] of local.fileEntries) {
-        if (!le.deleted && remoteLivePaths.has(le.path)) fileIds.add(id);
+        if (!le.deleted && !remote.fileEntries.has(id) && remoteLivePaths.has(le.path)) fileIds.add(id);
       }
     }
     await this.stageForFiles(local, fileIds, dag);
@@ -1024,6 +1055,30 @@ export class ServerSyncClient {
     missingContent: Set<string>,
     deferred: Set<string>,
   ): Promise<void> {
+    // ── Diagnostic sub-phase timing (perfLog only; zero cost when off) ────────
+    // Attributes the reconcile lap across its regions so a slow first-sync round shows
+    // exactly where the time goes (precheck vs whole-vault rebuild vs enumeration vs
+    // fold I/O). `reconcile:*Files/passes/folds` values are COUNTS, not ms. Emitted
+    // once at the single exit via `emit()` so the early-return paths report too.
+    const perf = this.perfLog;
+    const T = perf ? nowMs : null;
+    let tBuild = 0, tRecord = 0, tStage = 0, tEnum = 0, tFetch = 0, tFold = 0, tPrecheck = 0;
+    let passes = 0, folds = 0;
+    const emit = (touchedCount: number, multiHeadCount: number): void => {
+      if (!perf) return;
+      perf('reconcile:touchedFiles', touchedCount);   // COUNT
+      perf('reconcile:multiHeadFiles', multiHeadCount); // COUNT (files with ≥2 leaves)
+      perf('reconcile:passes', passes);               // COUNT
+      perf('reconcile:folds', folds);                 // COUNT
+      perf('reconcile:precheck', tPrecheck);
+      perf('reconcile:buildIdentity', tBuild);
+      perf('reconcile:recordEdges', tRecord);
+      perf('reconcile:stageForFiles', tStage);
+      perf('reconcile:enumerate', tEnum);
+      perf('reconcile:fetchLeafBytes', tFetch);
+      perf('reconcile:foldMergeApply', tFold);
+    };
+
     // fileIds a peer touched this round, plus a lookup from a leaf's version-id
     // (op-id) to the pulled op that carries its path/HLC/type/contentHash — the DAG
     // node alone doesn't record those.
@@ -1033,6 +1088,10 @@ export class ServerSyncClient {
       opById.set(op.id, op);
       if (op.hlcTimestamp.deviceId !== ownDeviceId) touched.add(op.fileId);
     }
+    // No peer touched anything this round (the common converged / solo round) — nothing
+    // to reconcile and nothing worth attributing; return silently so the perf log isn't
+    // padded with a zero-work breakdown every round. The sub-phase lines below fire only
+    // on a round that actually pulled peer ops.
     if (touched.size === 0) return;
 
     // Cheap pre-check on the in-memory DAG before paying for a full O(vault)
@@ -1040,11 +1099,19 @@ export class ServerSyncClient {
     // reconciliation only has work when some touched file has ≥2 open leaves — a
     // genuine concurrent divergence. A converged file has exactly one leaf. Without
     // this, EVERY round that merely pulled a peer op ran one whole-vault buildLocalState
-    // below just to discover there was nothing to fold. `leaves(fileId) < 2` is a safe
-    // under-approximation: the loop's "extra leaf" scan needs ≥2 leaves, so this never
-    // hides real work — it only skips the provable no-op case.
-    const anyMultiHead = [...touched].some(fileId => dag.leaves(fileId).length >= 2);
-    if (!anyMultiHead) return;
+    // below just to discover there was nothing to fold.
+    //
+    // Resolve every file's leaves in ONE O(nodes) pass (`leavesByFile`), NOT
+    // `dag.leaves(fileId)` per touched file — that rebuilds the whole child-set on each
+    // call, so a first sync pulling a peer op for each of thousands of files spent
+    // O(files·nodes) ≈ O(vault²) here (a measured ~30s precheck at ~16.8k touched files,
+    // zero of them multi-head). One pass + an O(1) lookup per touched file collapses it.
+    const preStart = T ? T() : 0;
+    const leavesByFile = dag.leavesByFile();
+    let multiHeadCount = 0;
+    for (const fileId of touched) if ((leavesByFile.get(fileId)?.length ?? 0) >= 2) multiHeadCount++;
+    if (T) tPrecheck = T() - preStart;
+    if (multiHeadCount === 0) { emit(touched.size, 0); return; }
 
     // Leaves we've already tried to fold this round, keyed `fileId leafId` (both are
     // space-free — a UUID and an op-id). A clean
@@ -1063,17 +1130,27 @@ export class ServerSyncClient {
     // pulled, so this terminates. The +touched guard covers the initial pass.
     const maxFolds = pulled.length + touched.size + 1;
     for (let step = 0; step < maxFolds; step++) {
+      passes++;
+      let s = T ? T() : 0;
       const local = await this.host.buildLocalIdentity(dag);
+      if (T) tBuild += T() - s;
       // Fold any merge node a previous iteration minted (now a pending op, not yet
       // in the persisted DAG) into the graph so this fold's LCA/leaf scan AND the
       // scoped staging below see it.
+      s = T ? T() : 0;
       dag = await this.host.recordVersionEdges(local.pendingOps, dag);
+      if (T) tRecord += T() - s;
       // Stage only the bytes the fold's pairwise merge reads: each multi-head file's
       // local head bytes + its DAG-reachable bases (the LCA against the extra leaf).
       // The extra leaf's own bytes are fetched separately below. Scoped to `touched`
       // (the concurrent-divergence files), never the whole vault (A2, §4.3).
+      s = T ? T() : 0;
       await this.stageForFiles(local, touched, dag);
+      if (T) tStage += T() - s;
 
+      // One O(nodes) pass for this pass's leaves (dag just changed via recordVersionEdges),
+      // then an O(1) lookup per touched file below — never `dag.leaves(fileId)` per file.
+      const passLeaves = dag.leavesByFile();
       let folded = false;
       for (const fileId of [...touched].sort()) {
         // A file the main apply deferred (F5 drift / auto-deferred conflict) re-pulls
@@ -1086,10 +1163,10 @@ export class ServerSyncClient {
 
         // Extra concurrent leaves: open leaves of this file our head does NOT already
         // descend from. Sorted → deterministic fold order across devices.
-        const extras = dag.leaves(fileId)
+        const eStart = T ? T() : 0;
+        const extras = (passLeaves.get(fileId) ?? [])
           .filter(v => v !== localHead && !dag.isAncestor(v, localHead))
           .sort();
-        if (extras.length === 0) continue;
 
         // First *foldable* extra: a live (non-tombstone) peer edit that shares a real
         // common base with our head (a genuine Finding-B concurrent edit). A leaf with
@@ -1104,30 +1181,53 @@ export class ServerSyncClient {
           if (dag.mergeBase(localHead, cand) === null) continue;
           leafId = cand; leafOp = op; break;
         }
+        if (T) tEnum += T() - eStart;   // leaves + isAncestor + mergeBase, per file per pass
         if (!leafId || !leafOp) continue;
         attempted.add(fileId + ' ' + leafId);
 
         const leafHash = dag.contentHashOf(leafId) ?? leafOp.contentHash;
         // Stage the extra leaf's bytes (the HLC-max projection never fetched them).
         // Absent on the server → hold the cursor (F3) and retry next round.
+        s = T ? T() : 0;
         let bytes = local.contentStore.get(leafHash) ?? null;
         if (!bytes) bytes = await this.fetchBlob(leafHash);
+        if (T) tFetch += T() - s;
         if (!bytes) { missingContent.add(leafHash); continue; }
 
         // Reconcile our head against this one extra leaf via the ordinary pairwise
         // merge. The base (LCA) bytes are already staged by buildLocalState (they are
         // reachable from our head); a known-but-missing base degrades to a conflict
         // inside mergeVaultStates (F1), never a union.
+        const foldStart = T ? T() : 0;
         const localOne = singleFileState(local, fileId);
         const remoteOne = leafRemoteState(leafOp, leafId, leafHash, bytes);
         const merge = mergeVaultStates(localOne, remoteOne, dag);
-        this.hlc.setCurrent(merge.mergedHlc);
+        // Monotonic clock advance. Folding every foldable file within ONE pass means
+        // `local.hlc` is the pass-start snapshot (stale) for all but the first fold, so a
+        // later fold's `mergedHlc` can sit below an earlier fold's. Take the running max
+        // so the minted op — stamped with `hlc.getCurrent()` inside applyMerge — never
+        // regresses the clock (F7) while still dominating its own parents (mergedHlc ≥
+        // both). The merge NODE id is content-addressed (order-independent parents), so a
+        // higher stamp never changes cross-device convergence; only the per-fold rebuild
+        // used to keep this monotonic, which is exactly the cost being removed.
+        this.hlc.setCurrent(hlcMax(this.hlc.getCurrent(), merge.mergedHlc));
         await this.host.applyMerge(merge.actions, localOne, remoteOne);
+        if (T) tFold += T() - foldStart;   // singleFileState + mergeVaultStates + applyMerge
+        folds++;
         folded = true;
-        break; // rebuild from fresh state before the next fold
+        // No `break`: fold EVERY foldable file in this single pass rather than one file
+        // per whole-vault `buildLocalIdentity`. Each touched file is independent — a
+        // distinct fileId owns distinct DAG leaves/LCA and a distinct registry entry — so
+        // folding one leaves the stale `local`/`dag` valid for the rest (applyMerge
+        // mutates disk + registry for THIS file only; the minted node belongs to another
+        // fileId and isn't needed until the next pass folds it in). Only a file with a
+        // 3rd concurrent leaf needs another pass, which the outer loop still provides.
+        // This turns O(folds) rebuilds into O(passes) (≈ max concurrent leaves per file,
+        // normally 1) — the fix for the ~9s first-sync reconcile lap.
       }
       if (!folded) break;
     }
+    emit(touched.size, multiHeadCount);
   }
 }
 

@@ -777,8 +777,85 @@ so both would reproduce in the WebView.
 
 ---
 
+## The multi-head reconcile O(N²) — on-device confirmed (`reconcile:precheck` 29.6 s → 23 ms; round 36.6 s → 7.8 s)
+
+Once the write side was solved, a **first sync that pulls a peer op for each of many files** exposed a
+second-order cliff in `reconcileConcurrentHeads` (step 4b) — invisible on the laptop's fast RAM, dominant on
+device. A device that had its `.vault-sync/` state wiped and re-pushed (so the server accumulated repeated
+whole-vault op sets under fresh ids) re-pulled the **entire ~67,104-op log** in one round (server totals for
+this vault: **67,104 ops · 8,356 blobs · 22.3 MiB** — the 8,356 blobs are the vault's real ~8.4k unique files;
+the 67k ops are the accumulated wipe-generations). Of the pulled ops, **16,776 distinct fileIds** were touched
+by *peer* ops (the `reconcile:touchedFiles` metric — a fileId count, **not** an op count). The reconcile lap
+ran **29.6 s** with **zero** files actually multi-head and **zero** folds. The new per-phase `reconcile:*`
+instrumentation (perfLog, gated, fires only on a round that pulled peer ops) pinned it precisely:
+
+| `reconcile:*` line | before | after | note |
+|---|--:|--:|---|
+| `touchedFiles` (count) | 16,776 | 16,776 | files a peer touched this round |
+| `multiHeadFiles` (count) | 0 | 0 | none genuinely divergent — nothing to fold |
+| `folds` (count) | 0 | 0 | — |
+| **`precheck`** | **29,586 ms** | **23 ms** | the whole cost |
+| `reconcileConcurrentHeads` (lap) | 29,601 ms | **47 ms** | — |
+| **round total** | **36,597 ms** | **7,821 ms** | **4.7×** |
+
+**Two independent O(N²) shapes, both fixed:**
+
+1. **The pre-check** (the on-device 29.6 s). It called `VersionDag.leaves(fileId)` **once per touched file**,
+   and each `leaves()` rebuilds the whole child-set with a full graph scan of **every DAG node** — so the "is
+   anything multi-head?" check was **O(touched files · nodes)** = 16,776 touched × ~67,104 nodes ≈ **1.1·10⁹**
+   node-visits (the DAG holds one node per op). Worse, since *no* file was multi-head
+   the production `.some()` never short-circuited. Fixed with a new `VersionDag.leavesByFile()` that resolves
+   **every** file's leaves in **one O(nodes) pass**, then an O(1) lookup per touched file. `leaves()` is now
+   called **zero** times on this path (pinned by `__tests__/reconcile-multihead-rebuild-perf.test.ts`).
+2. **The fold loop** rebuilt the **whole-vault** `buildLocalIdentity` **once per fold** and `break`ed after a
+   single file — O(folds·vault) when history genuinely interleaves. Fixed by folding **every** foldable file
+   per pass (each fileId is independent), turning O(folds) rebuilds into O(passes) (≈ max concurrent leaves,
+   normally 1). Unit-proven 23 → 4 rebuilds at N=20 (same test); the device run above had 0 folds so this half
+   is not separately isolated on device. See `docs/multi-head-reconciliation.md` §3.
+
+## Pull and push are the remaining levers (network-bound, and we have the concurrency pattern already)
+
+With reconcile fixed, the 7.8 s round is now **almost entirely the wire**, and these are the standing
+optimization candidates — flagged here because, unlike the read-floor above, **there is a concrete lever**:
+
+| phase | this round | share | shape / lever |
+|---|--:|--:|---|
+| **pull** | 4,895 ms | 63% | `pullAll` fetches op pages **serially** (`await pullOps` per page) and decrypts **each op serially** in a loop (`await decryptOp`) — here **~67,104 ops**, ≈73 µs/op. Fully sequential — no worker pool. |
+| **push** | 1,343 ms | 17% | blob upload already overlaps via `blobUploadConcurrency`; the **op-append** (`POST /ops`, chunked by `maxOpsPerAppend`) is still issued **serially**. |
+| fetchBlobs | 789 ms | 10% | already concurrent (`blobDownloadConcurrency` worker pool) + 3-tier already-held skip. |
+| everything else | ~800 ms | 10% | buildLocalIdentity / recordVersionEdges / stage / merge / applyMerge / reconcile — all sub-second. |
+
+**The lever is the bounded-worker-pool pattern already shipping on the blob paths** (`fetchRemoteBlobs`,
+blob upload — `blobDownloadConcurrency`/`blobUploadConcurrency`, default 8). Pull has *no* equivalent: its
+per-op AES-GCM decrypt is CPU-bound and serial, and its page fetch is latency-bound and serial. Applying the
+same pattern — overlap page prefetch with decrypt, and/or a bounded decrypt pool — plus overlapping the
+op-append chunks in push, is the obvious next cut.
+
+**Crucially, this is NOT the C1 case.** C1's capture-side concurrency *regressed* because the Android/Capacitor
+bridge **serializes native fs**, so overlap couldn't win. Pull and push are **network** round-trips
+(`requestUrl`/HTTP), where the blob pools already prove concurrency *does* win on device — so the lever is
+expected to pay off here, exactly where it didn't for local fs.
+
+**Caveat on the absolute numbers:** the ~67,104-op log (vs the vault's 8,356 real files ≈ 8× duplication) is
+inflated by the wipe-and-re-push test methodology — each wipe of `.vault-sync/` regenerates fresh fileIds for
+every file and re-pushes them, so the server accumulates whole-vault op sets under new ids (that is also why
+`touchedFiles` is 16,776, not the op count). A real vault syncs a single op set, and a steady-state round
+pulls only new ops — so pull's *absolute* cost is smaller in practice, but its **serial O(ops) structure** is
+the real, general lever regardless of the count (a genuine ~8.4k-file first sync still decrypts ~8.4k+ ops
+one-at-a-time).
+
+---
+
 ## Still to do (spec §9)
 
+- [ ] **Pull/push concurrency (the network lever)** — pull decrypts ops **serially** and fetches pages
+      **serially**; push appends op chunks **serially**. Apply the bounded-worker-pool pattern already proven
+      on the blob paths (`blobDownloadConcurrency`/`blobUploadConcurrency`) — a decrypt pool + page-prefetch
+      overlap for pull, chunk overlap for push. Network round-trips, so (unlike C1's local-fs case) concurrency
+      is expected to win. See "Pull and push are the remaining levers" above.
+- [x] **Multi-head reconcile O(N²)** — `leavesByFile()` single-pass pre-check (O(files·nodes) → O(nodes),
+      **29.6 s → 23 ms on device**) + batched-pass folding (O(folds) → O(passes) rebuilds). Round **36.6 s →
+      7.8 s**. See "The multi-head reconcile O(N²)" above.
 - [x] **First on-device run** — B3 first-enable capture, ~8.4k-file Android vault
       (recorded above; found the ~3.2k-file cliff + two capture bugs).
 - [x] **Confirm the cliff's cause** — Node probe: per-file cost is linear in F

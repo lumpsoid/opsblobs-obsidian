@@ -104,6 +104,31 @@ export class VersionDag {
   }
 
   /**
+   * Every file's open leaves, computed in ONE pass over the graph — the batched twin
+   * of {@link leaves}. `leaves(fileId)` rebuilds the whole `hasChild` set on every
+   * call, so asking it per file is O(files · nodes); a first sync that pulls a peer op
+   * for each of thousands of files then spends O(vault²) in the multi-head pre-check
+   * alone (the ~30s reconcile-precheck cliff). This builds `hasChild` once and buckets
+   * each leaf under its `fileId`, so the caller resolves any file's leaves by an O(1)
+   * map lookup. Files with no leaf recorded are simply absent from the map. Parent-only
+   * stubs (`fileId === ''`) are excluded, exactly as {@link leaves} excludes them.
+   */
+  leavesByFile(): Map<string, string[]> {
+    const hasChild = new Set<string>();
+    for (const node of this.nodes.values()) {
+      for (const p of node.parents) hasChild.add(p);
+    }
+    const out = new Map<string, string[]>();
+    for (const [id, node] of this.nodes) {
+      if (!node.fileId || hasChild.has(id)) continue;
+      const arr = out.get(node.fileId);
+      if (arr) arr.push(id);
+      else out.set(node.fileId, [id]);
+    }
+    return out;
+  }
+
+  /**
    * True when `versionId` is a *merge node* — a reconciliation of two (or more)
    * heads, i.e. it has ≥2 causal parents. Distinguishes a user-resolved conflict
    * (restore/keep-deleted/binary pick, or a clean/text merge) from a plain linear

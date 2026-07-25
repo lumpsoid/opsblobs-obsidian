@@ -67,13 +67,31 @@ specific peer staying online to push a merge.
   an auto-deferred delete/binary conflict) are skipped: their cursor is held so the whole
   round re-pulls, and reconciling them now would overwrite the very in-window edit F5
   protects.
+- **Pre-check (single pass)** — reconciliation only has work when some touched file has ≥2
+  open leaves. That check resolves every file's leaves in ONE `VersionDag.leavesByFile()`
+  pass, then an O(1) lookup per touched file — never `leaves(fileId)` per file, which
+  rebuilds the whole child-set on each call. Per-file was O(files·nodes): a first sync that
+  pulled a peer op for each of ~16.8k files, none multi-head, spent a measured ~30s here
+  alone (O(vault²)) before the batched pass collapsed it to ~one linear sweep. The fold loop
+  below likewise reads its leaves from one `leavesByFile()` pass per fold-pass.
 - **Enumerate** — `VersionDag.leaves(fileId)` gives the open leaves; the *extra* concurrent
   leaves are those the local head does **not** already descend from (`!isAncestor`).
-- **Fold** — the local head is folded with each extra leaf, one at a time, in **version-id
-  sorted order**, through the ordinary pairwise `mergeVaultStates`. A clean fold mints a
-  `write_merge` node; overlapping edits surface a two-headed `conflict` (inline zdiff3
-  markers) exactly like the normal path — never a silent pick. The loop rebuilds local
-  state each pass (folding in any node it just minted) until one head remains.
+- **Fold** — the local head is folded with each extra leaf, in **version-id sorted order**,
+  through the ordinary pairwise `mergeVaultStates`. A clean fold mints a `write_merge` node;
+  overlapping edits surface a two-headed `conflict` (inline zdiff3 markers) exactly like the
+  normal path — never a silent pick. One **pass** builds the local identity once and folds
+  *every* file that has a foldable extra leaf (files are independent — a distinct fileId owns
+  distinct DAG leaves/LCA and registry entry — so folding one leaves the pass's snapshot
+  valid for the rest). The outer loop rebuilds and runs another pass only for a file that
+  still has a further extra leaf (≥3 concurrent heads), folding in any node it just minted,
+  until one head remains. So whole-vault `buildLocalIdentity` rebuilds are **O(passes)** —
+  ≈ the max concurrent-leaf count over all files, normally 1 — not O(folds): a first sync
+  that pulls interleaved multi-device history and strands one leaf on each of thousands of
+  files reconciles them in a single pass, not thousands of rebuilds. Because a pass folds
+  from a *stale* pass-start snapshot, each fold advances the clock via
+  `setCurrent(hlcMax(getCurrent(), mergedHlc))` so the minted op never regresses logical
+  time (F7) while still dominating its parents; the merge node's id is content-addressed, so
+  the exact stamp never affects cross-device convergence.
 - **Only genuine concurrent edits are folded** — a leaf with no pulled op this round, a
   tombstone, or a disconnected lineage (`mergeBase === null`, e.g. a re-create root — see
   Finding A) is left alone, never unioned.
@@ -169,3 +187,9 @@ common, this is the upgrade path.
   puller reconciles locally (no dependency on the merging peer staying online), mints a
   real `write_merge` node, ends with a single DAG leaf, survives a reload, and replicates
   (a returning peer fast-forwards, no re-conflict).
+
+`__tests__/reconcile-multihead-rebuild-perf.test.ts`:
+- "N files each with 2 concurrent heads fold with O(passes) rebuilds, not O(N)" — pins the
+  batched-pass cost: N files each with a stranded leaf converge (both edits present) while
+  `buildLocalIdentity` is invoked a small constant number of times, not once per fold. Guards
+  the regression that made a first sync's reconcile lap scale with vault size (~9s on device).

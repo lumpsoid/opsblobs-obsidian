@@ -137,6 +137,33 @@ describe('VersionDag (pure structure)', () => {
     expect(dag.isAncestor('M', 'M')).toBe(true);
   });
 
+  test('leavesByFile: one-pass leaves match per-file leaves() across files, merges, stubs', () => {
+    const dag = new VersionDag();
+    // f1: a genuine two-head divergence (X, Y off O) → 2 open leaves.
+    dag.addVersion('O', [], 'hO', 'f1');
+    dag.addVersion('X', ['O'], 'hX', 'f1');
+    dag.addVersion('Y', ['O'], 'hY', 'f1');
+    // f2: converged after a merge node M unites its two heads → 1 open leaf (M).
+    dag.addVersion('P', [], 'hP', 'f2');
+    dag.addVersion('Q', [], 'hQ', 'f2');
+    dag.addVersion('M', ['P', 'Q'], 'hM', 'f2');
+    // f3: a plain linear head → 1 open leaf.
+    dag.addVersion('L', [], 'hL', 'f3');
+    // A parent-only stub (fileId '') must never surface as a leaf of a real file.
+    dag.addVersion('real', ['ghost'], 'hReal', 'f3');
+
+    const byFile = dag.leavesByFile();
+    // Parity with the per-file method for every real fileId.
+    for (const f of ['f1', 'f2', 'f3']) {
+      expect(new Set(byFile.get(f) ?? [])).toEqual(new Set(dag.leaves(f)));
+    }
+    expect(new Set(byFile.get('f1'))).toEqual(new Set(['X', 'Y'])); // the divergence
+    expect(byFile.get('f2')).toEqual(['M']);                        // merged → single head
+    expect(new Set(byFile.get('f3'))).toEqual(new Set(['L', 'real']));
+    // The stub carries fileId '' and is bucketed nowhere real.
+    expect(byFile.get('')).toBeUndefined();
+  });
+
   test('a parent-only stub backfills its content hash when its own edge arrives', () => {
     const dag = new VersionDag();
     dag.addVersion('child', ['parent'], 'hChild', 'f1'); // 'parent' referenced, no hash yet

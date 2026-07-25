@@ -14,7 +14,7 @@ export type PhaseTimingSink = (phase: string, ms: number) => void;
 /** `performance.now()` where available (Obsidian's mobile WebView and Node both
  *  have it — a monotonic high-resolution clock unaffected by wall-clock jumps),
  *  falling back to `Date.now()` so the timer can never throw on an exotic host. */
-function nowMs(): number {
+export function nowMs(): number {
   return typeof performance !== 'undefined' && typeof performance.now === 'function'
     ? performance.now()
     : Date.now();
