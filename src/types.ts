@@ -243,6 +243,8 @@ export const DEFAULT_SETTINGS: SyncSettings = {
     '.obsidian/workspace-mobile.json',
     '.obsidian/cache',
     '.vault-sync/**',
+    '.git',
+    '.git/**',
   ],
   deleteConflictStrategy: 'ask',
   syncObsidianConfig: false,
