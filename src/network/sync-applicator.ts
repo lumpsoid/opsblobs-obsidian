@@ -7,6 +7,7 @@ import { HLC, MergeAction, VaultState } from '../types';
 import { VaultFiles } from '../ports/vault-files';
 import { FileRegistry } from '../core/file-registry';
 import { ContentStore, hashContent } from '../core/content-store';
+import { PackCheckpoint } from '../core/pack-checkpoint';
 import { OperationLogger } from '../core/operation-logger';
 import { mergeVersionId } from '../core/operations';
 import { renderMarkersFromResult } from '../merge/diff3';
@@ -96,13 +97,31 @@ export class SyncApplicator {
     // (not F5 drift) — surfaced with reason 'conflict' by the plugin (Step 7).
     const deferredConflicts = new Set<string>();
 
+    // Bounded pack flushing shared with the capture path (pack-checkpoint.ts): the
+    // applicator buffers each pulled blob via `putBuffered` (no per-blob I/O) and this
+    // flushes them every N actions instead of once at the end — so a first pull of an
+    // 8k-note vault lands as ~40 bounded packs, not one giant pack that later has to be
+    // read whole to extract any single blob. No `persistReferrers`: the registry is
+    // batched across the whole apply (suspendSaves → one flush in the outer finally)
+    // and the ops are cleared once, so the checkpoint only governs blobs here.
+    const checkpoint = new PackCheckpoint(this.contentStore);
+
     try {
       try {
         for (const action of actions) {
           const resolved = await this.applyAction(action, localState, remoteState, deferred, deferredConflicts);
           if (resolved) resolutions.push(resolved);
+          await checkpoint.tick();
         }
       } finally {
+        // Flush the final sub-N tail of buffered blobs to durable packs (the per-N
+        // checkpoints above flushed the rest). At the top of the inner finally so it
+        // runs on the clean path AND any mid-apply throw: blob-before-op — every blob
+        // is durable before `clearOps` and before the resolution/merge ops below (which
+        // reference merge-node hashes) are recorded, so no op ever cites an unflushed
+        // blob (guide §5). `keepWarm` leaves the tail in memCache for the head reconcile
+        // that runs right after.
+        await checkpoint.flush({ keepWarm: true });
         // Clear pending ops before resuming listeners so that vault events
         // fired asynchronously by our writes (modify/create/delete) don't get
         // re-logged as new pending changes after clearOps returns.
@@ -182,7 +201,7 @@ export class SyncApplicator {
         // emits a fabricated empty write. Writing empty is therefore the correct
         // propagation of a user emptying a file — not a truncation to refuse (G13).
         await this.files.write(action.path, action.content);
-        await this.contentStore.put(hash, action.content);
+        await this.contentStore.putBuffered(hash, action.content);
         // Adopt the remote file's identity (its UUID) so both devices track this
         // path under ONE id. The merge is id-keyed; without this each device
         // keeps its own id for the same path and their edits never reconcile —
@@ -225,7 +244,7 @@ export class SyncApplicator {
         // across devices regardless of this per-device timestamp.
         const hlcTs = this.hlc.now();
         await this.files.write(action.path, action.content);
-        await this.contentStore.put(hash, action.content);
+        await this.contentStore.putBuffered(hash, action.content);
         // Adopt identity and set the head to the merge node explicitly (its id is
         // NOT hlcToString(hlc), so adoptRemote can't derive it).
         await this.registry.adoptRemote(action.fileId, action.path, hash, hlcTs, id);
@@ -286,7 +305,7 @@ export class SyncApplicator {
         const marked = new TextEncoder().encode(renderMarkersFromResult(action.mergeResult));
         const hash = await hashContent(marked);
         await this.files.write(action.localPath, marked);
-        await this.contentStore.put(hash, marked);
+        await this.contentStore.putBuffered(hash, marked);
         // Record the file two-headed: the markers' hash + the two conflicting heads,
         // so the resolving save re-emits `parents: [A, B]`. The file is now a derived
         // two-headed conflict (Step 7) — the panel/badge pick it up from the registry;
@@ -315,7 +334,7 @@ export class SyncApplicator {
           // Keep the file: re-assert its presence (undeleting our own copy if we
           // were the deleting side) as an `update` merge node.
           await this.files.write(action.path, action.content);
-          await this.contentStore.put(hash, action.content);
+          await this.contentStore.putBuffered(hash, action.content);
           return this.mintMergeResolution(action.fileId, action.path, hash, hlcTs, action.parents);
         }
         // 'keep_deleted' — accept the deletion: remove our copy (if present) and
@@ -345,7 +364,7 @@ export class SyncApplicator {
         // The chosen side's bytes are carried in the action (never fabricated), so
         // an empty payload is a legitimately-empty version to keep, not a truncation.
         await this.files.write(path, content);
-        await this.contentStore.put(hash, content);
+        await this.contentStore.putBuffered(hash, content);
         return this.mintMergeResolution(action.fileId, path, hash, hlcTs, action.parents);
       }
 

@@ -11,6 +11,14 @@ import { App, TFile, normalizePath } from 'obsidian';
 import { VaultFiles, VaultFileRef } from '../ports/vault-files';
 
 export class ObsidianVaultFiles implements VaultFiles {
+  // Dirs already ensured this session — skips the `adapter.exists` stat that `write`
+  // otherwise pays per file. A bulk apply (first pull of an 8k-note vault) touches
+  // every file, so an unmemoized `ensureDir` fired ~8k redundant dir stats; this
+  // collapses them to one per distinct dir (apply-path-pack-writes-spec §2.3, mirroring
+  // ContentStore.packDirEnsured). Never cleared within a session — dirs we created
+  // don't get un-created under us mid-run.
+  private ensuredDirs: Set<string> = new Set();
+
   constructor(private app: App) {}
 
   list(): VaultFileRef[] {
@@ -61,8 +69,10 @@ export class ObsidianVaultFiles implements VaultFiles {
   }
 
   private async ensureDir(dirPath: string): Promise<void> {
+    if (this.ensuredDirs.has(dirPath)) return;
     if (!(await this.app.vault.adapter.exists(dirPath))) {
       await this.app.vault.adapter.mkdir(dirPath);
     }
+    this.ensuredDirs.add(dirPath);
   }
 }

@@ -13,6 +13,7 @@ import { HybridLogicalClock } from './hlc';
 import { Ops, mergeVersionId } from './operations';
 import { FileRegistry } from './file-registry';
 import { ContentStore, hashContent } from './content-store';
+import { PackCheckpoint, PackFlushTarget } from './pack-checkpoint';
 import { nowMs } from './perf-clock';
 import { isExcluded } from './exclusion-policy';
 import { hasConflictMarkers } from '../merge/diff3';
@@ -185,7 +186,6 @@ export class OperationLogger {
     signal?: AbortSignal,
   ): Promise<CaptureStats> {
     let changed = false;
-    let sinceCheckpoint = 0;
     const onDisk = new Set<string>();
 
     // Per-phase split (perf diagnostics, Layer 3) — returned always so the caller
@@ -202,6 +202,35 @@ export class OperationLogger {
     // per-file cost is flat. `resumeSaves` runs in `finally` so an early throw (an
     // interrupted capture) can't leave autosave wedged off.
     this.registry.suspendSaves();
+
+    // Bounded pack flushing shared with the apply side (pack-checkpoint.ts). At each
+    // checkpoint: flush the buffered pack (timed into flushMs), THEN persist the
+    // batched registry and the oplog delta in that order — registry never behind the
+    // oplog on disk (blob-before-op, then registry-before-oplog). `changed` is read
+    // live, so a checkpoint with nothing new skips the oplog append (matches the
+    // pre-extraction final-tail guard). Every flush site below — mid-pass, abort, and
+    // the final tail — is one call into this.
+    const checkpoint = new PackCheckpoint(
+      {
+        flushPack: async () => {
+          const tf = nowMs();
+          await this.contentStore.flushPack();
+          stats.flushMs += nowMs() - tf;
+        },
+        clearMemCache: () => this.contentStore.clearMemCache(),
+      } satisfies PackFlushTarget,
+      CAPTURE_CHECKPOINT_EVERY,
+      async () => {
+        const tr = nowMs();
+        await this.registry.flush();
+        stats.regFlushMs += nowMs() - tr;
+        if (changed) {
+          const to = nowMs();
+          await this.appendOpLog();
+          stats.oplogSaveMs += nowMs() - to;
+        }
+      },
+    );
     try {
     // ── Live files: untracked → create, content drifted → update ─────────────
     const live = this.files.list();
@@ -215,21 +244,11 @@ export class OperationLogger {
       // file as "vanished while offline" and emit a vault-wide phantom delete. The
       // tail re-captures on the next enable; the `finally` still runs `resumeSaves`.
       if (signal?.aborted) {
-        // Blob-before-op (spec §4): flush the buffered pack + index BEFORE the oplog,
-        // so no persisted op references an unwritten blob. Buffered-but-unflushed blobs
-        // have no saved op either (op save is below), so an abort simply re-captures the
-        // tail next enable.
-        const tf = nowMs();
-        await this.contentStore.flushPack();
-        stats.flushMs += nowMs() - tf;
-        const tr = nowMs();
-        await this.registry.flush();
-        stats.regFlushMs += nowMs() - tr;
-        if (changed) {
-          const to = nowMs();
-          await this.appendOpLog();
-          stats.oplogSaveMs += nowMs() - to;
-        }
+        // Blob-before-op (spec §4): the checkpoint flushes the buffered pack + index
+        // BEFORE the oplog, so no persisted op references an unwritten blob. Buffered-
+        // but-unflushed blobs have no saved op either, so an abort simply re-captures
+        // the tail next enable. Keep the tail warm — the re-enable capture reads it.
+        await checkpoint.flush({ keepWarm: true });
         stats.totalMs = nowMs() - startedAt;
         return stats;
       }
@@ -309,36 +328,17 @@ export class OperationLogger {
       }
       changed = true;
 
-      // Crash-safety + memory checkpoint (every N emitted ops). Persist the batched
-      // registry FIRST, then the oplog, so on-disk the registry is never behind the
-      // oplog — a crash in the gap strands files (registry ahead; recoverable via
-      // rebaseline), never orphans ops (oplog ahead, referencing unregistered files).
-      // Without this, an interrupted capture on a large mobile vault (OOM at the GC
-      // cliff) left the registry marking files "captured" while their ops were never
-      // journalled — they skip re-capture on the `entry.contentHash === hash` guard
-      // and never sync. Bounds that loss to <N and keeps the live pending count fresh.
-      // Then drop the in-memory content cache: every blob is already on disk
-      // (contentStore.put), so a later read re-loads it — this keeps the pass from
-      // accumulating the whole vault's content in RAM. The final sub-N window is never
-      // cleared (the counter never reaches N again), so the just-captured tail stays
-      // warm for the sync round that runs right after — it reads those blobs from
-      // memCache instead of a disk read + C4 hash-verify (keeps the round stat-gate hot).
-      if (++sinceCheckpoint >= CAPTURE_CHECKPOINT_EVERY) {
-        // Pack-writes (spec §3.2/§4): append this chunk's buffered blobs to a pack +
-        // index FIRST, so every blob is durable before the ops that reference it are
-        // journalled (blob-before-op). Then the existing registry-then-oplog ordering.
-        const tf = nowMs();
-        await this.contentStore.flushPack();
-        stats.flushMs += nowMs() - tf;
-        const tr = nowMs();
-        await this.registry.flush();
-        stats.regFlushMs += nowMs() - tr;
-        const to = nowMs();
-        await this.appendOpLog();
-        stats.oplogSaveMs += nowMs() - to;
-        this.contentStore.clearMemCache();
-        sinceCheckpoint = 0;
-      }
+      // Crash-safety + memory checkpoint (every N emitted ops): flush the buffered pack,
+      // persist the batched registry then the oplog delta, and drop the content cache so
+      // the pass can't accumulate the whole vault in RAM. The registry-before-oplog order
+      // means a crash in the gap strands files (registry ahead; recoverable via
+      // rebaseline) rather than orphaning ops (oplog ahead, referencing unregistered
+      // files). Without it, an interrupted capture on a large mobile vault (OOM at the GC
+      // cliff) left files marked "captured" whose ops were never journalled — they skip
+      // re-capture on the `entry.contentHash === hash` guard and never sync; the
+      // checkpoint bounds that loss to <N. The final sub-N tail is flushed with
+      // `keepWarm` (below) so the sync round that runs right after reads it warm.
+      await checkpoint.tick();
     }
     // Final tick so the last (sub-batch) files register in the progress log.
     if (onProgress && total > 0) onProgress(total, total);
@@ -383,22 +383,12 @@ export class OperationLogger {
       }
     }
 
-    // Successful end: flush the final (sub-checkpoint) buffered pack, then persist the
-    // tail (registry first, then oplog — same ordering as the checkpoint). The final
-    // window's blobs stay in memCache (never cleared) so the sync round that runs right
-    // after reads them warm. On an early throw we skip this and fall to the `finally`,
-    // leaving disk at the last checkpoint (registry and oplog consistent there).
-    const tf = nowMs();
-    await this.contentStore.flushPack();
-    stats.flushMs += nowMs() - tf;
-    const tr = nowMs();
-    await this.registry.flush();
-    stats.regFlushMs += nowMs() - tr;
-    if (changed) {
-      const to = nowMs();
-      await this.appendOpLog();
-      stats.oplogSaveMs += nowMs() - to;
-    }
+    // Successful end: flush the final (sub-checkpoint) tail — pack, then registry, then
+    // oplog (only if changed). `keepWarm` leaves the tail's blobs in memCache so the
+    // sync round that runs right after reads them warm. On an early throw we skip this
+    // and fall to the `finally`, leaving disk at the last checkpoint (registry and oplog
+    // consistent there).
+    await checkpoint.flush({ keepWarm: true });
     stats.totalMs = nowMs() - startedAt;
     return stats;
     } finally {

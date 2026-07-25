@@ -245,6 +245,57 @@ describe('ServerSyncClient — full round against the fake', () => {
     expect(stored && new TextDecoder().decode(stored)).toBe(body);
   });
 
+  test('a first pull of F files buffers every blob and flushes the content store ONCE (apply-path-pack-writes §2.2)', async () => {
+    const server = new FakeSyncServer();
+    const deviceA = await device('dev-a');
+    const deviceB = await device('dev-b');
+
+    // A seeds F distinct files across two dirs, then pushes them all.
+    const F = 40;
+    const bodies = new Map<string, string>();
+    for (let i = 0; i < F; i++) {
+      const path = `${i % 2 === 0 ? 'a' : 'b'}/note-${i}.md`;
+      const body = `# note ${i}\nunique-line-${i}\n`;
+      bodies.set(path, body);
+      await deviceA.seedFile(path, body, 1000 + i);
+    }
+    await client(server, vc, deviceA).runSync();
+    expect(server.opCount).toBe(F);
+
+    // Count only the content-store's pack-dir appends B issues during its pull —
+    // isolating blob writes from the registry/oplog/DAG appends that share the
+    // same fake. The per-blob `put` did 2 appends (a 1-blob pack + its index line)
+    // PER FILE → 2F; buffering + a bounded pack checkpoint (PackCheckpoint) collapses
+    // that to 2 appends per flush, at most ceil(F/N) flushes — here one, since F < N.
+    const PACK_DIR = '.vault-sync/content/pack/';
+    let packAppends = 0;
+    const origAppend = deviceB.metadata.append.bind(deviceB.metadata);
+    deviceB.metadata.append = async (p: string, d: string) => {
+      if (p.startsWith(PACK_DIR)) packAppends++;
+      return origAppend(p, d);
+    };
+
+    await client(server, vc, deviceB).runSync();
+
+    // The point: content-store appends do NOT scale with F. One flush = one pack
+    // body append + one index append.
+    expect(packAppends).toBe(2);
+    expect(packAppends).toBeLessThan(2 * F);
+    // And no loose per-blob write ever happened (the format is pack-only, C4).
+    expect(deviceB.metadata.io.writesDirect).toBe(0);
+
+    // Every pulled file round-trips: on-disk bytes and the content store (read
+    // back by the registry hash, C4-verified) both match what A pushed.
+    expect(await deviceB.cursor()).toBe(F);
+    for (const [path, body] of bodies) {
+      const onDisk = await deviceB.files.read(path);
+      expect(onDisk && new TextDecoder().decode(onDisk)).toBe(body);
+      const hash = deviceB.entry(deviceB.entryByPath(path)!.id)!.contentHash;
+      const stored = await deviceB.content(hash);
+      expect(stored && new TextDecoder().decode(stored)).toBe(body);
+    }
+  });
+
   test('re-running a device does not double-append and settles its cursor', async () => {
     const server = new FakeSyncServer();
     const deviceA = await device('dev-a');
