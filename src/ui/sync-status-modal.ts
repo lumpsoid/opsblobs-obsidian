@@ -1,13 +1,18 @@
 // ─────────────────────────────────────────────
-//  Sync status modal  (S2)
+//  Sync status modal  (S2 → redesigned per docs/sync-status-modal-redesign-spec.md)
 // ─────────────────────────────────────────────
 //
-//  The inspectable "current state of sync" surface — replaces the transient
-//  8-second Notice. Shows the last round's result, still-pending changes, and
-//  anything that needs attention: delete/binary conflicts awaiting a decision, files
-//  deferred for on-disk drift (retry automatically), content stranded waiting on a
-//  blob, and the last error. The conflicts get an "Open Conflicts panel" action — the
-//  panel is where they (and text conflicts) are actually resolved (§3 "full inline").
+//  A live "what's happening / what needs me" glance, grouped by actionability
+//  rather than chronology:
+//    1. Live progress (first-enable indexing / in-flight sync round) — unchanged.
+//    2. Last error, with a Dismiss action.
+//    3. Needs your attention — a one-line conflict count + "Open Conflicts panel".
+//       The per-conflict list lives in ConflictsView, not here (no duplication).
+//    4. Waiting to sync — one line of pending/deferred/stranded counts + "View
+//       details", which opens the new PendingChangesView main-area tab.
+//    5. Last sync one-liner.
+//  Connection info (server/fingerprint/device) is dropped from the modal
+//  entirely — it lives in settings-tab.ts, which already owns configuring it.
 
 import { App, Modal, Setting } from 'obsidian';
 import { SyncState } from '../network/sync-state-store';
@@ -28,14 +33,14 @@ export interface UploadProgress {
   total: number;
 }
 
-/** The read-only snapshot the modal renders, plus the one action it can trigger. */
+/** The read-only snapshot the modal renders, plus the actions it can trigger. */
 export interface SyncStatusSnapshot {
-  serverUrl: string;
-  fingerprint: string | null;
-  deviceId: string;
-  /** This device's friendly name (settings) — shown instead of the raw UUID (§5). */
-  deviceName: string;
-  pendingPaths: string[];
+  /** Two-headed text conflicts + auto-deferred delete/binary conflicts — the same
+   *  derived count the ribbon/status-bar use. Replaces rendering `state.conflicts`
+   *  in full; ConflictsView owns the per-conflict listing. */
+  conflictCount: number;
+  /** The three "not yet fully synced" states, combined into one summary line. */
+  waitingCounts: { pending: number; deferred: number; stranded: number };
   state: SyncState;
   /** Live progress of the first-enable capture, or null when it isn't running. Read on
    *  each refresh tick (not captured once) so the bar advances while the modal is open. */
@@ -51,6 +56,12 @@ export interface SyncStatusSnapshot {
   /** Open the Conflicts panel — where delete/binary conflicts are resolved (§3).
    *  Closes the modal first. */
   onOpenConflicts: () => void;
+  /** Open the PendingChangesView — where the full pending/deferred/stranded detail
+   *  lives. Closes the modal first. */
+  onOpenPendingChanges: () => void;
+  /** Dismiss the last error (`syncState.clearError()`). Does not fix the underlying
+   *  cause — if the same failure recurs on the next sync, the section reappears. */
+  onDismissError: () => void;
 }
 
 export class SyncStatusModal extends Modal {
@@ -82,10 +93,48 @@ export class SyncStatusModal extends Modal {
     // start a long sync, then open this to check it's moving.
     this.liveTimer = window.setInterval(() => this.renderLive(), 2000);
 
-    const s = this.snap.state;
+    // ── Last error, with a Dismiss action ─────────────────────────────────────
+    this.renderError(contentEl.createDiv());
+
+    // ── Needs your attention (conflicts) ──────────────────────────────────────
+    contentEl.createEl('h3', { text: 'Needs your attention' });
+    if (this.snap.conflictCount === 0) {
+      contentEl.createEl('p', { text: 'No conflicts waiting.', cls: 'setting-item-description' });
+    } else {
+      const n = this.snap.conflictCount;
+      new Setting(contentEl)
+        .setName(`${n} conflict${n !== 1 ? 's' : ''} waiting`)
+        .setDesc('Open the Conflicts panel to choose which version to keep for each.')
+        .addButton(btn => {
+          btn.setButtonText('Open Conflicts panel').setCta().onClick(() => {
+            this.close();
+            this.snap.onOpenConflicts();
+          });
+        });
+    }
+
+    // ── Waiting to sync (pending / deferred / stranded, combined) ─────────────
+    contentEl.createEl('h3', { text: 'Waiting to sync' });
+    const { pending, deferred, stranded } = this.snap.waitingCounts;
+    if (pending + deferred + stranded === 0) {
+      contentEl.createEl('p', { text: 'Everything is synced.', cls: 'setting-item-description' });
+    } else {
+      const parts: string[] = [];
+      if (pending > 0) parts.push(`${pending} pending`);
+      if (deferred > 0) parts.push(`${deferred} deferred`);
+      if (stranded > 0) parts.push(`${stranded} waiting on content`);
+      new Setting(contentEl)
+        .setName(parts.join(' · '))
+        .addButton(btn => {
+          btn.setButtonText('View details').onClick(() => {
+            this.close();
+            this.snap.onOpenPendingChanges();
+          });
+        });
+    }
 
     // ── Last sync ─────────────────────────────────────────────────────────────
-    const last = s.lastSync;
+    const last = this.snap.state.lastSync;
     contentEl.createEl('h3', { text: 'Last sync' });
     if (last) {
       contentEl.createEl('p', {
@@ -96,88 +145,6 @@ export class SyncStatusModal extends Modal {
     } else {
       contentEl.createEl('p', { text: 'Never synced.', cls: 'setting-item-description' });
     }
-
-    // ── Pending changes ───────────────────────────────────────────────────────
-    contentEl.createEl('h3', { text: `Pending changes (${this.snap.pendingPaths.length})` });
-    if (this.snap.pendingPaths.length === 0) {
-      contentEl.createEl('p', { text: 'Everything is synced.', cls: 'setting-item-description' });
-    } else {
-      this.pathList(this.snap.pendingPaths);
-    }
-
-    // ── Delete/binary conflicts (resolved in the Conflicts panel) ─────────────
-    const conflicts = s.conflicts;
-    contentEl.createEl('h3', { text: `Needs your attention (${conflicts.length})` });
-    if (conflicts.length === 0) {
-      contentEl.createEl('p', { text: 'No conflicts waiting.', cls: 'setting-item-description' });
-    } else {
-      contentEl.createEl('p', {
-        text: 'These delete/binary conflicts are waiting for your decision. Your current version is kept until you choose.',
-        cls: 'setting-item-description',
-      });
-      for (const c of conflicts) {
-        // Flagged by color, not an emoji (no-emoji UI decision, §5).
-        contentEl.createEl('div', {
-          text: `${c.path} (${c.kind}) — since ${this.rel(c.at)}`,
-          cls: 'setting-item-description vault-sync-status-attention',
-        });
-      }
-      new Setting(contentEl)
-        .setName('Resolve conflicts')
-        .setDesc('Open the Conflicts panel to choose which version to keep for each.')
-        .addButton(btn => {
-          btn.setButtonText('Open Conflicts panel').setCta().onClick(() => {
-            this.close();
-            this.snap.onOpenConflicts();
-          });
-        });
-    }
-
-    // ── Deferred (drift) ──────────────────────────────────────────────────────
-    const drift = s.deferred; // deferred is F5-drift only now (conflicts are separate)
-    if (drift.length > 0) {
-      contentEl.createEl('h3', { text: `Deferred — changed during sync (${drift.length})` });
-      contentEl.createEl('p', {
-        text: 'These files changed on disk while a sync was in flight, so their incoming update was held. They retry automatically on the next sync.',
-        cls: 'setting-item-description',
-      });
-      this.pathList(drift.map(d => d.path));
-    }
-
-    // ── Stranded (missing content) ────────────────────────────────────────────
-    if (s.stranded.length > 0) {
-      // The stranded items are content blobs identified only by hash — a raw hex
-      // fragment means nothing to the user (§5), so we report the count and what it
-      // means rather than listing opaque ids.
-      const n = s.stranded.length;
-      contentEl.createEl('h3', { text: `Waiting on content (${n})` });
-      contentEl.createEl('p', {
-        text: `${n} incoming change${n !== 1 ? 's were' : ' was'} received but the file content ` +
-          "hasn't arrived from the server yet. This retries automatically on the next sync.",
-        cls: 'setting-item-description',
-      });
-    }
-
-    // ── Last error ────────────────────────────────────────────────────────────
-    if (s.lastError) {
-      contentEl.createEl('h3', { text: 'Last error' });
-      contentEl.createEl('p', { text: `${this.rel(s.lastError.at)} — ${s.lastError.message}`, cls: 'setting-item-description' });
-    }
-
-    // ── Connection ────────────────────────────────────────────────────────────
-    contentEl.createEl('h3', { text: 'Connection' });
-    contentEl.createEl('div', {
-      text: `Server: ${this.snap.serverUrl || '(not configured)'}`,
-      cls: 'setting-item-description',
-    });
-    contentEl.createEl('div', {
-      text: `Vault key: ${this.snap.fingerprint ? `unlocked (${this.snap.fingerprint})` : 'locked'}`,
-      cls: 'setting-item-description',
-    });
-    contentEl.createEl('div', {
-      text: `This device: ${this.snap.deviceName || 'unnamed'}`,
-      cls: 'setting-item-description',
-    });
   }
 
   onClose() {
@@ -186,6 +153,24 @@ export class SyncStatusModal extends Modal {
       this.liveTimer = null;
     }
     this.contentEl.empty();
+  }
+
+  /** (Re)render the last-error section into `el`, or leave it empty when there is
+   *  none. Dismissing calls the host action and empties `el` immediately — no need
+   *  to close/reopen the modal or re-render anything else. */
+  private renderError(el: HTMLElement): void {
+    el.empty();
+    const err = this.snap.state.lastError;
+    if (!err) return;
+    el.createEl('h3', { text: 'Last error' });
+    el.createEl('p', { text: `${this.rel(err.at)} — ${err.message}`, cls: 'setting-item-description' });
+    new Setting(el)
+      .addButton(btn => {
+        btn.setButtonText('Dismiss').onClick(() => {
+          this.snap.onDismissError();
+          el.empty();
+        });
+      });
   }
 
   /** Re-render both live sections from the latest progress. Called on open and on every
@@ -245,14 +230,6 @@ export class SyncStatusModal extends Modal {
       // Indeterminate: a moving stripe just says "working" for a phase with no count.
       const bar = el.createDiv({ cls: 'vault-sync-indexing-bar' });
       bar.createDiv({ cls: 'vault-sync-indexing-fill vault-sync-indexing-indeterminate' });
-    }
-  }
-
-  private pathList(paths: string[]): void {
-    const ul = this.contentEl.createEl('ul', { cls: 'vault-sync-status-list' });
-    for (const p of paths.slice(0, 50)) ul.createEl('li', { text: p });
-    if (paths.length > 50) {
-      this.contentEl.createEl('div', { text: `…and ${paths.length - 50} more`, cls: 'setting-item-description' });
     }
   }
 

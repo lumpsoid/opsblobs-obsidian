@@ -32,6 +32,7 @@ import { ObsidianEditorSaver } from './network/obsidian-editor-saver';
 import { ObsidianNotifier } from './network/obsidian-notifier';
 import { ConflictsView, CONFLICTS_VIEW_TYPE, ConflictsViewHost } from './ui/conflicts-view';
 import { PerfLogView, PERF_LOG_VIEW_TYPE, PerfLogViewHost } from './ui/perf-log-view';
+import { PendingChangesView, PENDING_CHANGES_VIEW_TYPE, PendingChangesViewHost } from './ui/pending-changes-view';
 import { listTwoHeadedConflicts, ConflictListItem } from './core/conflict-inventory';
 
 // ─── Ribbon icon SVG ────────────────────────────────────────────────────────
@@ -276,6 +277,9 @@ export default class VaultSyncPlugin extends Plugin {
     // The perf log viewer (Layer 3) — an in-app tab over the otherwise iOS-unreachable
     // `.vault-sync/perf-log.txt`. Registered so a restored leaf re-attaches to a live host.
     this.registerView(PERF_LOG_VIEW_TYPE, leaf => new PerfLogView(leaf, this.perfLogHost()));
+    // The pending-changes panel (status-modal redesign) — full pending/deferred/stranded
+    // detail behind the modal's one-line summary. Registered so a restored leaf re-attaches.
+    this.registerView(PENDING_CHANGES_VIEW_TYPE, leaf => new PendingChangesView(leaf, this.pendingChangesHost()));
 
     this.ribbonIcon = this.addRibbonIcon(SYNC_ICON_ID, 'Vault Sync', () => {
       // In the error state the tooltip promises "click for details" — honor that by
@@ -329,6 +333,12 @@ export default class VaultSyncPlugin extends Plugin {
       id: 'open-perf-log',
       name: 'Open perf log',
       callback: () => { void this.activatePerfLogView(); },
+    });
+
+    this.addCommand({
+      id: 'open-pending-changes',
+      name: 'Open pending changes',
+      callback: () => { void this.activatePendingChangesView(); },
     });
 
     // Diagnostic (A3 pack-writes): measure whether the native `append` is O(delta)
@@ -974,6 +984,22 @@ export default class VaultSyncPlugin extends Plugin {
     };
   }
 
+  /** The narrow surface the {@link PendingChangesView} needs — the full detail behind
+   *  the status modal's one-line "waiting to sync" summary. Reuses the same change
+   *  fan-out as the conflicts panel: an op recorded/cleared or a round finishing is
+   *  exactly when pending/deferred/stranded counts can have moved. */
+  private pendingChangesHost(): PendingChangesViewHost {
+    return {
+      listPendingOps: () => this.opLogger.getPendingOps().map(op => ({ path: op.path, type: op.type })),
+      listDeferred: () => this.syncState.get().deferred,
+      strandedCount: () => this.syncState.get().stranded.length,
+      onChange: (cb) => {
+        this.conflictChangeListeners.add(cb);
+        return () => this.conflictChangeListeners.delete(cb);
+      },
+    };
+  }
+
   /** The narrow surface the {@link PerfLogView} needs — reads and clears the perf log
    *  through the metadata store. Pure glue; a diagnostics read must never break sync. */
   private perfLogHost(): PerfLogViewHost {
@@ -1017,6 +1043,23 @@ export default class VaultSyncPlugin extends Plugin {
     void workspace.revealLeaf(leaf);
   }
 
+  /** Reveal the pending-changes view, creating it as a main-area tab if needed — the
+   *  full detail behind the status modal's "waiting to sync" summary line. Mirrors
+   *  {@link activateConflictsView}/{@link activatePerfLogView}; reuses an existing leaf
+   *  so repeated triggers don't spawn duplicate tabs. */
+  async activatePendingChangesView(): Promise<void> {
+    const { workspace } = this.app;
+    let leaf = workspace.getLeavesOfType(PENDING_CHANGES_VIEW_TYPE)[0] ?? null;
+    if (!leaf) {
+      leaf = workspace.getLeaf('tab');
+      await leaf.setViewState({ type: PENDING_CHANGES_VIEW_TYPE, active: true });
+    } else {
+      // An already-open tab may be stale — pending/deferred/stranded change out-of-band.
+      if (leaf.view instanceof PendingChangesView) leaf.view.refresh();
+    }
+    void workspace.revealLeaf(leaf);
+  }
+
   /** Single writer for the status bar. Called by every state-change event and
    *  by the sync progress handler, so it only touches the DOM when the text
    *  changed — and it keeps {@link statusBarText} in lockstep with the DOM so a
@@ -1037,17 +1080,21 @@ export default class VaultSyncPlugin extends Plugin {
   /** Open the inspectable sync-status surface (S2) — replaces the old transient
    *  Notice. Public so the settings tab can open it too. */
   openSyncStatus(): void {
+    const state = this.syncState.get();
     new SyncStatusModal(this.app, {
-      serverUrl: this.settings.serverUrl,
-      fingerprint: this.vaultKeyFingerprint(),
-      deviceId: this.settings.deviceId,
-      deviceName: this.settings.deviceName,
-      pendingPaths: this.opLogger.getPendingOps().map(op => op.path),
-      state: this.syncState.get(),
+      conflictCount: this.conflictCount(),
+      waitingCounts: {
+        pending: this.opLogger.getPendingOps().length,
+        deferred: state.deferred.length,
+        stranded: state.stranded.length,
+      },
+      state,
       getIndexingProgress: () => this.indexingProgress,
       getSyncActivity: () => this.syncActivity,
       getUploadProgress: () => this.uploadProgress,
       onOpenConflicts: () => { void this.activateConflictsView(); },
+      onOpenPendingChanges: () => { void this.activatePendingChangesView(); },
+      onDismissError: () => { void this.syncState.clearError(); },
     }).open();
   }
 
