@@ -1,7 +1,11 @@
 # Operation Format Audit — Findings & Hardening Backlog
 
-Status: **findings A–E, G remediated** (2026-07-20; see per-finding markers and
-§Suggested sequencing). F remains open (a decision); H is deferred to v2. Performed 2026-07-20 against `HEAD` of
+Status: **findings A–E, G, F remediated** (see per-finding markers and §Suggested
+sequencing; F was a decision, recorded 2026-07-20 — see its own ✅ marker below). Only
+**H** is open, and deliberately so: an acknowledged v1 deferral (unbounded log /
+from-zero replay for new devices), matching the server's own "checkpoints deferred to
+v2" decision — revisit alongside future checkpoint work, not before this release.
+Performed 2026-07-20 against `HEAD` of
 `master` (after the F1–F7 data-safety remediation landed). Scope: the
 **`Operation` interface /
 op format** — the core wire+at-rest data structure that represents every sync

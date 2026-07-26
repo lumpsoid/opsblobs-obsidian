@@ -1,5 +1,13 @@
 # Sync Robustness & UX Audit
 
+Status: **S1–S5 all remediated** (see per-finding markers below and the summary
+table). Performed 2026-07-21, before the v2 DAG migration (Steps 5–8, sync-v2-migration-spec.md)
+and the P0–P2 UX remediation pass (docs/pre-release-ux-audit-spec.md, 2026-07-22 to
+07-26) — that unrelated work closed every finding here as a side effect (derived
+conflict state, the unified non-blocking Conflicts panel, and explicit S1/S3/S4-labeled
+fixes in `sync-coordinator.ts`). Retained for historical context; treat as closed, not
+a live punch-list.
+
 Scope: the live client↔server sync path of the Obsidian plugin — capture
 (`OperationLogger`), the round (`ServerSyncClient` / `PluginVaultSyncHost` /
 `SyncApplicator`), and everything the user sees (`main.ts` ribbon/status, settings,
@@ -15,7 +23,11 @@ with `file:line`, and a remediation.
 
 ---
 
-## S1 — Edit-then-immediately-sync silently fails to push the edit  ⟶ data not propagated
+## S1 — Edit-then-immediately-sync silently fails to push the edit  ⟶ data not propagated ✅ REMEDIATED
+
+**Fixed:** `sync-coordinator.ts:110-113` — every round now runs `editorSaver.saveOpenEditors()` →
+`opLogger.flush()` → `opLogger.captureOfflineChanges()` before building local state, explicitly
+labeled "S1:" in the comment.
 
 **This is the "I change, save, sync fast and it doesn't take the change; wait a bit,
 sync again, now it takes it" bug.** Reproduces reliably. The edit is not lost
@@ -73,7 +85,13 @@ Add a test mirroring `edit-during-sync-dataloss.test.ts` but for the
 
 ---
 
-## S2 — The system's real state is invisible: skips, deferrals, and stalls never surface
+## S2 — The system's real state is invisible: skips, deferrals, and stalls never surface ✅ REMEDIATED
+
+**Fixed:** superseded by the v2 DAG migration's derived-conflict model (Steps 6–7) and the sync
+status modal redesign (`162191a`). "Conflicts" are no longer a hand-maintained set — they're
+derived from the registry's two-headed files plus the round's `deferredConflicts`, surfaced in a
+persistent Conflicts panel (not a transient Notice) with a live ribbon/status-bar indicator, and a
+skip can no longer silently drop a remote op (there is no more skip path — see S5).
 
 The user asked for "an easy place to overview the current state — what's been missed,
 what a skip left outstanding." Today there is none, and several states are not just
@@ -122,7 +140,11 @@ file where relevant: `outstanding-conflict` (skipped/dismissed), `deferred-drift
 
 ---
 
-## S3 — "Reset sync state" silently drops un-pushed local changes
+## S3 — "Reset sync state" silently drops un-pushed local changes ✅ REMEDIATED
+
+**Fixed:** `sync-coordinator.ts` `reset(confirm)` — confirms first when un-synced ops exist, then
+reconciles the registry and re-captures every on-disk file as ops instead of `clearOps`. Explicitly
+labeled "S3:" in the doc comment.
 
 `resetSyncState` (`main.ts:346-350`) calls `reconcileWithVault` then **`clearOps()`**.
 `clearOps` throws away the pending oplog (`operation-logger.ts:276-279`) **without
@@ -144,7 +166,12 @@ of clearing them. (b) is safer and dovetails with S4.
 
 ---
 
-## S4 — No "rebuild from a known-good client and force-push to the server"
+## S4 — No "rebuild from a known-good client and force-push to the server" ✅ REMEDIATED
+
+**Fixed:** `sync-coordinator.ts` `rebaseline(confirm, runManualSync)` — after an explicit confirm,
+emits an op for every live file via `captureAllAsBaseline()` then runs a normal sync round. Explicitly
+labeled "S4:" in the doc comment; exposed in the UI as the "Re-baseline this device to the server"
+danger-zone action with a type-to-confirm gate.
 
 Explicitly requested, and genuinely absent. The user wants: *"this client is the
 source of truth — re-derive the whole sync state and push it up."* Today:
@@ -168,7 +195,12 @@ device) has drifted, without the current footgun of dropping the oplog.
 
 ---
 
-## S5 — Auto-sync can pop a blocking, unattended conflict modal
+## S5 — Auto-sync can pop a blocking, unattended conflict modal ✅ REMEDIATED
+
+**Fixed:** superseded by the "full inline" conflicts decision (pre-release-ux-audit-spec.md §3,
+2026-07-23) — `DeleteConflictModal`/`BinaryConflictModal`/`ConflictResolutionModal` were deleted
+entirely. Delete/binary conflicts now always defer into the Conflicts panel on every round (manual
+or auto); there is no blocking modal of any kind left to pop, and no Escape-to-silent-skip path.
 
 Auto-sync fires `triggerSync('auto')` on a timer (`main.ts:324-327`), which runs the
 full round including `onConflict` → a modal (`main.ts:93-104`). A background sync can
@@ -185,15 +217,15 @@ conflict state. Resolve interactively only on a manual sync or from the status v
 
 ## Summary table
 
-| # | Severity | Finding | Anchor |
-|---|----------|---------|--------|
-| S1 | High | Edit made just before sync isn't pushed (flush only drains armed timers; no op minted for drift) | `operation-logger.ts:152`, `main.ts:261`, `vault-sync-host.ts:52` |
-| S2 | High | Skips/deferrals/stalls invisible; skip is sticky (cursor advances); conflict indicator is dead code | `conflict-modal.ts:83`, `server-sync.ts:341`, `main.ts:47` |
-| S3 | High | "Reset sync state" drops un-pushed pending ops without pushing | `main.ts:346`, `operation-logger.ts:276` |
-| S4 | Medium | No non-destructive "rebuild & force-push to server" | `main.ts:346-363` |
-| S5 | Medium | Auto-sync can open blocking conflict modals; Escape = silent skip | `main.ts:324`, `main.ts:93` |
+| # | Severity | Finding | Anchor | Status |
+|---|----------|---------|--------|--------|
+| S1 | High | Edit made just before sync isn't pushed (flush only drains armed timers; no op minted for drift) | `operation-logger.ts:152`, `main.ts:261`, `vault-sync-host.ts:52` | ✅ Remediated |
+| S2 | High | Skips/deferrals/stalls invisible; skip is sticky (cursor advances); conflict indicator is dead code | `conflict-modal.ts:83`, `server-sync.ts:341`, `main.ts:47` | ✅ Remediated |
+| S3 | High | "Reset sync state" drops un-pushed pending ops without pushing | `main.ts:346`, `operation-logger.ts:276` | ✅ Remediated |
+| S4 | Medium | No non-destructive "rebuild & force-push to server" | `main.ts:346-363` | ✅ Remediated |
+| S5 | Medium | Auto-sync can open blocking conflict modals; Escape = silent skip | `main.ts:324`, `main.ts:93` | ✅ Remediated |
 
-### Recommended order
+### Recommended order (historical — all items shipped; kept for context)
 1. **S1** — stops the reported silent non-propagation. Small, localized (reuse
    `captureOfflineChanges` at sync start).
 2. **S2** — the persisted sync-state model + status view. Unlocks S4/S5 and answers the
