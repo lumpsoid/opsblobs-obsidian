@@ -13,13 +13,17 @@
 //  and maintenance/destructive actions are tucked behind Advanced / Danger-zone
 //  disclosures so they never crowd the basics.
 
-import { App, Plugin, PluginSettingTab, Setting } from 'obsidian';
+import { App, ButtonComponent, Plugin, PluginSettingTab, Setting } from 'obsidian';
 import { SyncSettings } from '../types';
 
 /** The slice of the plugin the settings tab drives. Implemented by the plugin. */
 export interface SettingsHost extends Plugin {
   settings: SyncSettings;
   saveSettings(): Promise<void>;
+  /** Switch (or clear) the vault this device syncs against. Confirms first (unless
+   *  there's no prior vaultId to protect) and resets local sync state, since it's
+   *  not scoped by vaultId — see the settings-tab Vault ID field. */
+  switchVault(newVaultId: string): Promise<void>;
   applyVaultKey(): Promise<void>;
   vaultKeyFingerprint(): string | null;
   testConnection(): Promise<string>;
@@ -91,16 +95,33 @@ export class SyncSettingTab extends PluginSettingTab {
           });
       });
 
+    // Not a live-autosave field (unlike the others here): typing a new value only
+    // stages it — nothing is applied until "Switch vault" is clicked, since committing
+    // a vaultId change resets this device's local sync state (it isn't scoped by
+    // vaultId at all — see the vault-switch guard in main.ts). That needs to be an
+    // explicit, confirmed action, not a side effect of a keystroke.
+    let pendingVaultId = this.settings.vaultId;
+    let switchBtn: ButtonComponent | null = null;
     new Setting(containerEl)
       .setName('Vault ID')
-      .setDesc('Identifies this vault on the server. Use the same value on every device.')
+      .setDesc('Identifies this vault on the server. Use the same value on every device. ' +
+        'Changing it switches which vault this device syncs against — click "Switch vault" to apply.')
       .addText(t => {
         t.setValue(this.settings.vaultId)
           .setPlaceholder('my-notes')
-          .onChange(async v => {
-            this.settings.vaultId = v.trim();
-            await this.save();
-            this.updateReadiness();
+          .onChange(v => {
+            pendingVaultId = v.trim();
+            switchBtn?.setDisabled(pendingVaultId === this.settings.vaultId);
+          });
+      })
+      .addButton(b => {
+        switchBtn = b;
+        b.setButtonText('Switch vault')
+          .setDisabled(true)
+          .onClick(async () => {
+            b.setDisabled(true);
+            await this.host.switchVault(pendingVaultId);
+            this.display(); // re-render: reflects the committed value, or reverts if cancelled
           });
       });
 

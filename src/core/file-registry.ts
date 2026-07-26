@@ -189,6 +189,22 @@ export class FileRegistry {
     this.dirtyIds.clear();
   }
 
+  /** Wipe the registry back to empty — in-memory and on disk (vault-switch guard).
+   *  Unlike `compact()`, which folds the journal into the snapshot, this discards
+   *  both: every entry's headVersionId points into a version DAG that a vault
+   *  switch also clears, so keeping stale entries around would let a later capture
+   *  resolve merges against a base that no longer exists. */
+  async resetAll(): Promise<void> {
+    this.entries = new Map();
+    this.pathIndex = new Map();
+    this.dirtyIds.clear();
+    this.journalBytes = 0;
+    this.journalRecords = 0;
+    this.snapshotBytes = 0;
+    if (await this.metadata.exists(REGISTRY_PATH)) await this.metadata.remove(REGISTRY_PATH);
+    if (await this.metadata.exists(REGISTRY_JOURNAL_PATH)) await this.metadata.remove(REGISTRY_JOURNAL_PATH);
+  }
+
   /** Suspend the per-mutation autosave (mutations mark the registry dirty but don't
    *  write). Pair with `flush()` to persist at controlled checkpoints and
    *  `resumeSaves()` to restore normal behaviour — always in a `finally`. */

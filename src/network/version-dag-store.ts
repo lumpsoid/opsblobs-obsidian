@@ -130,6 +130,14 @@ export class VersionDagStore {
     await this.compact(dag);
   }
 
+  /** Wipe the DAG's backing files entirely (vault-switch guard) — unlike `compact`,
+   *  which folds edges into a fresh snapshot, this removes the snapshot too, so the
+   *  next `load()` starts from a genuinely empty graph. */
+  async clear(): Promise<void> {
+    if (await this.metadata.exists(SNAPSHOT_PATH)) await this.metadata.remove(SNAPSHOT_PATH);
+    if (await this.metadata.exists(JOURNAL_PATH)) await this.metadata.remove(JOURNAL_PATH);
+  }
+
   private async ensureDir(): Promise<void> {
     if (!(await this.metadata.exists('.vault-sync'))) {
       await this.metadata.mkdir('.vault-sync');

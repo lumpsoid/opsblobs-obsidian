@@ -192,4 +192,13 @@ export class SyncStateStore {
       await this.persist();
     }
   }
+
+  /** Wipe back to a clean empty state (vault-switch guard) — every field here is
+   *  keyed by fileIds/paths from a registry/DAG that a vault switch also resets,
+   *  so a stale `deferred`/`conflicts`/`pendingDecisions` entry would reference
+   *  state that no longer exists. */
+  async resetAll(): Promise<void> {
+    this.state = emptyState();
+    await this.persist();
+  }
 }

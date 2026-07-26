@@ -21,6 +21,7 @@ import { KeyMismatchError } from './network/sync-errors';
 import { HttpServerApi } from './network/server-http';
 import { CursorStore } from './network/cursor-store';
 import { VersionDagStore } from './network/version-dag-store';
+import { VaultBindingStore } from './network/vault-binding-store';
 import { HlcStore } from './network/hlc-store';
 import { SyncStateStore } from './network/sync-state-store';
 import { PluginVaultSyncHost } from './network/vault-sync-host';
@@ -715,6 +716,7 @@ export default class VaultSyncPlugin extends Plugin {
       if (source === 'manual') this.notifyMissingConfig();
       return;
     }
+    if (!(await this.checkVaultBinding(source))) return;
     if (!this.crypto.isReady()) {
       await this.tryDeriveVaultKey();
       if (!this.crypto.isReady()) {
@@ -755,6 +757,118 @@ export default class VaultSyncPlugin extends Plugin {
       // opLogger.onChange, so refresh the panel explicitly here.
       this.emitConflictChange();
     }
+  }
+
+  /**
+   * Vault-switch backstop: compares the vaultId this device's local sync state
+   * (cursor/registry/DAG) was last bound to against what settings currently say.
+   * The "Switch vault" UI action keeps these in sync itself, so this only ever
+   * fires for a genuine out-of-band drift (e.g. `data.json` edited or restored
+   * outside that flow). Returns whether the sync round should proceed.
+   *
+   * No marker yet (fresh install, or an upgrade from before this guard existed):
+   * adopt the current vaultId as the baseline with no reset — there's no
+   * retroactive signal to tell whether existing local state already belongs to
+   * it. An `auto` round never prompts or wipes silently; it just notices and
+   * defers to a manual sync, which can ask.
+   */
+  private async checkVaultBinding(source: 'manual' | 'auto'): Promise<boolean> {
+    const bindingStore = new VaultBindingStore(this.metadata);
+    const binding = await bindingStore.load();
+    if (binding === null) {
+      await bindingStore.save(this.settings.vaultId);
+      return true;
+    }
+    if (binding === this.settings.vaultId) return true;
+
+    if (source === 'auto') {
+      new Notice(
+        'Vault Sync: vault ID changed outside settings — open settings and sync manually to resolve.',
+        0,
+      );
+      return false;
+    }
+    const confirmed = await new Promise<boolean>(resolve => {
+      new ConfirmModal(this.app, {
+        title: 'Vault ID changed unexpectedly',
+        message:
+          `Local sync state is bound to vault "${binding}", but settings now show ` +
+          `"${this.settings.vaultId}". Continuing would risk corrupting file history. Reset local ` +
+          'sync state to match and continue? Vault content is never touched.',
+        confirmText: 'Reset & continue',
+        warning: true,
+      }, resolve).open();
+    });
+    if (!confirmed) return false;
+    await this.wipeLocalSyncStateForVaultSwitch();
+    await this.applyVaultKey().catch(err =>
+      console.error('Vault Sync: key derivation failed after vault-binding reset:', err));
+    await bindingStore.save(this.settings.vaultId);
+    return true;
+  }
+
+  /** Wipe every local sync store that's scoped to a specific server vault — cursor,
+   *  registry, version DAG, and observable sync state — so a vault switch never
+   *  reuses metadata built under a different vaultId's scope. `ContentStore` (hash-
+   *  addressed, vaultId-agnostic) and the HLC (a device-level monotonic clock, F7)
+   *  are deliberately left untouched. */
+  private async wipeLocalSyncStateForVaultSwitch(): Promise<void> {
+    this.opLogger.clearOps();
+    await this.registry.resetAll();
+    await new CursorStore(this.metadata).save(0);
+    await new VersionDagStore(this.metadata).clear();
+    await this.syncState.resetAll();
+  }
+
+  /**
+   * Switch this device to a different server vault (or disconnect, if `newVaultId`
+   * is blank). Local sync state is scoped only by folder location, not by vaultId
+   * (see the vault-switch incident this guards against), so reusing it across a
+   * switch risks silently corrupting merges. Block-and-warn: confirm first (unless
+   * this is the very first vaultId this device has ever had — nothing to protect
+   * yet), then wipe and, if the new vaultId is non-empty, re-baseline and sync.
+   */
+  async switchVault(newVaultId: string): Promise<void> {
+    const trimmed = newVaultId.trim();
+    const current = this.settings.vaultId;
+    if (trimmed === current) return;
+    if (this.syncInProgress || this.startupCaptureInProgress) {
+      new Notice('Vault Sync: finish the current sync before switching vaults.');
+      return;
+    }
+
+    const applySwitch = async () => {
+      this.settings.vaultId = trimmed;
+      await this.saveSettings();
+      await this.wipeLocalSyncStateForVaultSwitch();
+      await new VaultBindingStore(this.metadata).save(trimmed);
+      if (trimmed) {
+        await this.applyVaultKey().catch(err =>
+          console.error('Vault Sync: key derivation failed after vault switch:', err));
+        await this.opLogger.captureAllAsBaseline();
+        await this.triggerSync('manual');
+      }
+    };
+
+    if (!current) {
+      await applySwitch(); // first-time setup — nothing local to protect yet
+      return;
+    }
+
+    const confirmed = await new Promise<boolean>(resolve => {
+      new ConfirmModal(this.app, {
+        title: trimmed ? 'Switch vault?' : 'Disconnect this vault?',
+        message: trimmed
+          ? `This device will disconnect from "${current}" and connect to "${trimmed}". Local sync ` +
+            'history (cursor, version history, file registry) will be reset and rebuilt from scratch ' +
+            'against the new vault ID. Vault content on this device is never touched.'
+          : `This device will disconnect from "${current}". Local sync history will be reset. ` +
+            'Vault content on this device is never touched.',
+        confirmText: trimmed ? 'Switch vault' : 'Disconnect',
+        warning: true,
+      }, resolve).open();
+    });
+    if (confirmed) await applySwitch();
   }
 
   /** Make newly-introduced text conflicts impossible to miss (§3). A manual round is
