@@ -308,7 +308,7 @@ export default class VaultSyncPlugin extends Plugin {
     // panel drops the resolved card.
     this.opLogger.onChange(() => {
       this.emitConflictChange();
-      if (!this.syncInProgress) this.updateStatusBar();
+      if (!this.syncInProgress && !this.startupCaptureInProgress) this.updateStatusBar();
     });
 
     // ── Commands ───────────────────────────────────────────────────────────
@@ -599,9 +599,12 @@ export default class VaultSyncPlugin extends Plugin {
           announced = true;
           new Notice(`OpsBlobs: preparing ${total} files for first sync…`, 8000);
         }
-        // The status bar is the always-visible surface; reflect indexing progress
-        // there so the vault doesn't look frozen during a minutes-long capture.
-        this.setStatusBarText(`Indexing ${scanned}/${total}…`, 'syncing');
+        // The status bar is the always-visible surface; a coarse label is enough to
+        // show the vault isn't frozen during a minutes-long capture — the live
+        // scanned/total count lives in the inspectable status modal instead, since
+        // rendering the count here churns the DOM and flickers against other
+        // status updates (see indexingProgress below, and the status modal).
+        this.setStatusBarText('Indexing…', 'syncing');
         // The status modal is the inspectable surface — expose the same progress so a
         // user who opens it mid-capture sees how far along the first sync's DAG build is.
         this.indexingProgress = { scanned, total };
