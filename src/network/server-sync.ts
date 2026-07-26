@@ -860,8 +860,13 @@ export class ServerSyncClient {
     if (missing.length === 0) return;
     const total = missing.length;
     let done = 0;
+    // Once any unit fails, the round is aborted and other in-flight workers'
+    // completions must not resurrect progress state after the caller has
+    // already reset it in response to the failure (see `aborted` below).
+    let aborted = false;
     const bump = (n: number): void => {
       done += n;
+      if (aborted) return;
       if (total > this.blobUploadConcurrency) {
         this.onProgress?.(`Uploading files ${done}/${total}…`);
         this.onUploadProgress?.(done, total);
@@ -882,9 +887,15 @@ export class ServerSyncClient {
     let next = 0;
     const worker = async (): Promise<void> => {
       for (;;) {
+        if (aborted) return;
         const i = next++;
         if (i >= units.length) return;
-        await units[i]!();
+        try {
+          await units[i]!();
+        } catch (err) {
+          aborted = true;
+          throw err;
+        }
       }
     };
     const workers = Math.min(this.blobUploadConcurrency, units.length);
