@@ -192,7 +192,7 @@ export class SyncApplicator {
 
         if (await this.driftedSinceSnapshot(action.fileId, currentPath, local)) {
           deferred.add(action.fileId);
-          console.warn(`Vault Sync: deferring write_local for ${currentPath} — on-disk content changed during the sync window (F5)`);
+          console.warn(`OpsBlobs: deferring write_local for ${currentPath} — on-disk content changed during the sync window (F5)`);
           return null;
         }
         const hash = await hashContent(action.content);
@@ -253,7 +253,7 @@ export class SyncApplicator {
 
         if (await this.driftedSinceSnapshot(action.fileId, currentPath, local)) {
           deferred.add(action.fileId);
-          console.warn(`Vault Sync: deferring write_merge for ${currentPath} — on-disk content changed during the sync window (F5)`);
+          console.warn(`OpsBlobs: deferring write_merge for ${currentPath} — on-disk content changed during the sync window (F5)`);
           return null;
         }
         const hash = await hashContent(action.content);
@@ -278,7 +278,7 @@ export class SyncApplicator {
       case 'move_local':
         if (await this.driftedSinceSnapshot(action.fileId, action.fromPath, local)) {
           deferred.add(action.fileId);
-          console.warn(`Vault Sync: deferring move_local for ${action.fromPath} — on-disk content changed during the sync window (F5)`);
+          console.warn(`OpsBlobs: deferring move_local for ${action.fromPath} — on-disk content changed during the sync window (F5)`);
           return null;
         }
         await this.files.move(action.fromPath, action.toPath);
@@ -295,7 +295,7 @@ export class SyncApplicator {
       case 'delete_local':
         if (await this.driftedSinceSnapshot(action.fileId, action.path, local)) {
           deferred.add(action.fileId);
-          console.warn(`Vault Sync: deferring delete_local for ${action.path} — on-disk content changed during the sync window (F5)`);
+          console.warn(`OpsBlobs: deferring delete_local for ${action.path} — on-disk content changed during the sync window (F5)`);
           return null;
         }
         await this.files.trash(action.path);
@@ -319,7 +319,7 @@ export class SyncApplicator {
         const currentPath = localEntry && !localEntry.deleted ? localEntry.path : action.localPath;
         if (await this.driftedSinceSnapshot(action.fileId, currentPath, local)) {
           deferred.add(action.fileId);
-          console.warn(`Vault Sync: deferring conflict markers for ${currentPath} — on-disk content changed during the sync window (F5)`);
+          console.warn(`OpsBlobs: deferring conflict markers for ${currentPath} — on-disk content changed during the sync window (F5)`);
           return null;
         }
         const marked = new TextEncoder().encode(renderMarkersFromResult(action.mergeResult));

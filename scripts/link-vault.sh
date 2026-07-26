@@ -78,5 +78,5 @@ ln -s "$PLUGIN_ROOT" "$TARGET"
 echo "linked  $TARGET"
 echo "     -> $PLUGIN_ROOT"
 echo
-echo "next: in Obsidian → Settings → Community plugins, enable \"Vault Sync\""
+echo "next: in Obsidian → Settings → Community plugins, enable \"OpsBlobs\""
 echo "      (turn off Restricted/Safe mode first if it's on)."

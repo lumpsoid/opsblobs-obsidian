@@ -17,7 +17,7 @@ const VAULT_SYNC_DIR = '.vault-sync/';
 // address those secrets into the append-only (undeletable) server oplog. The id must
 // match `manifest.json`'s `id`. (The plugin binary here — main.js/manifest.json — is
 // also per-install and managed by Obsidian, so excluding the whole dir is correct.)
-const OWN_PLUGIN_DIR = '.obsidian/plugins/obsidian-vault-sync/';
+const OWN_PLUGIN_DIR = '.obsidian/plugins/opsblobs/';
 
 // Obsidian workspace-layout files are per-device and must never sync, even when
 // the rest of `.obsidian/` is opted in via `syncObsidianConfig`.

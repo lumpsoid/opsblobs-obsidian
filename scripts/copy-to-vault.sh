@@ -82,5 +82,5 @@ echo "copied plugin '$PLUGIN_ID' → $TARGET"
 echo "  files: main.js manifest.json$([ -f "$PLUGIN_ROOT/styles.css" ] && echo ' styles.css')"
 echo
 echo "re-run this after every 'npm run build' to update the copy."
-echo "next: in Obsidian → Settings → Community plugins, enable \"Vault Sync\""
+echo "next: in Obsidian → Settings → Community plugins, enable \"OpsBlobs\""
 echo "      (turn off Restricted/Safe mode first if it's on)."

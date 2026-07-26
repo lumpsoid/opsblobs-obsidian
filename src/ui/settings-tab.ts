@@ -215,7 +215,7 @@ export class SyncSettingTab extends PluginSettingTab {
 
     const body = help.createDiv({ cls: 'setting-item-description' });
     body.createEl('p', {
-      text: 'To sync a second device, install Vault Sync there and copy three values from this device:',
+      text: 'To sync a second device, install OpsBlobs there and copy three values from this device:',
     });
     const steps = body.createEl('ol');
     steps.createEl('li', { text: 'Vault ID — use the exact same value.' });

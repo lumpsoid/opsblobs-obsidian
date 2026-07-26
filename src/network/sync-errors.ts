@@ -39,7 +39,7 @@ export class KeyMismatchError extends Error {
   constructor() {
     super(
       "This device's sync passphrase doesn't match the vault already on the server. " +
-        'Check the passphrase in Vault Sync settings — it must be identical on every device.',
+        'Check the passphrase in OpsBlobs settings — it must be identical on every device.',
     );
     this.name = 'KeyMismatchError';
   }
@@ -51,7 +51,7 @@ export class AuthError extends Error {
   constructor(public readonly status: number) {
     super(
       `The sync server rejected this device's access token (HTTP ${status}). ` +
-        'Check the access token in Vault Sync settings — it may be wrong, expired, or not authorized for this vault.',
+        'Check the access token in OpsBlobs settings — it may be wrong, expired, or not authorized for this vault.',
     );
     this.name = 'AuthError';
   }
@@ -63,7 +63,7 @@ export class NotFoundError extends Error {
   constructor() {
     super(
       "The sync server couldn't find this vault (HTTP 404). " +
-        'Check the server URL and vault ID in Vault Sync settings.',
+        'Check the server URL and vault ID in OpsBlobs settings.',
     );
     this.name = 'NotFoundError';
   }
@@ -112,7 +112,7 @@ export class DecryptError extends Error {
   constructor() {
     super(
       "Couldn't decrypt data from the server — this device's passphrase likely doesn't match the vault. " +
-        'Check the passphrase in Vault Sync settings.',
+        'Check the passphrase in OpsBlobs settings.',
     );
     this.name = 'DecryptError';
   }

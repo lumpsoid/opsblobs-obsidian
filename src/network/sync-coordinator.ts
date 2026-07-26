@@ -127,7 +127,7 @@ export class SyncCoordinator {
       return { ok: true, summary };
     } catch (err) {
       const error = err as Error;
-      console.error('Vault Sync error:', error);
+      console.error('OpsBlobs error:', error);
       // Setup-class failures (auth/vault/passphrase) are the user's to fix and need a
       // durable, actionable surface (§5); transient transport errors self-retry, so a
       // fading toast is right for them. Either way the error is recorded in the

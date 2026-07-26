@@ -1,5 +1,5 @@
 {
-	"name": "obsidian-vault-sync",
+	"name": "opsblobs",
 	"version": "0.1.2",
 	"description": "End-to-end-encrypted vault sync for Obsidian with client-side CRDT conflict resolution",
 	"main": "main.js",

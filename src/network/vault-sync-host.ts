@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────
-//  Vault Sync Host  (Phase 4)
+//  OpsBlobs Host  (Phase 4)
 // ─────────────────────────────────────────────
 //
 //  The concrete `VaultSyncHost` the P3 orchestrator (server-sync.ts) drives —

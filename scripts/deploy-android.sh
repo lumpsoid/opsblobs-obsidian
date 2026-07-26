@@ -116,6 +116,6 @@ done
 echo "✓ deployed $pushed file(s) to $REMOTE_DIR"
 echo
 echo "Next on the phone:"
-echo "  • First time: Settings → Community plugins → enable \"Vault Sync\"."
+echo "  • First time: Settings → Community plugins → enable \"OpsBlobs\"."
 echo "  • Already enabled: toggle it off/on, or install the 'Hot Reload' plugin to"
 echo "    auto-reload on each deploy."

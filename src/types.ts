@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────
-//  Core Types — Obsidian Vault Sync
+//  Core Types — Obsidian OpsBlobs
 // ─────────────────────────────────────────────
 
 export interface HLC {

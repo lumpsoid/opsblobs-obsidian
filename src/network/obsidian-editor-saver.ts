@@ -25,7 +25,7 @@ export class ObsidianEditorSaver implements EditorSaver {
         if (typeof save === 'function') await save.call(view);
       }
     } catch (err) {
-      console.warn('Vault Sync: force-save of open editors failed (non-fatal):', err);
+      console.warn('OpsBlobs: force-save of open editors failed (non-fatal):', err);
     }
   }
 }

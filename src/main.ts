@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────
-//  Obsidian Vault Sync — Main Plugin Entry
+//  Obsidian OpsBlobs — Main Plugin Entry
 // ─────────────────────────────────────────────
 
 import { Plugin, Notice, addIcon } from 'obsidian';
@@ -282,7 +282,7 @@ export default class VaultSyncPlugin extends Plugin {
     // detail behind the modal's one-line summary. Registered so a restored leaf re-attaches.
     this.registerView(PENDING_CHANGES_VIEW_TYPE, leaf => new PendingChangesView(leaf, this.pendingChangesHost()));
 
-    this.ribbonIcon = this.addRibbonIcon(SYNC_ICON_ID, 'Vault Sync', () => {
+    this.ribbonIcon = this.addRibbonIcon(SYNC_ICON_ID, 'OpsBlobs', () => {
       // In the error state the tooltip promises "click for details" — honor that by
       // opening the status modal instead of silently firing another sync (§5).
       if (this.ribbonState === 'error') this.openSyncStatus();
@@ -413,7 +413,7 @@ export default class VaultSyncPlugin extends Plugin {
     return this.missingConfigFields().length === 0;
   }
 
-  /** Open Obsidian's settings straight to the Vault Sync tab, so the finish-setup
+  /** Open Obsidian's settings straight to the OpsBlobs tab, so the finish-setup
    *  notice is actionable instead of a dead end (UX audit §1.2). */
   private openSettings(): void {
     const setting = (this.app as unknown as {
@@ -429,9 +429,9 @@ export default class VaultSyncPlugin extends Plugin {
   private notifyMissingConfig(): void {
     const missing = this.missingConfigFields();
     const frag = createFragment(f => {
-      f.appendText(`Vault Sync: finish setup before syncing — still missing ${missing.join(', ')}.`);
+      f.appendText(`OpsBlobs: finish setup before syncing — still missing ${missing.join(', ')}.`);
       f.createEl('br');
-      const link = f.createEl('a', { text: 'Open Vault Sync settings', cls: 'vault-sync-notice-link' });
+      const link = f.createEl('a', { text: 'Open OpsBlobs settings', cls: 'vault-sync-notice-link' });
       link.addEventListener('click', () => this.openSettings());
     });
     new Notice(frag, 10000);
@@ -455,7 +455,7 @@ export default class VaultSyncPlugin extends Plugin {
     try {
       await this.applyVaultKey();
     } catch (err) {
-      console.error('Vault Sync: key derivation failed:', err);
+      console.error('OpsBlobs: key derivation failed:', err);
     }
   }
 
@@ -545,7 +545,7 @@ export default class VaultSyncPlugin extends Plugin {
    *  deliberate measurement, not gated on the `perfLog` setting), and surfaces the
    *  verdict in a Notice so the result is readable on the phone without a file pull. */
   private async measureAppendCost(): Promise<void> {
-    new Notice('Vault Sync: measuring append cost… (this writes ~35 MB of scratch, then cleans up)', 6000);
+    new Notice('OpsBlobs: measuring append cost… (this writes ~35 MB of scratch, then cleans up)', 6000);
     try {
       const result = await runAppendBench(this.metadata);
       const lines = formatAppendBench(result);
@@ -556,9 +556,9 @@ export default class VaultSyncPlugin extends Plugin {
         await this.metadata.append(PERF_LOG_PATH, line + '\n').catch(() => {});
       }
       const verdict = (lines[0] ?? '').replace('append-bench VERDICT: ', '');
-      new Notice(`Vault Sync append-bench: ${verdict}`, 12000);
+      new Notice(`OpsBlobs append-bench: ${verdict}`, 12000);
     } catch (e) {
-      new Notice(`Vault Sync append-bench failed: ${e instanceof Error ? e.message : String(e)}`, 8000);
+      new Notice(`OpsBlobs append-bench failed: ${e instanceof Error ? e.message : String(e)}`, 8000);
     }
   }
 
@@ -597,7 +597,7 @@ export default class VaultSyncPlugin extends Plugin {
       if (total > CAPTURE_PROGRESS_UI_MIN) {
         if (!announced) {
           announced = true;
-          new Notice(`Vault Sync: preparing ${total} files for first sync…`, 8000);
+          new Notice(`OpsBlobs: preparing ${total} files for first sync…`, 8000);
         }
         // The status bar is the always-visible surface; reflect indexing progress
         // there so the vault doesn't look frozen during a minutes-long capture.
@@ -670,7 +670,7 @@ export default class VaultSyncPlugin extends Plugin {
     // Capture done — the modal's indexing section clears itself once this reads null.
     this.indexingProgress = null;
     if (announced) {
-      new Notice('Vault Sync: vault prepared.', 4000);
+      new Notice('OpsBlobs: vault prepared.', 4000);
       this.updateStatusBar();
     }
   }
@@ -705,7 +705,7 @@ export default class VaultSyncPlugin extends Plugin {
    *  in the obsidian-free {@link SyncCoordinator}. */
   private async triggerSync(source: 'manual' | 'auto'): Promise<void> {
     if (this.startupCaptureInProgress) {
-      if (source === 'manual') new Notice('Vault Sync: still preparing the vault for first sync — try again shortly.');
+      if (source === 'manual') new Notice('OpsBlobs: still preparing the vault for first sync — try again shortly.');
       return;
     }
     if (this.syncInProgress) {
@@ -720,7 +720,7 @@ export default class VaultSyncPlugin extends Plugin {
     if (!this.crypto.isReady()) {
       await this.tryDeriveVaultKey();
       if (!this.crypto.isReady()) {
-        if (source === 'manual') new Notice("Vault Sync: couldn't unlock the vault with this passphrase — check it in settings.");
+        if (source === 'manual') new Notice("OpsBlobs: couldn't unlock the vault with this passphrase — check it in settings.");
         return;
       }
     }
@@ -783,7 +783,7 @@ export default class VaultSyncPlugin extends Plugin {
 
     if (source === 'auto') {
       new Notice(
-        'Vault Sync: vault ID changed outside settings — open settings and sync manually to resolve.',
+        'OpsBlobs: vault ID changed outside settings — open settings and sync manually to resolve.',
         0,
       );
       return false;
@@ -802,7 +802,7 @@ export default class VaultSyncPlugin extends Plugin {
     if (!confirmed) return false;
     await this.wipeLocalSyncStateForVaultSwitch();
     await this.applyVaultKey().catch(err =>
-      console.error('Vault Sync: key derivation failed after vault-binding reset:', err));
+      console.error('OpsBlobs: key derivation failed after vault-binding reset:', err));
     await bindingStore.save(this.settings.vaultId);
     return true;
   }
@@ -833,7 +833,7 @@ export default class VaultSyncPlugin extends Plugin {
     const current = this.settings.vaultId;
     if (trimmed === current) return;
     if (this.syncInProgress || this.startupCaptureInProgress) {
-      new Notice('Vault Sync: finish the current sync before switching vaults.');
+      new Notice('OpsBlobs: finish the current sync before switching vaults.');
       return;
     }
 
@@ -844,7 +844,7 @@ export default class VaultSyncPlugin extends Plugin {
       await new VaultBindingStore(this.metadata).save(trimmed);
       if (trimmed) {
         await this.applyVaultKey().catch(err =>
-          console.error('Vault Sync: key derivation failed after vault switch:', err));
+          console.error('OpsBlobs: key derivation failed after vault switch:', err));
         await this.opLogger.captureAllAsBaseline();
         await this.triggerSync('manual');
       }
@@ -882,7 +882,7 @@ export default class VaultSyncPlugin extends Plugin {
       return;
     }
     const frag = createFragment(f => {
-      f.appendText(`Vault Sync: ${count} file${count !== 1 ? 's' : ''} need${count === 1 ? 's' : ''} conflict resolution.`);
+      f.appendText(`OpsBlobs: ${count} file${count !== 1 ? 's' : ''} need${count === 1 ? 's' : ''} conflict resolution.`);
       f.createEl('br');
       const link = f.createEl('a', { text: 'Open conflicts', cls: 'vault-sync-notice-link' });
       link.addEventListener('click', () => { void this.activateConflictsView(); });
@@ -1026,12 +1026,12 @@ export default class VaultSyncPlugin extends Plugin {
     this.ribbonIcon.addClass(`vault-sync-${state}`);
 
     const titles: Record<string, string> = {
-      idle: 'Vault Sync',
-      syncing: 'Vault Sync (syncing…)',
-      conflict: 'Vault Sync (conflicts need resolution)',
-      error: 'Vault Sync (error — click for details)',
+      idle: 'OpsBlobs',
+      syncing: 'OpsBlobs (syncing…)',
+      conflict: 'OpsBlobs (conflicts need resolution)',
+      error: 'OpsBlobs (error — click for details)',
     };
-    this.ribbonIcon.setAttribute('aria-label', titles[state] ?? 'Vault Sync');
+    this.ribbonIcon.setAttribute('aria-label', titles[state] ?? 'OpsBlobs');
   }
 
   /**

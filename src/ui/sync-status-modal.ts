@@ -80,7 +80,7 @@ export class SyncStatusModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl('h2', { text: 'Vault Sync status' });
+    contentEl.createEl('h2', { text: 'OpsBlobs status' });
 
     // ── Live progress (first-enable indexing, then the in-flight round) ───────────
     // Rendered at the top: while either is running it's the most relevant thing. Both
