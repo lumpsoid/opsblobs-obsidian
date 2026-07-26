@@ -452,6 +452,43 @@ describe('mergeVaultStates', () => {
     }
   });
 
+  // ── A parent-only DAG stub (unrecorded content hash) must not union either ──
+  test('both modified, ancestor is a parent-only stub with no content hash → conflict (never union both versions)', () => {
+    // Same hazard as F6, but the base was never independently recorded at all — it
+    // only exists as a parent reference from v-local/v-remote (e.g. its own create
+    // op was never pushed/pulled by this device — the real-world trigger was a
+    // vaultId switch that left a stale head whose true origin op never reached the
+    // new vault's server). `mergeBase` still finds it structurally (walking
+    // `parents` doesn't require the node's own edge), but `contentHashOf` returns
+    // undefined for it — indistinguishable from "no common ancestor at all" unless
+    // resolveThreeWayBase treats the two cases differently. Must degrade to a
+    // conflict, never an empty-ancestor union.
+    const localText = '\nAAA local only line 1\nAAA local only line 2';
+    const remoteText = '\nBBB remote only line 1\nBBB remote only line 2';
+    // 'v-base' is referenced as a parent below but never given its own
+    // [id, parents, hash] triple — reproducing a parent-only stub node.
+    const dag = dagOf([['v-local', ['v-base'], 'local-hash'], ['v-remote', ['v-base'], 'remote-hash']]);
+    expect(dag.contentHashOf('v-base')).toBeUndefined();
+    const local = makeState('A', [
+      { id: 'file1', contentHash: 'local-hash', headVersionId: 'v-local', hlcTimestamp: { wallTime: 1000, counter: 0, deviceId: 'A' } },
+    ]);
+    const remote = makeState('B', [
+      { id: 'file1', contentHash: 'remote-hash', headVersionId: 'v-remote', hlcTimestamp: { wallTime: 2000, counter: 0, deviceId: 'B' } },
+    ]);
+    local.contentStore.set('local-hash', new TextEncoder().encode(localText));
+    remote.contentStore.set('remote-hash', new TextEncoder().encode(remoteText));
+
+    const { actions } = mergeVaultStates(local, remote, dag);
+    const action = actions.find(a => a.fileId === 'file1')!;
+    expect(action.type).toBe('conflict');
+    // Must NOT emit a write_local whose merged content concatenates BOTH versions.
+    const writes = actions.filter(a => a.type === 'write_local' && a.fileId === 'file1');
+    for (const w of writes) {
+      const text = new TextDecoder().decode((w as { content: Uint8Array }).content);
+      expect(text.includes('AAA local only line 1') && text.includes('BBB remote only line 1')).toBe(false);
+    }
+  });
+
   test('commutativity: merge(A,B).type == merge(B,A).type', () => {
     const stateA = makeState('A', [{ id: 'f1' }, { id: 'f2' }]);
     const stateB = makeState('B', [{ id: 'f2', contentHash: 'different' }, { id: 'f3' }]);

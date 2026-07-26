@@ -377,6 +377,22 @@ test; the *classes* are what to watch for.
   missing → conflict". **Step 8's GC keeps DAG-reachable bases** (`referencedHashes(dag)`)
   precisely so this degradation is rare — but degrading is *safe* (a visible conflict),
   fabricating is not.
+- **A parent-only DAG stub is "known but missing" too, not "no base" (F1 corollary,
+  real-world incident).** `mergeBase`'s LCA walk only needs a node's `parents` set, so it
+  can name a base id the DAG knows only as a *stub* — referenced as someone's parent but
+  never itself recorded via `addVersion` (its own op was never pushed/pulled by this
+  device — the real trigger was a vaultId switch that left a stale local head whose true
+  origin op never reached the new vault's server). `contentHashOf` returns `undefined` for
+  a stub, and `resolveThreeWayBase` used to collapse that to `baseHash: null` —
+  indistinguishable from "genuinely no common ancestor," which the caller treats as safe
+  to empty-ancestor-fallback. That silently unioned both full versions exactly like the
+  GC'd-bytes case above, just via a gap the existing guard didn't cover (it only checked
+  `baseHash != null`). Fixed by adding `hasKnownAncestor` to `resolveThreeWayBase`'s
+  result, set whenever `mergeBase` finds a real id regardless of whether its hash is
+  known, and gating the conflict-guard on it instead of on `baseHash`. Pinned by
+  `core.test.ts`'s "ancestor is a parent-only stub with no content hash → conflict".
+  **Lesson:** "the DAG names a real base" and "we know that base's content hash" are two
+  different facts — collapsing them loses exactly the distinction F1 exists to preserve.
 - **Identical content ≠ causal convergence (concurrent-same-edit).** Two devices that
   independently edit a file to the *same* bytes (canonically: both empty it) reach
   identical content via **two distinct heads** off a common base. The old `state-merge`

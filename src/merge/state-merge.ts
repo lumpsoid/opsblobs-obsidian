@@ -335,7 +335,7 @@ function resolveContentConflict(
   // common ancestor), else the scalar ancestor. `ambiguous` means the DAG found
   // multiple incomparable bases (a criss-cross) — never guess one; surface a
   // conflict (decisions §6). A `null` baseHash means no common base at all.
-  const { baseHash, ambiguous } = resolveThreeWayBase(le, re, dag);
+  const { baseHash, ambiguous, hasKnownAncestor } = resolveThreeWayBase(le, re, dag);
 
   // The two conflicting heads (sync v2): when both are known, the user's resolution
   // is re-emitted as a two-parent merge node with these parents, so peers holding
@@ -398,14 +398,16 @@ function resolveContentConflict(
     ? (local.contentStore.get(baseHash) ?? remote.contentStore.get(baseHash))
     : undefined;
 
-  // A *known-but-missing* base (a real hash was recorded but its bytes are held by
-  // neither store — GC'd or never fetched to this device) is NOT a valid three-way
-  // base. Falling back to an empty ancestor makes diff3 treat both full versions as
-  // inserts at the same gap and silently *unions* them, duplicating the whole file.
-  // Distinguish that from "no base recorded at all" (baseHash == null — genuinely no
-  // common base): only the latter may fall back to an empty ancestor. When the base
-  // is known but unavailable, surface a conflict so nothing is silently concatenated.
-  if (baseHash != null && ancestorContent === undefined) {
+  // A *known* ancestor — a real LCA id, whether its content hash is simply
+  // unrecorded (a parent-only DAG stub, `baseHash === null` but
+  // `hasKnownAncestor`) or its bytes are GC'd/never fetched for a recorded hash
+  // (`baseHash` set but `ancestorContent` absent) — is NOT a valid "no base" case.
+  // Falling back to an empty ancestor makes diff3 treat both full versions as
+  // inserts at the same gap and silently *unions* them, duplicating the whole
+  // file. Only a genuinely disconnected history (`hasKnownAncestor === false`) may
+  // fall back to an empty ancestor. When a base is known to exist but its content
+  // isn't available, surface a conflict so nothing is silently concatenated.
+  if (hasKnownAncestor && ancestorContent === undefined) {
     return wholeConflict();
   }
 
@@ -579,28 +581,40 @@ function pickCollisionWinner(le: FileEntry, re: FileEntry): FileEntry {
  * DAG and both heads are known; otherwise falls back to the scalar ancestor so
  * pure-`VaultState` unit tests (no DAG) behave as before.
  *
- * Returns `{ baseHash, ambiguous }`:
+ * Returns `{ baseHash, ambiguous, hasKnownAncestor }`:
  *   · `ambiguous` — the DAG found multiple incomparable bases (a criss-cross); the
  *     caller must surface a conflict, never guess a base (decisions §6).
- *   · `baseHash === null` — no common base at all (may fall back to an empty
- *     ancestor, i.e. treat both as inserts) — but only when genuinely none exists.
- * A DAG that yields no common base (disconnected histories, e.g. a create/create
- * lineage) returns a `null` baseHash — genuinely no common base — which the caller
- * may treat as an empty ancestor (both sides pure inserts).
+ *   · `hasKnownAncestor` — a real LCA id exists in the DAG, whether or not its
+ *     content hash is recorded. `mergeBase` only needs to walk `parents` sets, so
+ *     it can name a base the DAG knows only as a *parent-only stub* — referenced
+ *     as someone's parent but never itself recorded via its own op (never pushed/
+ *     pulled by this device, e.g. across a vaultId switch that left a stale local
+ *     head). `contentHashOf` then returns `undefined` for that id, which must NOT
+ *     collapse to "no common ancestor" (`baseHash === null` alone is ambiguous
+ *     between the two) — a stub base is exactly as unsafe to treat as empty as a
+ *     known-but-GC'd one (F1): both must degrade to a conflict, never an
+ *     empty-ancestor union. Only `hasKnownAncestor === false` means genuinely no
+ *     common ancestor exists, where an empty-ancestor fallback (both sides pure
+ *     inserts) is safe.
+ *   · `baseHash` — the base's content hash when known; `null` when either no base
+ *     exists at all or a real base exists but its hash is unrecorded (check
+ *     `hasKnownAncestor` to tell those apart).
  */
 function resolveThreeWayBase(
   le: FileEntry,
   re: FileEntry,
   dag: VersionDag | undefined,
-): { baseHash: string | null; ambiguous: boolean } {
+): { baseHash: string | null; ambiguous: boolean; hasKnownAncestor: boolean } {
   if (dag && le.headVersionId && re.headVersionId) {
     const mb = dag.mergeBase(le.headVersionId, re.headVersionId);
-    if (mb === MULTIPLE_BASES) return { baseHash: null, ambiguous: true };
-    if (mb !== null) return { baseHash: dag.contentHashOf(mb) ?? null, ambiguous: false };
+    if (mb === MULTIPLE_BASES) return { baseHash: null, ambiguous: true, hasKnownAncestor: false };
+    if (mb !== null) {
+      return { baseHash: dag.contentHashOf(mb) ?? null, ambiguous: false, hasKnownAncestor: true };
+    }
     // mb === null: the two heads share no ancestor in the DAG (disconnected) — no
     // common base, so the caller falls back to an empty ancestor.
   }
-  return { baseHash: null, ambiguous: false };
+  return { baseHash: null, ambiguous: false, hasKnownAncestor: false };
 }
 
 /** The two conflicting heads to carry on a delete/binary/content conflict action,
