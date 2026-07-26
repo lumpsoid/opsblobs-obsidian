@@ -3,7 +3,7 @@
 // ─────────────────────────────────────────────
 
 import { describe, test, expect } from 'vitest';
-import { isExcluded } from '../src/core/exclusion-policy';
+import { isExcluded, isTooLarge } from '../src/core/exclusion-policy';
 import { SyncSettings } from '../src/types';
 
 type PolicySettings = Pick<SyncSettings, 'excludedPatterns' | 'syncObsidianConfig'>;
@@ -61,5 +61,21 @@ describe('exclusion-policy', () => {
 
   test('a normal note is not excluded', () => {
     expect(isExcluded('notes/a.md', settings())).toBe(false);
+  });
+});
+
+describe('isTooLarge', () => {
+  const MB = 1024 * 1024;
+
+  test('0 (or unset) means no limit', () => {
+    expect(isTooLarge(500 * MB, { maxFileSizeMb: 0 })).toBe(false);
+  });
+
+  test('file at or under the cap is not too large', () => {
+    expect(isTooLarge(10 * MB, { maxFileSizeMb: 10 })).toBe(false);
+  });
+
+  test('file over the cap is too large', () => {
+    expect(isTooLarge(10 * MB + 1, { maxFileSizeMb: 10 })).toBe(true);
   });
 });

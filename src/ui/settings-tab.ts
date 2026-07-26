@@ -422,6 +422,19 @@ export class SyncSettingTab extends PluginSettingTab {
           });
       });
 
+    new Setting(details)
+      .setName('Max file size')
+      .setDesc('Skip files larger than this from sync (MB). 0 = no limit.')
+      .addSlider(s => {
+        s.setLimits(0, 500, 5)
+          .setValue(this.settings.maxFileSizeMb)
+          .setDynamicTooltip()
+          .onChange(async v => {
+            this.settings.maxFileSizeMb = v;
+            await this.save();
+          });
+      });
+
     details.createEl('p', {
       text: 'Excluded paths — files and folders to keep out of sync (glob patterns, one per line).',
       cls: 'setting-item-description',

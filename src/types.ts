@@ -218,6 +218,9 @@ export interface SyncSettings {
   deleteConflictStrategy: 'ask' | 'keep_deleted' | 'keep_modified';
   syncObsidianConfig: boolean;
   ancestorRetentionDays: number;
+  maxFileSizeMb: number;    // 0 = unlimited. Mirrors the server's MaxBlobSize cap
+                             // (enforced client-side, pre-emptively, so an oversize
+                             // file never reaches the upload path at all).
 
   // ── Diagnostics ─────────────────────────────────────────────────────────
   // Emit per-phase sync-round + startup timings to the console (and a log file
@@ -249,5 +252,6 @@ export const DEFAULT_SETTINGS: SyncSettings = {
   deleteConflictStrategy: 'ask',
   syncObsidianConfig: false,
   ancestorRetentionDays: 30,
+  maxFileSizeMb: 100,
   perfLog: false,
 };

@@ -15,7 +15,7 @@ import { FileRegistry } from './file-registry';
 import { ContentStore, hashContent } from './content-store';
 import { PackCheckpoint, PackFlushTarget } from './pack-checkpoint';
 import { nowMs } from './perf-clock';
-import { isExcluded } from './exclusion-policy';
+import { isExcluded, isTooLarge } from './exclusion-policy';
 import { hasConflictMarkers } from '../merge/diff3';
 import { VaultFiles } from '../ports/vault-files';
 import { VaultWatcher } from '../ports/vault-watcher';
@@ -40,6 +40,7 @@ export interface HlcPersister {
 export interface CaptureStats {
   files: number;        // files scanned (post-exclusion)
   opsEmitted: number;   // create/update/delete ops pushed
+  skippedTooLarge: number; // files over maxFileSizeMb, skipped without reading
   readMs: number;       // Σ files.read
   hashMs: number;       // Σ hashContent
   putMs: number;        // Σ contentStore.putBuffered (base64 encode + buffer push; pack-writes moved the fs write to flushMs)
@@ -208,7 +209,7 @@ export class OperationLogger {
     // phase (docs/startup-capture-optimization-spec.md §3). Every return path below
     // (abort, normal end) returns these partial-or-full totals.
     const startedAt = nowMs();
-    const stats: CaptureStats = { files: 0, opsEmitted: 0, readMs: 0, hashMs: 0, putMs: 0, flushMs: 0, regFlushMs: 0, oplogSaveMs: 0, totalMs: 0 };
+    const stats: CaptureStats = { files: 0, opsEmitted: 0, skippedTooLarge: 0, readMs: 0, hashMs: 0, putMs: 0, flushMs: 0, regFlushMs: 0, oplogSaveMs: 0, totalMs: 0 };
 
     // Batch the registry writes. Without this each file re-serialized the WHOLE
     // registry (registerFile + setHeadVersion each save()), so the pass was O(F²) —
@@ -271,6 +272,16 @@ export class OperationLogger {
       const path = ref.path;
       if (this.isExcluded(path)) continue;
       onDisk.add(path);
+
+      // Oversize files are skipped before the read/hash — `onDisk` already has the
+      // path above, so a file that grew past the cap since it was last tracked
+      // still reads as "present" here and won't fall into the delete-detection
+      // pass below as a phantom vanished-while-offline delete; it just never
+      // re-captures until it's edited back under the cap (or the cap is raised).
+      if (this.isTooLarge(ref.size)) {
+        stats.skippedTooLarge++;
+        continue;
+      }
       stats.files++;
 
       const entry = this.registry.getByPath(path);
@@ -440,6 +451,7 @@ export class OperationLogger {
     for (const ref of this.files.list()) {
       const path = ref.path;
       if (this.isExcluded(path)) continue;
+      if (this.isTooLarge(ref.size)) continue;
 
       const content = await this.files.read(path);
       if (content === null) continue;
@@ -599,6 +611,14 @@ export class OperationLogger {
     const hlcTs = this.hlc.now();
     const content = await this.files.read(path);
     if (content === null) return;
+    // No stat is threaded from the live create event (bare path, see below), so the
+    // size cap can only be checked post-read. Skip before registering — this file is
+    // never tracked, so it carries none of the delete-detection risk a mid-life size
+    // change does in the offline capture pass.
+    if (this.isTooLarge(content.length)) {
+      this.notifier?.info(`${path} is over the size limit — skipped from sync`);
+      return;
+    }
     const hash = await hashContent(content);
 
     // No stat is threaded from the live create event (the watcher forwards a bare
@@ -638,6 +658,13 @@ export class OperationLogger {
 
     const content = await this.files.read(path);
     if (content === null) return;
+    // Grew past the cap since it was last (under-cap) captured: leave the registry
+    // entry frozen at its last synced hash/stat rather than re-hashing. An edit that
+    // brings it back under the cap re-triggers this handler and proceeds normally.
+    if (this.isTooLarge(content.length)) {
+      this.notifier?.info(`${path} is over the size limit — skipped from sync`);
+      return;
+    }
     const hash = await hashContent(content);
 
     // Skip if content hasn't actually changed
@@ -874,5 +901,9 @@ export class OperationLogger {
 
   private isExcluded(path: string): boolean {
     return isExcluded(path, this.getSettings());
+  }
+
+  private isTooLarge(sizeBytes: number): boolean {
+    return isTooLarge(sizeBytes, this.getSettings());
   }
 }

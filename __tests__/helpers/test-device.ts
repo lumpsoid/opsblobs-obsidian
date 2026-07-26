@@ -37,6 +37,8 @@ export interface TestDeviceOptions {
   seedHlc?: HLC;
   /** Restore the wall clock so time continues from where the prior instance left off. */
   wall?: number;
+  /** Override any DEFAULT_SETTINGS field (e.g. `maxFileSizeMb`, `excludedPatterns`). */
+  settings?: Partial<SyncSettings>;
 }
 
 /** How a device resolves a delete/modify(-or-rename) conflict. */
@@ -98,7 +100,7 @@ export class TestDevice {
     this.metadata = opts.metadata ?? new FakeMetadataStore();
     if (opts.wall !== undefined) this.clock.wall = opts.wall;
 
-    const settings: SyncSettings = { ...DEFAULT_SETTINGS, deviceId };
+    const settings: SyncSettings = { ...DEFAULT_SETTINGS, deviceId, ...opts.settings };
     const getSettings = () => settings;
 
     // Seed from the persisted HLC (F7) exactly as main.ts::onload does.

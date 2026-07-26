@@ -64,6 +64,27 @@ export function isExcluded(
   return false;
 }
 
+/**
+ * Whether `sizeBytes` is over the user's configured per-file cap. Mirrors the
+ * server's `MaxBlobSize` (docs/server-api-spec.md §9.6), but enforced client-side
+ * and pre-emptively — an oversize file is never hashed, stored, or queued for
+ * upload, rather than round-tripping to the server only to get a 413.
+ *
+ * Kept separate from {@link isExcluded} rather than folded into it: that check is
+ * decided purely from `path`, while this one needs a byte count that isn't always
+ * on hand at the same call site (the offline capture pass has it up front from the
+ * vault listing's stat; a live create/modify event only learns it after the file
+ * is read). `maxFileSizeMb <= 0` means no cap.
+ */
+export function isTooLarge(
+  sizeBytes: number,
+  settings: Pick<SyncSettings, 'maxFileSizeMb'>,
+): boolean {
+  const maxMb = settings.maxFileSizeMb;
+  if (!maxMb || maxMb <= 0) return false;
+  return sizeBytes > maxMb * 1024 * 1024;
+}
+
 // Cache compiled patterns — the same handful are matched against every path.
 const regExpCache = new Map<string, RegExp>();
 
