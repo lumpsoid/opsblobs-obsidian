@@ -19,6 +19,7 @@ import {
   StaleCursorError,
   reconstructRemoteState,
 } from '../src/network/server-sync';
+import { SyncCancelToken, SyncCancelledError } from '../src/network/sync-cancellation';
 import { FakeSyncServer, MissingBlobError } from '../src/network/fake-server';
 import { VaultCrypto } from '../src/network/encryption';
 import { Operation } from '../src/types';
@@ -121,6 +122,37 @@ class ConcurrencyProbeServer implements ServerApi {
   putBlobBatch(blobs: BlobUpload[]): Promise<void> {
     return this.track(() => this.inner.putBlobBatch(blobs));
   }
+}
+
+/** Requests cancellation on `token` once the Nth `putBlob`/`putBlobBatch` call has
+ *  landed on the inner fake — lets a test cancel mid-push deterministically (the
+ *  key-check PUT at step 2b counts as call #1, so N=2 cancels right after the first
+ *  pending file's blob has already uploaded). Everything else delegates untouched. */
+class CancelAfterNPutsServer implements ServerApi {
+  private puts = 0;
+  constructor(
+    private readonly inner: FakeSyncServer,
+    private readonly token: SyncCancelToken,
+    private readonly n: number,
+  ) {}
+  pullOps(since: number, limit: number): Promise<PullOpsResult> { return this.inner.pullOps(since, limit); }
+  appendOps(baseCursor: number, ops: AppendOp[]): Promise<AppendResult> { return this.inner.appendOps(baseCursor, ops); }
+  checkBlobs(hashes: string[]): Promise<{ missing: string[] }> { return this.inner.checkBlobs(hashes); }
+  async putBlob(hash: string, bytes: Uint8Array): Promise<void> {
+    const result = await this.inner.putBlob(hash, bytes);
+    this.puts++;
+    if (this.puts >= this.n) this.token.request();
+    return result;
+  }
+  async putBlobBatch(blobs: BlobUpload[]): Promise<void> {
+    const result = await this.inner.putBlobBatch(blobs);
+    this.puts++;
+    if (this.puts >= this.n) this.token.request();
+    return result;
+  }
+  getBlob(hash: string): Promise<Uint8Array | null> { return this.inner.getBlob(hash); }
+  getBlobBatch(hashes: string[]): Promise<{ blobs: Map<string, Uint8Array>; missing: string[] }> { return this.inner.getBlobBatch(hashes); }
+  preflight(keyCheckKey: string): Promise<{ claimed: boolean; keyCheck: Uint8Array | null }> { return this.inner.preflight(keyCheckKey); }
 }
 
 function client(api: FakeSyncServer, crypto: VaultCrypto, device: TestDevice): ServerSyncClient {
@@ -529,6 +561,68 @@ describe('ServerSyncClient — full round against the fake', () => {
     // The op was pulled but its content couldn't be fetched — reported as stranded.
     expect(summary.pulled).toBe(1);
     expect(summary.stranded).toContain(hash);
+  });
+});
+
+describe('ServerSyncClient — cancellation (sync-cancellation.ts)', () => {
+  let vc: VaultCrypto;
+  beforeAll(async () => {
+    vc = new VaultCrypto();
+    await vc.deriveFromPassphrase('correct horse battery staple', SALT);
+  });
+
+  test('a cancel requested before the round starts throws immediately and touches nothing', async () => {
+    const server = new FakeSyncServer();
+    const deviceA = await device('dev-a');
+    await deviceA.seedFile('a.md', 'hello', 1000);
+    const token = new SyncCancelToken();
+    token.request();
+    const c = new ServerSyncClient({ api: server, crypto: vc, host: deviceA.host, hlc: deviceA.hlc, cancelToken: token });
+
+    await expect(c.runSync()).rejects.toThrow(SyncCancelledError);
+
+    // Nothing was ever sent — a pre-round cancel is a pure no-op past the guard.
+    expect(server.opCount).toBe(0);
+    expect(server.blobCount).toBe(0);
+    expect(deviceA.pendingOps).toHaveLength(1);
+    expect(await deviceA.cursor()).toBe(0);
+  });
+
+  test('a cancel mid-push is safe: nothing is lost, and a later un-cancelled round completes cleanly', async () => {
+    const inner = new FakeSyncServer();
+    const token = new SyncCancelToken();
+    // Cancel right after the key-check PUT + the first pending file's blob upload —
+    // i.e. partway through a multi-blob push, not at a phase boundary.
+    const gated = new CancelAfterNPutsServer(inner, token, 2);
+    const deviceA = await device('dev-a');
+    await deviceA.seedFile('a.md', 'body a', 1000);
+    await deviceA.seedFile('b.md', 'body b', 1001);
+    await deviceA.seedFile('c.md', 'body c', 1002);
+    expect(deviceA.pendingOps).toHaveLength(3);
+
+    const cancelled = new ServerSyncClient({
+      api: gated, crypto: vc, host: deviceA.host, hlc: deviceA.hlc,
+      cancelToken: token,
+      // Force one blob per request, uploaded strictly sequentially, so the Nth-put
+      // cancel lands deterministically between two files rather than inside one
+      // batch covering all three.
+      blobUploadConcurrency: 1, blobBatchMaxCount: 1,
+    });
+    await expect(cancelled.runSync()).rejects.toThrow(SyncCancelledError);
+
+    // The op append never happened, and `clearPendingOps` never ran — the round left
+    // local state exactly as if it had never been triggered. One blob is already on
+    // the server (idempotent, harmless), but no op references it yet.
+    expect(inner.opCount).toBe(0);
+    expect(deviceA.pendingOps).toHaveLength(3);
+
+    // A normal, un-cancelled round afterwards pushes everything cleanly — the
+    // already-uploaded blob just dedupes via blobs:check, never re-sent or duplicated.
+    const clean = new ServerSyncClient({ api: inner, crypto: vc, host: deviceA.host, hlc: deviceA.hlc });
+    const summary = await clean.runSync();
+    expect(summary.pushed).toBe(3);
+    expect(inner.opCount).toBe(3);
+    expect(deviceA.pendingOps).toHaveLength(0);
   });
 });
 

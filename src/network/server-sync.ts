@@ -70,6 +70,8 @@ export {
   TimeoutError,
   DecryptError,
 } from './sync-errors';
+import { SyncCancelToken } from './sync-cancellation';
+export { SyncCancelToken, SyncCancelledError } from './sync-cancellation';
 
 /** One blob in a batch upload: its (blinded) hash and the *encrypted* envelope. */
 export interface BlobUpload {
@@ -233,6 +235,11 @@ export interface ServerSyncOptions {
    *  (the default) `runSync` installs no timer and does no timing work — inert. The
    *  plugin wires this only when the `perfLog` setting is on. */
   perfLog?: PhaseTimingSink;
+  /** Cooperative cancellation for a user-triggered "Cancel sync" (sync-cancellation.ts).
+   *  Checked only at checkpoints before the round touches the local vault — see that
+   *  module's doc for why this is always safe. Omitted (the default) means the round
+   *  can't be cancelled (e.g. the preflight check never wires one). */
+  cancelToken?: SyncCancelToken;
 }
 
 /** Default page size for the pull loop's `GET /ops?limit=`. Set to the server's
@@ -324,6 +331,7 @@ export class ServerSyncClient {
   private readonly onProgress?: (label: string) => void;
   private readonly onUploadProgress?: (uploaded: number, total: number) => void;
   private readonly perfLog?: PhaseTimingSink;
+  private readonly cancelToken?: SyncCancelToken;
 
   constructor(opts: ServerSyncOptions) {
     this.api = opts.api;
@@ -346,6 +354,7 @@ export class ServerSyncClient {
     this.onProgress = opts.onProgress;
     this.onUploadProgress = opts.onUploadProgress;
     this.perfLog = opts.perfLog;
+    this.cancelToken = opts.cancelToken;
   }
 
   /**
@@ -365,6 +374,10 @@ export class ServerSyncClient {
    */
   async runSync(): Promise<SyncRoundSummary> {
     if (!this.crypto.isReady()) throw new Error('Vault key not derived');
+    // A cancel requested before the round even started (e.g. a double-click) — bail
+    // before any I/O. See sync-cancellation.ts for why every check in this method
+    // stops once step 4 (merge/apply, the local-vault-mutating phase) begins.
+    this.cancelToken?.throwIfCancelled();
 
     // Per-phase timing (perf baseline, Layer 3): only installed when the plugin
     // passed a `perfLog` sink (the diagnostic setting is on). `undefined` otherwise,
@@ -406,6 +419,7 @@ export class ServerSyncClient {
       await this.host.saveCursor(0);
     }
     timer?.lap('keycheck+dag-guard');
+    this.cancelToken?.throwIfCancelled();
 
     // Build the local IDENTITY only (entries + pending ops + the A1 stat-gate hash
     // correction) — no O(vault) byte staging. The bytes the merge actually needs are
@@ -421,6 +435,7 @@ export class ServerSyncClient {
     this.onProgress?.('Pulling changes…');
     const { ops: pulled, cursor: pulledCursor } = await this.pullAll(startCursor);
     timer?.lap('pull');
+    this.cancelToken?.throwIfCancelled();
 
     // ── 2. Reconstruct the remote projection and fetch the content it needs ──
     // Exclude our own re-pulled ops — projecting them would make a fresh local
@@ -429,6 +444,7 @@ export class ServerSyncClient {
     const remote = reconstructRemoteState(pulled.map(p => p.op), local.deviceId);
     const missingContent = await this.fetchRemoteBlobs(remote, local);
     timer?.lap('fetchBlobs');
+    this.cancelToken?.throwIfCancelled();
 
     // ── 2b. Claim the key-check record if the vault has none yet ─────────────
     // Stamp it once our key is established: either we successfully decrypted the
@@ -443,6 +459,7 @@ export class ServerSyncClient {
     }
 
     // ── 3. Push our pending ops (blobs first, then the append) ───────────────
+    this.cancelToken?.throwIfCancelled();
     if (local.pendingOps.length > 0) {
       this.onProgress?.(`Pushing ${local.pendingOps.length} change(s)…`);
       // Stage the pending ops' content so `pushPendingOps` can upload their blobs.
@@ -463,6 +480,11 @@ export class ServerSyncClient {
     timer?.lap('push');
 
     // ── 4. Merge remote into local and apply ─────────────────────────────────
+    // No cancellation checks from here to the end of the round (sync-cancellation.ts):
+    // this is where the round starts mutating the local vault (registry/DAG/disk), and
+    // an interrupted apply is exactly the failure mode "Cancel sync" must never risk.
+    // Everything above was either read-only or already-durable/idempotent network state,
+    // so it's fine to cancel through step 3; from here the round always runs to completion.
     // Record this round's causal edges into the op-id DAG FIRST — both our authored
     // ops (the snapshot taken before clearPendingOps) and the ops we pulled — so the
     // merge sees both this round's heads (local's and remote's) and can derive the
@@ -601,6 +623,9 @@ export class ServerSyncClient {
     let cursor = startCursor;
     // Bounded to avoid an accidental infinite loop if a server misreports hasMore.
     for (;;) {
+      // Read-only so far (nothing pushed/applied yet) — safe to cancel between pages
+      // of a large first-sync pull instead of only at the top of `runSync`.
+      this.cancelToken?.throwIfCancelled();
       const page = await this.api.pullOps(cursor, this.opsLimit);
       for (const rec of page.ops) {
         let op: Operation;
@@ -705,6 +730,8 @@ export class ServerSyncClient {
     let next = 0;
     const worker = async (): Promise<void> => {
       for (;;) {
+        // Read-only — safe to cancel between chunks of a large first-sync download.
+        this.cancelToken?.throwIfCancelled();
         const i = next++;
         if (i >= chunks.length) return;
         await this.fetchBlobChunk(chunks[i]!, byBlinded, remote, missing, bump);
@@ -833,6 +860,9 @@ export class ServerSyncClient {
     let cursor = baseCursor;
     const total = records.length;
     for (let i = 0; i < total; i += this.maxOpsPerAppend) {
+      // Each batch append is idempotent by clientOpId — safe to cancel between
+      // batches of a large offline backlog.
+      this.cancelToken?.throwIfCancelled();
       const batch = records.slice(i, i + this.maxOpsPerAppend);
       if (total > this.maxOpsPerAppend) {
         this.onProgress?.(`Uploading changes ${i + batch.length}/${total}…`);
@@ -888,6 +918,12 @@ export class ServerSyncClient {
     const worker = async (): Promise<void> => {
       for (;;) {
         if (aborted) return;
+        // Every upload is idempotent by hash (method doc) — safe to cancel between
+        // blobs of a large first-sync push, same as the abort-on-failure path below.
+        if (this.cancelToken?.isCancelled) {
+          aborted = true;
+          this.cancelToken.throwIfCancelled();
+        }
         const i = next++;
         if (i >= units.length) return;
         try {

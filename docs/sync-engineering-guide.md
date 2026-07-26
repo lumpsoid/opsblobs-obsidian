@@ -162,6 +162,7 @@ relevant `core`/`merge` unit) with a port for the Obsidian bit.
 | `network/cursor-store.ts` / `hlc-store.ts` | Scalar cursor + persisted HLC. |
 | `network/encryption.ts` | `VaultCrypto` — passphrase-derived key, op/blob envelopes, blinded content hashes (unlinkable dedup). |
 | `network/server-http.ts` / `fake-server.ts` | Real HTTP `ServerApi` vs in-memory fake (contract-tested to be equivalent). `HttpServerApi` bounds every `requestUrl` with `withTimeout` and maps each transport outcome to the typed error family (401/403→auth, 404→not-found, 5xx→server, no-response→network). |
+| `network/sync-cancellation.ts` | `SyncCancelToken`/`SyncCancelledError` — cooperative "Cancel sync". Checked only through the end of a round's step 3 (§4); never past the point the round starts mutating the local vault. |
 | `network/sync-errors.ts` | The **user-actionable typed-error family** every round can throw — `KeyMismatchError` (passphrase guard), `AuthError`/`NotFoundError`/`ServerError`/`NetworkError`/`TimeoutError` (transport), `DecryptError` (wrong/legacy key at pull), `StaleCursorError` (internal, F4). Each `message` is written for the user; the coordinator toasts it verbatim. Obsidian-free. |
 | `network/with-timeout.ts` | Pure `withTimeout(op, ms, label)` — bounds a hung `requestUrl` (which has no native timeout) and rejects with `TimeoutError`. The detached request is harmless (idempotent writes). |
 | `ui/conflicts-view.ts` | The non-blocking Conflicts panel (an `ItemView`): the single "needs your attention" surface — two-headed text files (per-hunk 3-way compare, applied through the ordinary save path) **and** delete/binary conflict cards resolved inline (records a `pendingDecision`, §3 "full inline"). |
@@ -237,6 +238,17 @@ Invariants you must preserve if you touch the round:
   every device (redundant). The exceptions are the **merge nodes** — a clean merge and a
   human resolution — which are re-emitted so a fresh decision (and the FF target)
   replicate.
+
+**Cancellation has a hard checkpoint at the top of step 4.** "Cancel sync" (`SyncCancelToken`,
+`sync-cancellation.ts`) is cooperative and checked only through the end of step 3 (pull,
+blob fetch, push) — everything there is either read-only or already-durable/idempotent
+network state (a pushed op, an uploaded blob), so cancelling is exactly as safe as the
+round never having run: the un-pushed/un-applied work just sits as pending ops for the
+next sync. `runSync` stops checking once `recordVersionEdges`/`mergeVaultStates`/
+`applyMerge` begins — that's where the round starts mutating the registry/DAG/disk, and
+an interrupted apply is precisely the failure mode cancellation must never risk. Any new
+long-running phase before step 4 should get a checkpoint (see the pull/download/upload
+loops for the pattern); never add one at or after step 4.
 
 ---
 

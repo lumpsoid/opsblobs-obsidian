@@ -16,6 +16,7 @@ import { SyncRoundSummary } from '../src/network/server-sync';
 import { DEFER_CONFLICT } from '../src/network/sync-applicator';
 import { SyncCoordinator } from '../src/network/sync-coordinator';
 import { AuthError } from '../src/network/sync-errors';
+import { SyncCancelledError } from '../src/network/sync-cancellation';
 import { TestDevice } from './helpers/test-device';
 
 const EMPTY_SUMMARY: SyncRoundSummary = { pushed: 0, pulled: 0, deferred: [], stranded: [], deferredConflicts: [] };
@@ -109,6 +110,24 @@ describe('SyncCoordinator', () => {
     expect(h.syncState.get().lastError).toEqual({ message: 'network down', at: 5000 });
     expect(clearError).not.toHaveBeenCalled();
     expect(h.device.pendingOps.length).toBeGreaterThan(0); // un-pushed work survives
+  });
+
+  test('a user-cancelled round is not a failure: quiet toast, no persisted error, pending ops survive', async () => {
+    const h = await harness({ roundError: new SyncCancelledError() });
+    await h.device.seedFile('note.md', 'body\n', 1000); // one un-synced pending op
+    const clearError = vi.spyOn(h.syncState, 'clearError');
+
+    const outcome = await h.coordinator.sync('manual');
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.cancelled).toBe(true);
+    // Distinct from a real failure: no scary error toast, nothing durably recorded.
+    expect(h.notifier.error).not.toHaveBeenCalled();
+    expect(h.notifier.info).toHaveBeenCalledWith('Sync cancelled');
+    expect(h.syncState.get().lastError).toBeNull();
+    expect(clearError).not.toHaveBeenCalled();
+    // Un-pushed work simply survives, exactly as if the round never ran.
+    expect(h.device.pendingOps.length).toBeGreaterThan(0);
   });
 
   test('a setup-class error routes to the durable setupError notice with an action, not the fading toast (§5)', async () => {

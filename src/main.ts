@@ -16,6 +16,7 @@ import { ObsidianMetadataStore } from './network/obsidian-metadata-store';
 import { ObsidianVaultWatcher } from './network/obsidian-vault-watcher';
 import { VaultCrypto, saltForVault } from './network/encryption';
 import { ServerSyncClient, SyncRoundSummary } from './network/server-sync';
+import { SyncCancelToken } from './network/sync-cancellation';
 import { PhaseTimer, PhaseTimingSink, heapNote } from './network/perf-timer';
 import { KeyMismatchError } from './network/sync-errors';
 import { HttpServerApi } from './network/server-http';
@@ -112,6 +113,12 @@ export default class VaultSyncPlugin extends Plugin {
    *  or null when no push is uploading. Drives a determinate bar in the status modal;
    *  the phase label in {@link syncActivity} carries the same counts as text. */
   private uploadProgress: { uploaded: number; total: number } | null = null;
+  /** Cancellation flag for the in-flight round, or null when no round is running.
+   *  A fresh token per round (created in `runRound`), so a stale "Cancel" click from
+   *  a round that already finished can never affect a later one. Honored only at
+   *  checkpoints before the round starts writing to the local vault
+   *  (sync-cancellation.ts) — cancelling never loses or corrupts data. */
+  private syncCancelToken: SyncCancelToken | null = null;
   /** Aborts the in-flight first-enable capture when the plugin is disabled/unloaded.
    *  The capture walks every vault file (O(F·B) hashing) and can run for minutes on a
    *  large mobile vault; without this it would run to completion after the user has
@@ -285,7 +292,10 @@ export default class VaultSyncPlugin extends Plugin {
     this.ribbonIcon = this.addRibbonIcon(SYNC_ICON_ID, 'OpsBlobs', () => {
       // In the error state the tooltip promises "click for details" — honor that by
       // opening the status modal instead of silently firing another sync (§5).
+      // Mid-round, open the same modal rather than just bouncing with a "already in
+      // progress" notice — that's where the Cancel button lives.
       if (this.ribbonState === 'error') this.openSyncStatus();
+      else if (this.syncInProgress) this.openSyncStatus();
       else void this.triggerSync('manual');
     });
     // Reflect any conflicts left outstanding from a previous session immediately.
@@ -297,6 +307,8 @@ export default class VaultSyncPlugin extends Plugin {
     this.statusBarItem.addClass('mod-clickable');
     this.statusBarItem.addEventListener('click', () => {
       if (this.conflictCount() > 0) void this.activateConflictsView();
+      // Mid-round: open the status modal (where Cancel lives) instead of bouncing.
+      else if (this.syncInProgress) this.openSyncStatus();
       else void this.triggerSync('manual');
     });
     this.updateStatusBar();
@@ -316,6 +328,18 @@ export default class VaultSyncPlugin extends Plugin {
       id: 'sync-now',
       name: 'Sync now',
       callback: () => this.triggerSync('manual'),
+    });
+
+    // Only listed/runnable while a round is actually in flight (checkCallback) —
+    // there's nothing to cancel otherwise.
+    this.addCommand({
+      id: 'cancel-sync',
+      name: 'Cancel sync',
+      checkCallback: (checking) => {
+        if (!this.syncInProgress) return false;
+        if (!checking) this.cancelSync();
+        return true;
+      },
     });
 
     this.addCommand({
@@ -469,8 +493,9 @@ export default class VaultSyncPlugin extends Plugin {
 
   /** Build a ServerSyncClient wired to the real transport + local vault. The plugin
    *  owns this Obsidian-coupled wiring (HttpServerApi/host/progress); shared by the
-   *  sync round and the settings "Test connection" preflight. */
-  private buildSyncClient(): ServerSyncClient {
+   *  sync round and the settings "Test connection" preflight. `cancelToken` is
+   *  omitted for preflight (nothing to cancel) and supplied per-round by `runRound`. */
+  private buildSyncClient(cancelToken?: SyncCancelToken): ServerSyncClient {
     const api = new HttpServerApi({
       baseUrl: this.settings.serverUrl,
       vaultId: this.settings.vaultId,
@@ -506,6 +531,7 @@ export default class VaultSyncPlugin extends Plugin {
       // Per-phase round timings (perf baseline, Layer 3) — `undefined` unless the
       // `perfLog` diagnostic is on, so the client installs no timer by default.
       perfLog: this.perfSink('round'),
+      cancelToken,
     });
   }
 
@@ -679,9 +705,13 @@ export default class VaultSyncPlugin extends Plugin {
   }
 
   /** Build and run one sync round, returning its summary. The coordinator drives
-   *  *when* this runs and what happens around it. */
+   *  *when* this runs and what happens around it. A fresh cancel token is minted
+   *  per round and stashed for `cancelSync()`/the status modal to reach; `triggerSync`
+   *  clears it in its `finally` once the round (and this promise) has settled. */
   private runRound(): Promise<SyncRoundSummary> {
-    return this.buildSyncClient().runSync();
+    const cancelToken = new SyncCancelToken();
+    this.syncCancelToken = cancelToken;
+    return this.buildSyncClient(cancelToken).runSync();
   }
 
   /**
@@ -748,11 +778,16 @@ export default class VaultSyncPlugin extends Plugin {
       // Clear the in-flight activity so the modal's live section settles back.
       this.syncActivity = null;
       this.uploadProgress = null;
+      // Drop this round's cancel token — a stale click after the round has already
+      // settled must not reach a later round (see the field doc).
+      this.syncCancelToken = null;
       // Always leave the 'syncing' ribbon spinner from the *finally*, not the try — so
       // a throw between here and the settle (e.g. in conflictCount) can't strand the
       // ribbon mid-spin. Land on the state the round actually produced: error if it
-      // failed (or threw before returning), conflict if any remain, else idle.
-      if (!outcome || !outcome.ok) this.updateRibbonState('error');
+      // failed (or threw before returning), conflict if any remain, else idle. A
+      // user-requested cancellation is not an error (§ SyncOutcome.cancelled) — it
+      // never touched local data, so it lands on idle/conflict exactly like success.
+      if (!outcome || (!outcome.ok && !outcome.cancelled)) this.updateRibbonState('error');
       else this.updateRibbonState(this.conflictCount() > 0 ? 'conflict' : 'idle');
       this.updateStatusBar();
       // A round can surface NEW two-headed files (the applicator writes markers) or
@@ -904,6 +939,27 @@ export default class VaultSyncPlugin extends Plugin {
    *  a fresh, idle-looking button for work it isn't driving. */
   isSyncing(): boolean {
     return this.syncInProgress || this.startupCaptureInProgress;
+  }
+
+  /** Whether a cancel has already been requested for the in-flight round — read by
+   *  the status modal so its button flips to "Cancelling…" and disables instead of
+   *  re-requesting on every re-render. */
+  isCancelRequested(): boolean {
+    return this.syncCancelToken?.isCancelled ?? false;
+  }
+
+  /** User-requested cancel of the in-flight sync round. A no-op if none is running,
+   *  or if a cancel was already requested. Honored cooperatively at safe checkpoints
+   *  (sync-cancellation.ts) — everything up to the checkpoint is either read-only or
+   *  already-durable/idempotent network state, so this never discards or corrupts
+   *  local data: it just leaves whatever wasn't pushed/pulled yet as pending work for
+   *  the next sync, exactly as if this round had never been triggered. Once the round
+   *  starts writing to the vault, cancellation is no longer honored and the round runs
+   *  to completion, so the vault is never left half-applied. */
+  cancelSync(): void {
+    if (!this.syncCancelToken || this.syncCancelToken.isCancelled) return;
+    this.syncCancelToken.request();
+    new Notice('OpsBlobs: cancelling sync…');
   }
 
   // ─── Auto-sync ──────────────────────────────────────────────────────────────
@@ -1212,6 +1268,8 @@ export default class VaultSyncPlugin extends Plugin {
       onOpenConflicts: () => { void this.activateConflictsView(); },
       onOpenPendingChanges: () => { void this.activatePendingChangesView(); },
       onDismissError: () => { void this.syncState.clearError(); },
+      onCancelSync: () => this.cancelSync(),
+      isCancelRequested: () => this.isCancelRequested(),
     }).open();
   }
 

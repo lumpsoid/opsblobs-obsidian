@@ -26,6 +26,7 @@ import { SyncStateStore, ConflictDescriptor } from './sync-state-store';
 import { SyncRoundSummary } from './server-sync';
 import { DEFER_CONFLICT, DeferConflict } from './sync-applicator';
 import { isSetupError } from './sync-errors';
+import { SyncCancelledError } from './sync-cancellation';
 
 export type SyncSource = 'manual' | 'auto';
 
@@ -35,6 +36,11 @@ export interface SyncOutcome {
   ok: boolean;
   summary?: SyncRoundSummary;
   error?: Error;
+  /** True when `error` is a user-requested cancellation (sync-cancellation.ts), not
+   *  a real failure — the plugin uses this to skip the error toast/ribbon and land
+   *  back on whatever state (idle/conflict) the vault was already in, since a
+   *  cancelled round never touches local data. */
+  cancelled?: boolean;
 }
 
 export interface SyncCoordinatorDeps {
@@ -127,6 +133,16 @@ export class SyncCoordinator {
       return { ok: true, summary };
     } catch (err) {
       const error = err as Error;
+      // A user-requested cancel (sync-cancellation.ts) is not a failure: the round
+      // never reached the local-vault-mutating phase (or ran to completion past it —
+      // either way nothing is lost), so this deliberately skips the error toast and
+      // `syncState.setError` that a real failure gets below. The un-pushed/un-applied
+      // work just sits as pending ops for the next sync, same as if the round had
+      // never been triggered.
+      if (error instanceof SyncCancelledError) {
+        this.notifier.info('Sync cancelled');
+        return { ok: false, error, cancelled: true };
+      }
       console.error('OpsBlobs error:', error);
       // Setup-class failures (auth/vault/passphrase) are the user's to fix and need a
       // durable, actionable surface (§5); transient transport errors self-retry, so a

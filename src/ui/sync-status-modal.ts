@@ -62,6 +62,15 @@ export interface SyncStatusSnapshot {
   /** Dismiss the last error (`syncState.clearError()`). Does not fix the underlying
    *  cause — if the same failure recurs on the next sync, the section reappears. */
   onDismissError: () => void;
+  /** Request cancellation of the in-flight round (shown only while
+   *  {@link getSyncActivity} is non-null). Cooperative — honored at safe checkpoints
+   *  before the round starts writing to the vault (sync-cancellation.ts), so this
+   *  never loses or corrupts local data; it may simply have no visible effect if the
+   *  round has already passed the last checkpoint before this is clicked. */
+  onCancelSync: () => void;
+  /** Whether a cancel was already requested for the in-flight round — read on each
+   *  tick so the button flips to a disabled "Cancelling…" instead of re-firing. */
+  isCancelRequested: () => boolean;
 }
 
 export class SyncStatusModal extends Modal {
@@ -231,6 +240,17 @@ export class SyncStatusModal extends Modal {
       const bar = el.createDiv({ cls: 'vault-sync-indexing-bar' });
       bar.createDiv({ cls: 'vault-sync-indexing-fill vault-sync-indexing-indeterminate' });
     }
+    const cancelling = this.snap.isCancelRequested();
+    new Setting(el)
+      .setDesc(cancelling
+        ? 'Stopping at the next safe point — nothing pushed or applied so far is lost.'
+        : 'Cancelling leaves your data exactly as it is; nothing already synced is undone.')
+      .addButton(btn => {
+        btn.setButtonText(cancelling ? 'Cancelling…' : 'Cancel sync')
+          .setDisabled(cancelling)
+          .setWarning()
+          .onClick(() => this.snap.onCancelSync());
+      });
   }
 
   private rel(ts: number): string {
