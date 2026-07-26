@@ -45,4 +45,12 @@ export class HlcStore {
     }
     await this.metadata.write(HLC_PATH, JSON.stringify(hlc));
   }
+
+  /** Wipe the persisted clock (full local rebuild) — the next `load()` returns
+   *  null, same as a fresh device with no seed. The in-memory clock still needs
+   *  its own reset (`HybridLogicalClock.setCurrent`); this only clears the file
+   *  so a restart doesn't reseed the old value. */
+  async clear(): Promise<void> {
+    if (await this.metadata.exists(HLC_PATH)) await this.metadata.remove(HLC_PATH);
+  }
 }

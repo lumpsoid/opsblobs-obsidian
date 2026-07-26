@@ -838,7 +838,7 @@ export default class VaultSyncPlugin extends Plugin {
       }, resolve).open();
     });
     if (!confirmed) return false;
-    await this.wipeLocalSyncStateForVaultSwitch();
+    await this.wipeLocalSyncState({ resetHlc: false });
     await this.applyVaultKey().catch(err =>
       console.error('OpsBlobs: key derivation failed after vault-binding reset:', err));
     await bindingStore.save(this.settings.vaultId);
@@ -846,16 +846,22 @@ export default class VaultSyncPlugin extends Plugin {
   }
 
   /** Wipe every local sync store that's scoped to a specific server vault — cursor,
-   *  registry, version DAG, and observable sync state — so a vault switch never
-   *  reuses metadata built under a different vaultId's scope. `ContentStore` (hash-
-   *  addressed, vaultId-agnostic) and the HLC (a device-level monotonic clock, F7)
-   *  are deliberately left untouched. */
-  private async wipeLocalSyncStateForVaultSwitch(): Promise<void> {
-    this.opLogger.clearOps();
+   *  registry, version DAG, oplog, and observable sync state. `ContentStore` (hash-
+   *  addressed, vaultId-agnostic) is always left untouched — stale blobs are just
+   *  dead weight, never wrong. The HLC (a device-level monotonic clock, F7) is left
+   *  untouched by default too: a vault switch on the same device must keep issuing
+   *  well-ordered timestamps. `resetHlc` opts into wiping it as well, for a full
+   *  local rebuild where the whole point is to inherit nothing. */
+  private async wipeLocalSyncState(opts: { resetHlc: boolean }): Promise<void> {
+    await this.opLogger.clearOps();
     await this.registry.resetAll();
     await new CursorStore(this.metadata).save(0);
     await new VersionDagStore(this.metadata).clear();
     await this.syncState.resetAll();
+    if (opts.resetHlc) {
+      await this.hlcStore.clear();
+      this.hlc.setCurrent({ wallTime: 0, counter: 0, deviceId: this.settings.deviceId });
+    }
   }
 
   /**
@@ -878,7 +884,7 @@ export default class VaultSyncPlugin extends Plugin {
     const applySwitch = async () => {
       this.settings.vaultId = trimmed;
       await this.saveSettings();
-      await this.wipeLocalSyncStateForVaultSwitch();
+      await this.wipeLocalSyncState({ resetHlc: false });
       await new VaultBindingStore(this.metadata).save(trimmed);
       if (trimmed) {
         await this.applyVaultKey().catch(err =>
@@ -1057,6 +1063,56 @@ export default class VaultSyncPlugin extends Plugin {
         }),
       () => this.triggerSync('manual'),
     );
+  }
+
+  /**
+   * Full local rebuild (last resort, S-rebuild): wipe every local sync store —
+   * oplog, file registry, version DAG, cursor, observable sync state, AND the
+   * logical clock — then re-scan the vault and re-capture every file as a fresh
+   * baseline, exactly as if this were a brand-new device. Unlike "Reset sync
+   * state" (reconciles onto the *existing* registry/DAG) or "Re-baseline" (re-
+   * asserts every file but keeps the existing sync history/cursor/clock), this
+   * discards the local sync history itself — for when *that* is what's suspected
+   * corrupted, not just drifted.
+   *
+   * Still safe, not a blind overwrite: the sync round that follows pulls the full
+   * remote history and does a genuine merge against the rebuilt local state — a
+   * file whose content matches the server converges silently, but one that
+   * actually differs surfaces as an ordinary create/content conflict to resolve
+   * (`resolveCreateCollision` in state-merge.ts), same as any other conflict.
+   * Vault content on this device is never touched.
+   */
+  async rebuildLocalStateFromScratch(): Promise<void> {
+    if (this.syncInProgress || this.startupCaptureInProgress) {
+      new Notice('OpsBlobs: finish the current sync before rebuilding.');
+      return;
+    }
+    if (!this.isServerConfigured()) {
+      this.notifyMissingConfig();
+      return;
+    }
+    const fileCount = this.registry.getActiveEntries().length;
+    const confirmed = await new Promise<boolean>(resolve => {
+      new ConfirmModal(this.app, {
+        title: 'Rebuild everything from scratch?',
+        message:
+          'This discards ALL local sync history on this device — the file registry, version ' +
+          'history, pending changes, sync cursor, and logical clock — and rebuilds it from what ' +
+          'is on disk right now. The next sync then reconciles against the server from a clean ' +
+          'slate: files that match converge silently, and anything that actually differs is ' +
+          'surfaced as a conflict to resolve, never silently overwritten. Use this only if sync ' +
+          `metadata itself seems corrupted — "Reset sync state" above is the gentler fix for most ` +
+          `problems. Vault content on this device is never touched. (${fileCount} file${fileCount !== 1 ? 's' : ''}.)`,
+        confirmText: 'Rebuild everything',
+        warning: true,
+        requireTyped: 'rebuild everything',
+      }, resolve).open();
+    });
+    if (!confirmed) return;
+
+    await this.wipeLocalSyncState({ resetHlc: true });
+    await this.opLogger.captureAllAsBaseline();
+    await this.triggerSync('manual');
   }
 
   /**

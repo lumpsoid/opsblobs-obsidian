@@ -31,6 +31,7 @@ export interface SettingsHost extends Plugin {
   clearContentCache(): Promise<number>;
   resetSyncState(): Promise<void>;
   rebaselineToServer(): Promise<void>;
+  rebuildLocalStateFromScratch(): Promise<void>;
   recheckConflicts(): Promise<void>;
   syncNow(): Promise<void>;
   /** Whether a sync round is currently running — read when the "Sync now" button is
@@ -508,10 +509,10 @@ export class SyncSettingTab extends PluginSettingTab {
         'use to rebuild or recover the server from a device you trust. If another device ' +
         'edited the same file, this device wins. Vault content here is never touched.')
       .addButton(btn => {
-        // The single most dangerous action here (it can overwrite other devices'
-        // edits), so it gets the loud, solid danger style — visibly distinct from the
-        // non-destructive warning buttons above (UX audit §4). The double-confirm is
-        // escalated in the plugin's rebaseline() handler.
+        // Dangerous (it can overwrite other devices' edits), so it gets the loud,
+        // solid danger style — visibly distinct from the non-destructive warning
+        // buttons above (UX audit §4). The double-confirm is escalated in the
+        // plugin's rebaseline() handler.
         btn.setButtonText('Re-baseline').setWarning();
         btn.buttonEl.addClass('vault-sync-danger-btn');
         btn.onClick(async () => {
@@ -520,6 +521,27 @@ export class SyncSettingTab extends PluginSettingTab {
             await this.host.rebaselineToServer();
           } finally {
             btn.setButtonText('Re-baseline').setDisabled(false);
+          }
+        });
+      });
+
+    new Setting(details)
+      .setName('Rebuild everything from scratch')
+      .setDesc('Discard all local sync history — file registry, version history, pending changes, ' +
+        'sync cursor, and logical clock — and rebuild it from the vault as it is right now. Use only ' +
+        'if sync metadata itself seems corrupted; "Reset sync state" above is the gentler fix for most ' +
+        'problems. Vault content is never touched, and anything that actually differs from the server ' +
+        'still surfaces as a conflict rather than being silently overwritten.')
+      .addButton(btn => {
+        // As loud as re-baseline: also discards local history, just more of it.
+        btn.setButtonText('Rebuild everything').setWarning();
+        btn.buttonEl.addClass('vault-sync-danger-btn');
+        btn.onClick(async () => {
+          btn.setDisabled(true);
+          try {
+            await this.host.rebuildLocalStateFromScratch();
+          } finally {
+            btn.setButtonText('Rebuild everything').setDisabled(false);
           }
         });
       });
