@@ -97,7 +97,7 @@ describe('captureOfflineChanges: registry never lags the oplog (§4-Q3 gate)', (
   const seedFiles = async (dev: TestDevice, n: number) => {
     for (let i = 0; i < n; i++) await dev.seedExistingFile(`notes/n-${i}.md`, `body ${i}\n`);
   };
-  const REGISTRY_JOURNAL = '.vault-sync/file-registry.journal';
+  const REGISTRY_JOURNAL = '.opsblobs/file-registry.journal';
 
   const assertNoOrphan = (dev: TestDevice) => {
     for (const op of dev.pendingOps) {

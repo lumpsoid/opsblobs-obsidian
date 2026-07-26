@@ -12,9 +12,9 @@ import { describe, test, expect } from 'vitest';
 import { ContentStore, hashContent } from '../src/core/content-store';
 import { FakeMetadataStore } from './helpers/fakes/metadata-store';
 
-const PACK0 = '.vault-sync/content/pack/0.pack';
-const PACK1 = '.vault-sync/content/pack/1.pack';
-const PACK_INDEX = '.vault-sync/content/pack/index';
+const PACK0 = '.opsblobs/content/pack/0.pack';
+const PACK1 = '.opsblobs/content/pack/1.pack';
+const PACK_INDEX = '.opsblobs/content/pack/index';
 const DAY = 86_400_000;
 const NOW = 1_000_000_000_000;
 
@@ -130,7 +130,7 @@ describe('ContentStore packs — the pack is the only format (spec §2.2)', () =
     await store.put(h, bytes); // durable single edit → buffer + immediate flush
 
     // No loose blob anywhere — not at the old sharded path, and no `.bin` written at all.
-    expect(meta.has(`.vault-sync/content/${h.slice(0, 2)}/${h}.bin`)).toBe(false);
+    expect(meta.has(`.opsblobs/content/${h.slice(0, 2)}/${h}.bin`)).toBe(false);
     expect(writes.some(p => p.endsWith('.bin'))).toBe(false);
     // The blob lives in a pack + the index, and resolves purely from packs cold.
     expect(meta.has(PACK0)).toBe(true);

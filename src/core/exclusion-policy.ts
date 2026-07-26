@@ -9,7 +9,7 @@
 import { SyncSettings } from '../types';
 
 // The plugin's own metadata dir. Always excluded — not user-configurable.
-const VAULT_SYNC_DIR = '.vault-sync/';
+const STATE_DIR = '.opsblobs/';
 
 // This plugin's own install dir under `.obsidian/plugins/`. ALWAYS excluded, even
 // when `syncObsidianConfig` opts the rest of `.obsidian/` in — its `data.json` holds
@@ -32,7 +32,7 @@ const OBSIDIAN_DIR = '.obsidian/';
  * Whether `path` is excluded from sync under the given settings.
  *
  * Order of decisions:
- *  1. `.vault-sync/` — always excluded (invariant).
+ *  1. `.opsblobs/` — always excluded (invariant).
  *  2. This plugin's own `.obsidian/plugins/<id>/` dir — always excluded (holds the
  *     cleartext passphrase + token; must never reach the server), even with config on.
  *  3. `.obsidian/workspace.json` / `workspace-mobile.json` — always excluded.
@@ -44,7 +44,7 @@ export function isExcluded(
   settings: Pick<SyncSettings, 'excludedPatterns' | 'syncObsidianConfig'>,
 ): boolean {
   // (1) Plugin metadata — invariant.
-  if (path.startsWith(VAULT_SYNC_DIR)) return true;
+  if (path.startsWith(STATE_DIR)) return true;
 
   // (2) This plugin's own install dir (secrets in data.json) — invariant, even when
   // syncObsidianConfig opts the rest of `.obsidian/` in.

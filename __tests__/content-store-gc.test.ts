@@ -17,7 +17,7 @@ import { FileEntry, HLC, SyncSettings } from '../src/types';
 import { FakeMetadataStore } from './helpers/fakes/metadata-store';
 import { FakeVaultFiles } from './helpers/fakes/vault-files';
 
-const PACK0 = '.vault-sync/content/pack/0.pack';
+const PACK0 = '.opsblobs/content/pack/0.pack';
 const DAY = 86_400_000;
 const NOW = 1_000_000_000_000; // fixed injected clock
 
@@ -39,7 +39,7 @@ function packSeeder(store: ContentStore, meta: FakeMetadataStore) {
   let seq = 0;
   return async (hash: string, data: string, mtime: number): Promise<void> => {
     await store.put(hash, new TextEncoder().encode(data));
-    meta.setMtime(`.vault-sync/content/pack/${seq++}.pack`, mtime);
+    meta.setMtime(`.opsblobs/content/pack/${seq++}.pack`, mtime);
   };
 }
 
@@ -70,7 +70,7 @@ describe('ContentStore.gc — age-aware retention (pack granularity)', () => {
     await seed('cforphan', 'dead', NOW - 100 * DAY);
 
     // A real registry with one live file whose head descends from bbbase.
-    const REGISTRY_PATH = '.vault-sync/file-registry.json';
+    const REGISTRY_PATH = '.opsblobs/file-registry.json';
     const hlc: HLC = { wallTime: 1, counter: 0, deviceId: 'dev' };
     const live: FileEntry = {
       id: 'a', path: 'note.md', contentHash: 'aahead', hlcTimestamp: hlc,
@@ -115,7 +115,7 @@ describe('ContentStore — put/get/has/delete round-trip (pack-only)', () => {
 
     // Stored in a pack, never a loose `.bin`.
     expect(meta.has(PACK0)).toBe(true);
-    expect(meta.has(`.vault-sync/content/${hash.slice(0, 2)}/${hash}.bin`)).toBe(false);
+    expect(meta.has(`.opsblobs/content/${hash.slice(0, 2)}/${hash}.bin`)).toBe(false);
 
     // A fresh store (empty memCache) must find it purely from the reloaded index.
     const cold = new ContentStore(meta);

@@ -43,7 +43,7 @@ const CAPTURE_PROGRESS_UI_MIN = 500;
 
 /** The perf log (perf baseline, Layer 3). A dotfolder, so effectively unreachable
  *  through the iOS Files app — {@link PerfLogView} surfaces it as an in-app tab. */
-const PERF_LOG_PATH = '.vault-sync/perf-log.txt';
+const PERF_LOG_PATH = '.opsblobs/perf-log.txt';
 
 const SYNC_ICON_ID = 'vault-sync-icon';
 const SYNC_ICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"/></svg>`;
@@ -276,7 +276,7 @@ export default class VaultSyncPlugin extends Plugin {
     // restored leaf of this type re-attaches to a live host.
     this.registerView(CONFLICTS_VIEW_TYPE, leaf => new ConflictsView(leaf, this.conflictsHost()));
     // The perf log viewer (Layer 3) — an in-app tab over the otherwise iOS-unreachable
-    // `.vault-sync/perf-log.txt`. Registered so a restored leaf re-attaches to a live host.
+    // `.opsblobs/perf-log.txt`. Registered so a restored leaf re-attaches to a live host.
     this.registerView(PERF_LOG_VIEW_TYPE, leaf => new PerfLogView(leaf, this.perfLogHost()));
     // The pending-changes panel (status-modal redesign) — full pending/deferred/stranded
     // detail behind the modal's one-line summary. Registered so a restored leaf re-attaches.
@@ -513,7 +513,7 @@ export default class VaultSyncPlugin extends Plugin {
    * A per-phase timing sink for the `perfLog` diagnostic (perf baseline, Layer 3),
    * or `undefined` when the setting is off — so callers install no timer at all and
    * the instrumented code stays inert. Emits each phase to the console and appends a
-   * line to `.vault-sync/perf-log.txt` for a post-hoc read on-device. Fully guarded:
+   * line to `.opsblobs/perf-log.txt` for a post-hoc read on-device. Fully guarded:
    * a diagnostics write must never break a sync.
    */
   private perfSink(scope: string): PhaseTimingSink | undefined {
@@ -1212,7 +1212,7 @@ export default class VaultSyncPlugin extends Plugin {
     }).open();
   }
 
-  /** Open the perf log viewer tab (SettingsHost). The `.vault-sync/perf-log.txt`
+  /** Open the perf log viewer tab (SettingsHost). The `.opsblobs/perf-log.txt`
    *  dotfolder is effectively unreachable on iOS, so the settings button routes here
    *  instead of asking the user to hunt for a hidden file. */
   openPerfLog(): void {

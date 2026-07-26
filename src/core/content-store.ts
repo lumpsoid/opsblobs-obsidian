@@ -4,7 +4,7 @@
 // ---------------------------------------------
 //
 //  Content-addressed storage for ancestor versions and pending content. Every blob
-//  lives in a **pack** — many blobs per file — under `.vault-sync/content/pack/`:
+//  lives in a **pack** — many blobs per file — under `.opsblobs/content/pack/`:
 //  a per-checkpoint `pack/<id>.pack` holds the base64 bodies, and an append-only
 //  `pack/index` maps each hash → {pack, offset, len}. There is ONE on-disk format;
 //  the loose one-file-per-blob layout was removed (unify-on-packs-spec).
@@ -34,7 +34,7 @@ export interface PutPerf {
 // Re-exported so existing importers of these names from content-store keep working.
 export { uint8ToBase64, base64ToUint8 };
 
-const CONTENT_DIR = '.vault-sync/content';
+const CONTENT_DIR = '.opsblobs/content';
 // Packed-blob storage (A3). A first-enable capture buffers blobs and appends them in
 // large per-checkpoint packs; steady-state edits and the sync applicator write through
 // the same buffered path (`put` = buffer + immediate flush). `pack` is NOT a 2-hex

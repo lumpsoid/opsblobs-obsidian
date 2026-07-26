@@ -61,8 +61,8 @@ export interface OplogPerf {
   writeMs: number;      // Σ metadata.append of the delta bytes to the oplog journal at capture checkpoints
 }
 
-const OPLOG_DIR = '.vault-sync';
-const OPLOG_PATH = '.vault-sync/oplog.json';
+const OPLOG_DIR = '.opsblobs';
+const OPLOG_PATH = '.opsblobs/oplog.json';
 
 /** How often `captureOfflineChanges` fires its optional progress callback (every N
  *  files scanned) — perf diagnostics only. */
@@ -152,7 +152,7 @@ export class OperationLogger {
     // torn trailing line from a crash mid-append: a final line that won't parse is dropped
     // (its op simply re-captures next enable — no persisted op references an unwritten
     // blob, since blobs flush before the oplog append). A pre-journal single-array file
-    // (old on-disk format) parses to zero lines and loads empty — `.vault-sync/` is
+    // (old on-disk format) parses to zero lines and loads empty — `.opsblobs/` is
     // disposable (rebuild), so no migration is carried (ground rule §0).
     const raw = await this.metadata.read(OPLOG_PATH);
     const ops: Operation[] = [];

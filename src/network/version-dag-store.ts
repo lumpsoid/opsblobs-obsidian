@@ -21,8 +21,8 @@
 import { MetadataStore } from '../ports/metadata-store';
 import { VersionDag } from '../core/version-dag';
 
-const SNAPSHOT_PATH = '.vault-sync/version-dag.json';
-const JOURNAL_PATH = '.vault-sync/version-dag.log';
+const SNAPSHOT_PATH = '.opsblobs/version-dag.json';
+const JOURNAL_PATH = '.opsblobs/version-dag.log';
 
 /** Compact (fold the journal into a fresh snapshot, then clear it) once the
  *  journal reaches this many appended edges — so the O(N) full rewrite happens
@@ -139,8 +139,8 @@ export class VersionDagStore {
   }
 
   private async ensureDir(): Promise<void> {
-    if (!(await this.metadata.exists('.vault-sync'))) {
-      await this.metadata.mkdir('.vault-sync');
+    if (!(await this.metadata.exists('.opsblobs'))) {
+      await this.metadata.mkdir('.opsblobs');
     }
   }
 }

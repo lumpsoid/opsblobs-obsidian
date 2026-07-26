@@ -255,7 +255,7 @@ describe('C4 — non-atomic pack append is made safe by hash-verify-on-read', ()
   // blob MISSING — so the merge degrades to a conflict (F1) instead of three-way-merging
   // against corrupt content. docs/unify-on-packs-spec.md §3.
 
-  const PACK0 = '.vault-sync/content/pack/0.pack';
+  const PACK0 = '.opsblobs/content/pack/0.pack';
 
   test('a blob whose packed bytes no longer hash to its name reads back as null', async () => {
     const A = await TestDevice.create('dev-a');

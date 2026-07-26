@@ -12,7 +12,7 @@ read your notes and it never merges — all conflict resolution runs **on your d
 
 ## How it works
 
-Each device keeps durable local state under `.vault-sync/` in the vault:
+Each device keeps durable local state under `.opsblobs/` in the vault:
 
 - a **file registry** — a stable UUID for every file, so identity survives renames/moves;
 - a **version DAG** — a commit graph keyed by operation id (a mini-Git for the vault, see
@@ -120,7 +120,7 @@ they share the same key, and a connection test — with a live readiness checkli
 them in.
 
 **This device** — a friendly device name; a Diagnostics panel with the read-only device id, a
-performance-logging toggle, and an in-app perf-log viewer (useful since `.vault-sync/` is
+performance-logging toggle, and an in-app perf-log viewer (useful since `.opsblobs/` is
 unreachable from the iOS Files app).
 
 **Sync** — a sync-status view, a manual "Sync now", an auto-sync interval (0 = manual only), and
@@ -183,7 +183,7 @@ to O(changes-since-last-sync) via append-only journals and batched writes; conte
 a merge is scoped to exactly the bytes that round's merge needs (zero on an already-converged
 round); and blob transfer uses batched fetch/push endpoints instead of one round-trip per file.
 Work is measured in three tiers — relative wall-clock timing on a dev machine, device-independent
-operation/byte counts, and real on-device timing (the in-app perf-log, since `.vault-sync/` isn't
+operation/byte counts, and real on-device timing (the in-app perf-log, since `.opsblobs/` isn't
 reachable from the iOS Files app) — recorded in `docs/perf-baseline-2026-07-23.md` and the
 various `docs/*-optimization-spec.md` documents.
 
@@ -226,7 +226,7 @@ works, why, and the gotchas found along the way.
   **vault passphrase** you set once; TLS protects the connection to the server.
 - Content hashes are **HMAC-blinded** with a vault-derived key before they reach the server, so
   it can deduplicate blobs without learning a plaintext fingerprint.
-- The plugin only reads/writes inside your vault (`.vault-sync/` for its own state) and excludes
+- The plugin only reads/writes inside your vault (`.opsblobs/` for its own state) and excludes
   its own settings file (which holds your passphrase and token in cleartext locally) from sync.
 
 ## License

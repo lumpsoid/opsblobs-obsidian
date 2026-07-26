@@ -12,7 +12,7 @@
 import { describe, test, expect } from 'vitest';
 import { TestDevice } from './helpers/test-device';
 
-const OPLOG = '.vault-sync/oplog.json';
+const OPLOG = '.opsblobs/oplog.json';
 
 /** Wrap a device's `metadata.append` so a test sees the byte-size of each write to
  *  the oplog journal (the O(delta) regression guard needs per-append sizes). */

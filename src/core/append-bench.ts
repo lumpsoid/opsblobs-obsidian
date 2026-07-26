@@ -12,7 +12,7 @@
 //  This can only be answered on the device — the TS adapter just delegates to
 //  `app.vault.adapter.append`, whose cost lives in the native layer. So this module
 //  runs three tiny probes through the real `MetadataStore` port and reports the
-//  numbers `main.ts` writes to `.vault-sync/perf-log.txt`:
+//  numbers `main.ts` writes to `.opsblobs/perf-log.txt`:
 //
 //    A. GROWTH   — append a fixed chunk N times to ONE file. The go/no-go signal:
 //                  if the per-append time of the LAST quartile ≈ the FIRST quartile,
@@ -31,9 +31,9 @@
 import { MetadataStore } from '../ports/metadata-store';
 import { nowMs } from './perf-clock';
 
-/** Scratch directory the probe writes into and wipes afterwards. Under `.vault-sync`
+/** Scratch directory the probe writes into and wipes afterwards. Under `.opsblobs`
  *  so it is excluded from sync and disposable like the rest of the store. */
-const BENCH_DIR = '.vault-sync/bench';
+const BENCH_DIR = '.opsblobs/bench';
 
 export interface AppendBenchParams {
   /** Appends in probe A / writes in probe B. The spec's "append 200× and time it". */

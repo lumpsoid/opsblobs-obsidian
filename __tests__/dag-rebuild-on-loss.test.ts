@@ -2,7 +2,7 @@
 //  Sync v2 — a lost version-DAG self-heals from the server log
 // ─────────────────────────────────────────────
 //
-//  The version-DAG (`.vault-sync/version-dag.json`) is a *derived* cache of the
+//  The version-DAG (`.opsblobs/version-dag.json`) is a *derived* cache of the
 //  server op log, not a source of truth: every edge is `op.id → parents`, and the
 //  server holds every op. So if the file is lost — a torn write on an older build
 //  (pre-atomic-write), or a hand-deleted metadata file — it must be rebuildable by
@@ -24,8 +24,8 @@ import { TestDevice } from './helpers/test-device';
 
 const SALT = new Uint8Array([9, 8, 7, 6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]);
 // The DAG persists as a snapshot + an append-only journal; a genuine loss drops both.
-const DAG_SNAPSHOT = '.vault-sync/version-dag.json';
-const DAG_JOURNAL = '.vault-sync/version-dag.log';
+const DAG_SNAPSHOT = '.opsblobs/version-dag.json';
+const DAG_JOURNAL = '.opsblobs/version-dag.log';
 
 const onDisk = async (d: TestDevice, path = 'note.md'): Promise<string> => {
   const bytes = await d.files.read(path);

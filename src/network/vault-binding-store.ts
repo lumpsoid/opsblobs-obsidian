@@ -3,7 +3,7 @@
 // ─────────────────────────────────────────────
 //
 //  Records which server `vaultId` this device's local sync state (cursor,
-//  registry, version DAG) was last built against, at `.vault-sync/vault-binding.json`.
+//  registry, version DAG) was last built against, at `.opsblobs/vault-binding.json`.
 //  Modeled on cursor-store.ts. Settings carry the *desired* vaultId; this file is
 //  the backstop that lets `triggerSync` notice when the two have drifted apart
 //  (e.g. `data.json` edited or restored outside the "Switch vault" UI flow) and
@@ -13,7 +13,7 @@
 
 import { MetadataStore } from '../ports/metadata-store';
 
-const BINDING_PATH = '.vault-sync/vault-binding.json';
+const BINDING_PATH = '.opsblobs/vault-binding.json';
 
 export class VaultBindingStore {
   constructor(private metadata: MetadataStore) {}
@@ -30,8 +30,8 @@ export class VaultBindingStore {
   }
 
   async save(vaultId: string): Promise<void> {
-    if (!(await this.metadata.exists('.vault-sync'))) {
-      await this.metadata.mkdir('.vault-sync');
+    if (!(await this.metadata.exists('.opsblobs'))) {
+      await this.metadata.mkdir('.opsblobs');
     }
     await this.metadata.write(BINDING_PATH, JSON.stringify({ vaultId }));
   }

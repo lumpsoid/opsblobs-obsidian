@@ -26,7 +26,7 @@ one side should be mirrored here:
   race with `FakeVaultFiles.setListingReady(false)` — `list()` reports empty while
   `read`/`exists` still work.
 - **Persistence survives a restart.** `FakeVaultFiles` (vault bytes) and
-  `FakeMetadataStore` (`.vault-sync/*` JSON: registry, oplog, cursor, HLC,
+  `FakeMetadataStore` (`.opsblobs/*` JSON: registry, oplog, cursor, HLC,
   sync-state) hold the durable state; in-memory device state does not.
   `TestDevice.reload()` rebuilds the stack over the same two fakes to model a
   plugin restart / crash-recovery.

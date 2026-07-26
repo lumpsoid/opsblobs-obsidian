@@ -3,7 +3,7 @@
 // ─────────────────────────────────────────────
 //
 //  The plugin's answer to "what is the current state of sync, and what still
-//  needs my attention?" — persisted at `.vault-sync/sync-state.json` so it
+//  needs my attention?" — persisted at `.opsblobs/sync-state.json` so it
 //  survives restarts. Distinct from the *cursor* (how far we've consumed the
 //  server log): this records the things a normal round would otherwise swallow —
 //  a destructive action deferred because the file drifted mid-round (F5), a
@@ -26,7 +26,7 @@
 
 import { MetadataStore } from '../ports/metadata-store';
 
-const STATE_PATH = '.vault-sync/sync-state.json';
+const STATE_PATH = '.opsblobs/sync-state.json';
 
 /** A merge action the round declined to apply because the file changed on disk during
  *  the sync window (F5): the cursor is held so it re-pulls and re-merges. Retries (and
@@ -134,8 +134,8 @@ export class SyncStateStore {
   }
 
   private async persist(): Promise<void> {
-    if (!(await this.metadata.exists('.vault-sync'))) {
-      await this.metadata.mkdir('.vault-sync');
+    if (!(await this.metadata.exists('.opsblobs'))) {
+      await this.metadata.mkdir('.opsblobs');
     }
     await this.metadata.write(STATE_PATH, JSON.stringify(this.state, null, 2));
   }

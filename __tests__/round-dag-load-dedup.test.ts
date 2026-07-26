@@ -23,8 +23,8 @@ import { FakeSyncServer } from '../src/network/fake-server';
 import { TestDevice } from './helpers/test-device';
 
 const SALT = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8]);
-const DAG_SNAPSHOT = '.vault-sync/version-dag.json';
-const DAG_JOURNAL = '.vault-sync/version-dag.log';
+const DAG_SNAPSHOT = '.opsblobs/version-dag.json';
+const DAG_JOURNAL = '.opsblobs/version-dag.log';
 
 const onDisk = async (d: TestDevice, path: string): Promise<string> => {
   const bytes = await d.files.read(path);

@@ -4,7 +4,7 @@
 // ─────────────────────────────────────────────
 //
 //  Maintains a stable UUID → path mapping so files can be tracked
-//  through renames and moves. Stored at .vault-sync/file-registry.json.
+//  through renames and moves. Stored at .opsblobs/file-registry.json.
 
 import { FileEntry, HLC, SyncSettings } from '../types';
 import { MetadataStore } from '../ports/metadata-store';
@@ -15,14 +15,14 @@ import { nowMs } from './perf-clock';
 import { isExcluded } from './exclusion-policy';
 import { randomUuid } from './encoding';
 
-const REGISTRY_DIR = '.vault-sync';
-const REGISTRY_PATH = '.vault-sync/file-registry.json';
+const REGISTRY_DIR = '.opsblobs';
+const REGISTRY_PATH = '.opsblobs/file-registry.json';
 /** The append-only NDJSON journal of entry mutations since the last snapshot
  *  (docs/registry-append-journal-spec.md §1). Each checkpoint `flush()` appends
  *  only the touched entries here (O(delta)) rather than rewriting the whole
  *  snapshot (O(N)); `compact()` folds it back into {@link REGISTRY_PATH} and
  *  truncates it. Mirrors `ContentStore`'s pack/index journal. */
-const REGISTRY_JOURNAL_PATH = '.vault-sync/file-registry.journal';
+const REGISTRY_JOURNAL_PATH = '.opsblobs/file-registry.journal';
 
 type SerializedRegistry = {
   version: number;

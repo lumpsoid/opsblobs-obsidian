@@ -16,8 +16,8 @@ import { Operation } from '../src/types';
 import { TestDevice } from './helpers/test-device';
 import { FakeMetadataStore } from './helpers/fakes/metadata-store';
 
-const SNAPSHOT = '.vault-sync/version-dag.json';
-const JOURNAL = '.vault-sync/version-dag.log';
+const SNAPSHOT = '.opsblobs/version-dag.json';
+const JOURNAL = '.opsblobs/version-dag.log';
 
 /** Record edges the way the host does: add to the in-memory DAG, journal only the
  *  ones that actually changed it. Returns the DAG so a test can assert topology. */
@@ -174,8 +174,8 @@ describe('VersionDagStore: auto-compaction (deferred coverage)', () => {
     await device.host.recordVersionEdges(ops, await device.host.loadDag());
 
     // Crossed the threshold → the journal was folded into the snapshot and cleared.
-    expect(device.metadata.has('.vault-sync/version-dag.json')).toBe(true);
-    expect(device.metadata.has('.vault-sync/version-dag.log')).toBe(false);
+    expect(device.metadata.has('.opsblobs/version-dag.json')).toBe(true);
+    expect(device.metadata.has('.opsblobs/version-dag.log')).toBe(false);
 
     // …and every recorded edge survives the compaction.
     const dag = await device.versionDagStore.load();

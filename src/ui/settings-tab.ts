@@ -38,7 +38,7 @@ export interface SettingsHost extends Plugin {
    *  mid-round, instead of looking idle for a round it isn't driving. */
   isSyncing(): boolean;
   openSyncStatus(): void;
-  /** Open the in-app perf log viewer tab (the `.vault-sync/perf-log.txt` dotfolder is
+  /** Open the in-app perf log viewer tab (the `.opsblobs/perf-log.txt` dotfolder is
    *  unreachable on iOS, so we surface it as a tab rather than a hidden file). */
   openPerfLog(): void;
 }
@@ -294,7 +294,7 @@ export class SyncSettingTab extends PluginSettingTab {
       .setName('Performance logging')
       .setDesc(
         'Log per-phase timings of each sync round and of startup to the console and ' +
-          '.vault-sync/perf-log.txt. For measuring on-device performance; leave off for ' +
+          '.opsblobs/perf-log.txt. For measuring on-device performance; leave off for ' +
           'everyday use.',
       )
       .addToggle(t => {
@@ -306,11 +306,11 @@ export class SyncSettingTab extends PluginSettingTab {
       });
 
     // Open the log in an in-app tab rather than pointing the user at the file: the
-    // `.vault-sync/` dotfolder is hidden by the iOS Files app and Obsidian's mobile
+    // `.opsblobs/` dotfolder is hidden by the iOS Files app and Obsidian's mobile
     // explorer, so a hidden-file path is a dead end there.
     new Setting(diag)
       .setName('View perf log')
-      .setDesc('Open the captured timings in a tab — readable on mobile without hunting for the hidden .vault-sync folder.')
+      .setDesc('Open the captured timings in a tab — readable on mobile without hunting for the hidden .opsblobs folder.')
       .addButton(btn => {
         btn.setButtonText('View perf log').onClick(() => this.host.openPerfLog());
       });
@@ -442,7 +442,7 @@ export class SyncSettingTab extends PluginSettingTab {
     new Setting(details)
       .addTextArea(ta => {
         ta.setValue(this.settings.excludedPatterns.join('\n'))
-          .setPlaceholder('.obsidian/workspace.json\n.vault-sync/**')
+          .setPlaceholder('.obsidian/workspace.json\n.opsblobs/**')
           .onChange(async v => {
             this.settings.excludedPatterns = v.split('\n').map(s => s.trim()).filter(Boolean);
             await this.save();

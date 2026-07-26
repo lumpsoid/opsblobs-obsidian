@@ -7,7 +7,7 @@
 //
 // Driven through the REAL device stack (TestDevice) over the in-memory fakes.
 // A "restart" is `device.reload()` — a fresh stack over the SAME vault bytes +
-// `.vault-sync/*` metadata, seeded from the persisted HLC, so everything durable
+// `.opsblobs/*` metadata, seeded from the persisted HLC, so everything durable
 // (registry, oplog, cursor, sync-state, logical time) survives and only
 // in-memory-only state is dropped. After a reload the old instance is defunct.
 //
@@ -137,7 +137,7 @@ describe('round interruption & durability (C1–C4)', () => {
     const A = await TestDevice.create('dev-a');
     const B = await TestDevice.create('dev-b');
 
-    // A makes edits but never syncs — the ops sit in .vault-sync/oplog.json only.
+    // A makes edits but never syncs — the ops sit in .opsblobs/oplog.json only.
     await A.seedFile('draft.md', 'unsynced work\n', 1000);
     await A.seedFile('notes.md', 'more unsynced\n', 1000);
     expect(A.pendingOps).toHaveLength(2);

@@ -37,7 +37,7 @@ pointer to the most recent run — never commit those. Override the date with `B
 - **Layer 3 — on-device wall-clock.** The only source of truth for absolute time.
   Turn on the **Performance logging** diagnostic (Settings → Diagnostics, the
   `perfLog` setting), run the matrix on a real phone, and read
-  `.vault-sync/perf-log.txt`. Recorded by hand into the baseline table.
+  `.opsblobs/perf-log.txt`. Recorded by hand into the baseline table.
 
 ## Scenarios (B1–B9)
 

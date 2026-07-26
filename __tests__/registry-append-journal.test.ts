@@ -15,8 +15,8 @@ import { FileEntry, HLC, SyncSettings } from '../src/types';
 import { FakeMetadataStore } from './helpers/fakes/metadata-store';
 import { FakeVaultFiles } from './helpers/fakes/vault-files';
 
-const REGISTRY_PATH = '.vault-sync/file-registry.json';
-const JOURNAL_PATH = '.vault-sync/file-registry.journal';
+const REGISTRY_PATH = '.opsblobs/file-registry.json';
+const JOURNAL_PATH = '.opsblobs/file-registry.journal';
 const hlc: HLC = { wallTime: 1, counter: 0, deviceId: 'dev' };
 
 const settings = (() => ({}) as SyncSettings);

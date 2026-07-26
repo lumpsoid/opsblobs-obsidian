@@ -15,9 +15,9 @@ const settings = (over: Partial<PolicySettings> = {}): PolicySettings => ({
 });
 
 describe('exclusion-policy', () => {
-  test('.vault-sync/ is always excluded', () => {
-    expect(isExcluded('.vault-sync/file-registry.json', settings())).toBe(true);
-    expect(isExcluded('.vault-sync/x', settings({ syncObsidianConfig: true }))).toBe(true);
+  test('.opsblobs/ is always excluded', () => {
+    expect(isExcluded('.opsblobs/file-registry.json', settings())).toBe(true);
+    expect(isExcluded('.opsblobs/x', settings({ syncObsidianConfig: true }))).toBe(true);
   });
 
   test('.obsidian/ files excluded when syncObsidianConfig is false', () => {

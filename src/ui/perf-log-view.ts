@@ -1,8 +1,8 @@
 // ─────────────────────────────────────────────
-//  Perf log viewer — a main-area tab over .vault-sync/perf-log.txt
+//  Perf log viewer — a main-area tab over .opsblobs/perf-log.txt
 // ─────────────────────────────────────────────
 //
-//  The perf log (perf baseline, Layer 3) lives at `.vault-sync/perf-log.txt` — a
+//  The perf log (perf baseline, Layer 3) lives at `.opsblobs/perf-log.txt` — a
 //  dotfolder that is effectively unreachable on iOS, where the Files app hides
 //  dot-prefixed folders and Obsidian's mobile file explorer never shows them. This
 //  ItemView surfaces the file's contents in a first-class tab (not a sidebar drawer —
@@ -113,7 +113,7 @@ export class PerfLogView extends ItemView {
     const confirmed = await new Promise<boolean>(resolve => {
       new ConfirmModal(this.app, {
         title: 'Clear perf log?',
-        message: 'This deletes .vault-sync/perf-log.txt. A new sync or restart starts a fresh log.',
+        message: 'This deletes .opsblobs/perf-log.txt. A new sync or restart starts a fresh log.',
         confirmText: 'Clear',
         warning: true,
       }, resolve).open();

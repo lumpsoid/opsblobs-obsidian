@@ -2,7 +2,7 @@
 //  ObsidianMetadataStore — live MetadataStore implementation
 // ─────────────────────────────────────────────
 //
-//  Wraps `app.vault.adapter` (the `.vault-sync/*` persistence surface). The one
+//  Wraps `app.vault.adapter` (the `.opsblobs/*` persistence surface). The one
 //  place `normalizePath` and the adapter APIs live for metadata reads/writes;
 //  `read`/`list`/`stat` return null/empty on a missing path so callers never
 //  need a try/catch.
@@ -27,7 +27,7 @@ export interface WritePerf {
 
 /** Content-blob path prefix the {@link WritePerf} split is scoped to — so the split
  *  measures only the first-enable blob writes, not the oplog/registry/DAG checkpoints. */
-const CONTENT_PREFIX = '.vault-sync/content/';
+const CONTENT_PREFIX = '.opsblobs/content/';
 
 export class ObsidianMetadataStore implements MetadataStore {
   constructor(private app: App) {}

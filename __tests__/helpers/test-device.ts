@@ -31,7 +31,7 @@ import { FakeVaultWatcher } from './fakes/vault-watcher';
 export interface TestDeviceOptions {
   /** Reuse an existing vault (persisted bytes survive a restart). */
   files?: FakeVaultFiles;
-  /** Reuse existing `.vault-sync/*` metadata (registry/oplog/cursor/HLC survive). */
+  /** Reuse existing `.opsblobs/*` metadata (registry/oplog/cursor/HLC survive). */
   metadata?: FakeMetadataStore;
   /** Seed the HLC from persisted logical time so it can't regress across a restart. */
   seedHlc?: HLC;
@@ -163,7 +163,7 @@ export class TestDevice {
 
   /**
    * Model a plugin restart / crash-recovery: build a NEW device stack over the
-   * SAME vault bytes + `.vault-sync/*` metadata as this one, seeded from the
+   * SAME vault bytes + `.opsblobs/*` metadata as this one, seeded from the
    * persisted HLC. Everything durable (registry, oplog, cursor, sync-state, logical
    * time) survives; all in-memory-only state is dropped — so a test can assert that
    * a round which crashed mid-flight recovers from what actually reached disk.

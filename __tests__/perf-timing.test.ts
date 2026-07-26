@@ -107,7 +107,7 @@ describe('perfLog per-phase timing', () => {
     let oplogAppends = 0;
     const origAppend = dev.metadata.append.bind(dev.metadata);
     dev.metadata.append = async (path: string, data: string) => {
-      if (path === '.vault-sync/oplog.json') oplogAppends++;
+      if (path === '.opsblobs/oplog.json') oplogAppends++;
       return origAppend(path, data);
     };
 
@@ -150,7 +150,7 @@ describe('perfLog per-phase timing', () => {
     const sizes: number[] = [];
     const orig = dev.metadata.append.bind(dev.metadata);
     dev.metadata.append = async (p: string, d: string) => {
-      if (p === '.vault-sync/file-registry.journal') sizes.push(d.length);
+      if (p === '.opsblobs/file-registry.journal') sizes.push(d.length);
       return orig(p, d);
     };
 

@@ -13,7 +13,7 @@ import { FileEntry, HLC, SyncSettings } from '../src/types';
 import { FakeMetadataStore } from './helpers/fakes/metadata-store';
 import { FakeVaultFiles } from './helpers/fakes/vault-files';
 
-const REGISTRY_PATH = '.vault-sync/file-registry.json';
+const REGISTRY_PATH = '.opsblobs/file-registry.json';
 const hlc: HLC = { wallTime: 1, counter: 0, deviceId: 'dev' };
 
 function entry(over: Partial<FileEntry>): FileEntry {

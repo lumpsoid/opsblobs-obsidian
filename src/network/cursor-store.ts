@@ -2,14 +2,14 @@
 //  Cursor persistence  (Phase 2 — moved out of server-http.ts)
 // ─────────────────────────────────────────────
 //
-//  Persists the scalar sync cursor (spec §D3) at `.vault-sync/sync-cursor.json`.
+//  Persists the scalar sync cursor (spec §D3) at `.opsblobs/sync-cursor.json`.
 //  A single integer: the highest server `seq` this device has consumed. `0` means
 //  "seen nothing" — a fresh device replays the whole log. Backed by a
 //  `MetadataStore` port so it's obsidian-free and directly testable.
 
 import { MetadataStore } from '../ports/metadata-store';
 
-const CURSOR_PATH = '.vault-sync/sync-cursor.json';
+const CURSOR_PATH = '.opsblobs/sync-cursor.json';
 
 export class CursorStore {
   constructor(private metadata: MetadataStore) {}
@@ -26,8 +26,8 @@ export class CursorStore {
   }
 
   async save(cursor: number): Promise<void> {
-    if (!(await this.metadata.exists('.vault-sync'))) {
-      await this.metadata.mkdir('.vault-sync');
+    if (!(await this.metadata.exists('.opsblobs'))) {
+      await this.metadata.mkdir('.opsblobs');
     }
     await this.metadata.write(CURSOR_PATH, JSON.stringify({ cursor }));
   }

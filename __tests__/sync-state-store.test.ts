@@ -12,7 +12,7 @@ import { describe, test, expect } from 'vitest';
 import { SyncStateStore } from '../src/network/sync-state-store';
 import { FakeMetadataStore } from './helpers/fakes/metadata-store';
 
-const STATE_PATH = '.vault-sync/sync-state.json';
+const STATE_PATH = '.opsblobs/sync-state.json';
 
 describe('SyncStateStore', () => {
   test('absent file loads as empty state', async () => {

@@ -17,7 +17,7 @@
 //
 //  Then (see the printed hints): push the notes to the device, deploy the plugin
 //  into the same vault (scripts/deploy-android.sh), enable Diagnostics → Performance
-//  logging, open the vault, and read `.vault-sync/perf-log.txt`.
+//  logging, open the vault, and read `.opsblobs/perf-log.txt`.
 
 import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -96,7 +96,7 @@ console.log(`  2. deploy the plugin into that vault (unminified for readable tra
 console.log(`       scripts/deploy-android.sh --build-dev "/sdcard/Documents/PerfVault"`);
 console.log(`  3. on the phone: open the "PerfVault" vault, enable the plugin, then`);
 console.log(`     Settings → Diagnostics → Performance logging = on.`);
-console.log(`  4. trigger scenarios and read \`.vault-sync/perf-log.txt\`:`);
+console.log(`  4. trigger scenarios and read \`.opsblobs/perf-log.txt\`:`);
 console.log(`       • B3 (first-enable capture): happens automatically on first open`);
 console.log(`         → look for the \`startup captureOfflineChanges\` line.`);
 console.log(`       • B1 (steady-state round): edit one note, tap Sync now`);

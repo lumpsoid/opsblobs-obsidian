@@ -224,7 +224,7 @@ export interface SyncSettings {
 
   // ── Diagnostics ─────────────────────────────────────────────────────────
   // Emit per-phase sync-round + startup timings to the console (and a log file
-  // under `.vault-sync/`) for the mobile perf baseline (docs/mobile-perf-baseline-spec.md
+  // under `.opsblobs/`) for the mobile perf baseline (docs/mobile-perf-baseline-spec.md
   // Layer 3). Off by default and fully inert when off — the only production hook
   // is a guarded `performance.now()` bracket that isn't even installed unless this
   // is set. A manual, pre-release on-device measurement aid, not an everyday toggle.
@@ -245,7 +245,7 @@ export const DEFAULT_SETTINGS: SyncSettings = {
     '.obsidian/workspace.json',
     '.obsidian/workspace-mobile.json',
     '.obsidian/cache',
-    '.vault-sync/**',
+    '.opsblobs/**',
     '.git',
     '.git/**',
   ],

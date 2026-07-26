@@ -2,7 +2,7 @@
 //  HLC persistence  (F7 — logical time survives restart)
 // ─────────────────────────────────────────────
 //
-//  Persists this device's current Hybrid Logical Clock at `.vault-sync/hlc.json`
+//  Persists this device's current Hybrid Logical Clock at `.opsblobs/hlc.json`
 //  so locally-issued HLCs stay monotonic across restarts and wall-clock
 //  regressions (NTP corrections, manual changes). On startup the clock is seeded
 //  from the persisted value; `HybridLogicalClock.now()` then takes
@@ -16,7 +16,7 @@
 import { HLC } from '../types';
 import { MetadataStore } from '../ports/metadata-store';
 
-const HLC_PATH = '.vault-sync/hlc.json';
+const HLC_PATH = '.opsblobs/hlc.json';
 
 export class HlcStore {
   constructor(private metadata: MetadataStore) {}
@@ -40,8 +40,8 @@ export class HlcStore {
   }
 
   async save(hlc: HLC): Promise<void> {
-    if (!(await this.metadata.exists('.vault-sync'))) {
-      await this.metadata.mkdir('.vault-sync');
+    if (!(await this.metadata.exists('.opsblobs'))) {
+      await this.metadata.mkdir('.opsblobs');
     }
     await this.metadata.write(HLC_PATH, JSON.stringify(hlc));
   }

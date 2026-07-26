@@ -2,7 +2,7 @@
 //  MetadataStore port  (pure — must not import 'obsidian')
 // ─────────────────────────────────────────────
 //
-//  The narrow surface the sync stack needs for `.vault-sync/*` persistence —
+//  The narrow surface the sync stack needs for `.opsblobs/*` persistence —
 //  today backed by `app.vault.adapter`. `ObsidianMetadataStore` is the live
 //  implementation; a fake `Map`-backed implementation drives the real device
 //  stack in tests. `read` returns null on a missing path (replacing the former

@@ -279,7 +279,7 @@ describe('ServerSyncClient — full round against the fake', () => {
     // same fake. The per-blob `put` did 2 appends (a 1-blob pack + its index line)
     // PER FILE → 2F; buffering + a bounded pack checkpoint (PackCheckpoint) collapses
     // that to 2 appends per flush, at most ceil(F/N) flushes — here one, since F < N.
-    const PACK_DIR = '.vault-sync/content/pack/';
+    const PACK_DIR = '.opsblobs/content/pack/';
     let packAppends = 0;
     const origAppend = deviceB.metadata.append.bind(deviceB.metadata);
     deviceB.metadata.append = async (p: string, d: string) => {

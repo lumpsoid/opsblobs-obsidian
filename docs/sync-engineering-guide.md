@@ -64,7 +64,7 @@ v2 records the structure and **derives** the ancestor.
    - `update` (ordinary edit) → `parents: [prevHeadVersionId]`
    - `merge` (clean auto-merge or human resolution) → `parents: [headA, headB]`
    - `delete` → a tombstone version with `parents: [prevHeadVersionId]`
-3. **The DAG is persisted and accumulated** (`.vault-sync/version-dag.json`): every op
+3. **The DAG is persisted and accumulated** (`.opsblobs/version-dag.json`): every op
    ever authored or pulled contributes its `(versionId → parents, contentHash, fileId)`
    edge. Version-ids/hashes are tiny, so the graph survives content GC.
 4. **A "head" is a leaf** (no child). One head = converged; **two heads = divergence**.
@@ -120,7 +120,7 @@ The single most important structural rule:
 This is what makes the engine unit-testable without a running Obsidian. Layers:
 
 - **Ports** (`src/ports/`) — narrow interfaces the engine depends on:
-  `VaultFiles` (read/write/move/trash), `MetadataStore` (`.vault-sync/*` persistence),
+  `VaultFiles` (read/write/move/trash), `MetadataStore` (`.opsblobs/*` persistence),
   `VaultWatcher` (create/modify/delete/rename events), `EditorSaver` (flush open
   editors), `Notifier` (user-facing toasts).
 - **Obsidian adapters** (`src/network/obsidian-*.ts`) — the *only* place `obsidian` is
@@ -145,12 +145,12 @@ relevant `core`/`merge` unit) with a port for the Obsidian bit.
 | `core/hlc.ts` | Hybrid Logical Clock — total ordering of events across devices; persisted (F7) so logical time never regresses across a wall-clock jump. Also mints each op's id (`hlcToString`). |
 | `core/version-dag.ts` | **The v2 causal graph.** Pure, in-memory DAG of `versionId (op-id) → { parents, contentHash, fileId }`. `isAncestor` / `mergeBase` (LCA, returns `MULTIPLE_BASES` on a criss-cross) / `isMergeNode` (≥2 parents) / `contentHashOf` / `leaves(fileId)` (open heads — 1 = converged, ≥2 = un-reconciled divergence) / `reachableContentHashes` (base-bytes staging + GC keep-set). Acyclic by construction (op-id keys). |
 | `core/file-registry.ts` | The source of truth for file **identity**: UUID → `{path, contentHash, headVersionId, lastSyncedPath, deleted, conflictParents}`. `adoptRemote` converges identity across devices and records the adopted head. `referencedHashes(dag?)` is the content-GC keep-set (live content + DAG-reachable merge bases). |
-| `core/content-store.ts` | Hash → bytes cache (`.vault-sync/content/`). Age-aware GC (`gc(keep, retentionMs, now)`); the keep-set now sees the DAG so reachable merge bases survive (Step 8). |
+| `core/content-store.ts` | Hash → bytes cache (`.opsblobs/content/`). Age-aware GC (`gc(keep, retentionMs, now)`); the keep-set now sees the DAG so reachable merge bases survive (Step 8). |
 | `core/operation-logger.ts` | Watches vault events, debounces edits into ops (each carrying `parents: [prevHead]`), persists the pending oplog, advances `headVersionId`. Cold-start capture (`captureOfflineChanges`), force-push baseline (`captureAllAsBaseline`), and the two-headed → merge-node resolution branch (`flushModify` emits `Ops.merge` when a save removes conflict markers). |
 | `core/operations.ts` | Op factories (`Ops.create/update/delete/move/merge/mergeDelete`) + `mergeVersionId` (deterministic content-addressed `m-` id for merge nodes, commutative in parents). The single catalog of op shapes. |
 | `core/conflict-inventory.ts` | `listTwoHeadedConflicts(entries)` — the *derived* query over `FileEntry.conflictParents` that IS the text-conflict list (with per-head HLC provenance). No hand-maintained set. |
 | `core/conflict-policy.ts` | Pure delete-conflict strategy (`resolveDeleteStrategy`) shared by the merge and the applicator. |
-| `core/exclusion-policy.ts` | Glob-based path exclusion (`.obsidian`, `.vault-sync`, user patterns). |
+| `core/exclusion-policy.ts` | Glob-based path exclusion (`.obsidian`, `.opsblobs`, user patterns). |
 | `merge/state-merge.ts` | **The heart.** Pure `mergeVaultStates(local, remote, dag?) → actions`. Commutative & deterministic. Fast-forward / LCA-base / clean-merge / conflict per file, all from DAG topology (`isUnchangedSinceBase`, `resolveContentConflict`, `resolveCreateCollision`). |
 | `merge/diff3.ts` | Three-way line merge + `resolveConflictChunkLines`; the marker helpers `renderConflictMarkers` / `renderMarkersFromResult` / `hasConflictMarkers` / `parseConflictMarkers` / `resolveMarkedText` / `countMarkerConflicts` (the in-context conflict UX + the panel's compare). |
 | `network/server-sync.ts` | `ServerSyncClient.runSync()` — orchestrates one round (build→pull→fetch→push→**record DAG edges**→merge→apply→**reconcile concurrent heads**→cursor). Obsidian-free; driven by fakes in tests. Also `reconstructRemoteState`, `reconcileConcurrentHeads` (the multi-head sweep — see `docs/multi-head-reconciliation.md`), and `safeCursor`. |
@@ -158,7 +158,7 @@ relevant `core`/`merge` unit) with a port for the Obsidian bit.
 | `network/vault-sync-host.ts` | `PluginVaultSyncHost` — bridges the obsidian-free round to the live stores. `buildLocalIdentity` snapshots entries + pending ops with the A1 stat-gate hash correction and **no** O(vault) byte staging; `stageContent(state, hashes)` fills the content store for exactly the hashes the round scopes (A2). |
 | `network/version-dag-store.ts` | Persists the `VersionDag` incrementally: a compacted snapshot (`version-dag.json`) + an append-only JSONL journal (`version-dag.log`) of edges since. A round `appendEdges` only its *new* edges (O(delta)); the O(N) full rewrite is deferred to `compact()` past a threshold. Defensive `load()` = snapshot ⊕ journal-replay, tolerant of a missing/corrupt snapshot and a torn trailing journal line. |
 | `network/sync-coordinator.ts` | Obsidian-free orchestration: the capture→round→record sequence, delete/binary conflict decisions (always defer to the panel; consume a `pendingDecision` when present — §3 "full inline"), reset/rebaseline. `deferredConflictCount()` is a derived per-round count (no badge bookkeeping). |
-| `network/sync-state-store.ts` | The **observable** sync state (`.vault-sync/sync-state.json`): `deferred` files (each `reason: 'drift' \| 'conflict'`), `stranded` content, last error, last-round summary. No outstanding-conflict set (retired in Step 7). |
+| `network/sync-state-store.ts` | The **observable** sync state (`.opsblobs/sync-state.json`): `deferred` files (each `reason: 'drift' \| 'conflict'`), `stranded` content, last error, last-round summary. No outstanding-conflict set (retired in Step 7). |
 | `network/cursor-store.ts` / `hlc-store.ts` | Scalar cursor + persisted HLC. |
 | `network/encryption.ts` | `VaultCrypto` — passphrase-derived key, op/blob envelopes, blinded content hashes (unlinkable dedup). |
 | `network/server-http.ts` / `fake-server.ts` | Real HTTP `ServerApi` vs in-memory fake (contract-tested to be equivalent). `HttpServerApi` bounds every `requestUrl` with `withTimeout` and maps each transport outcome to the typed error family (401/403→auth, 404→not-found, 5xx→server, no-response→network). |

@@ -5,7 +5,7 @@
 //  The bench's *numbers* are only meaningful on the device (the in-memory fake has
 //  no flash latency). These tests pin the harness's CORRECTNESS: it issues the right
 //  I/O shape, computes the summary fields, and — critically — leaves NO scratch files
-//  behind (a leak would pollute `.vault-sync` on a real vault).
+//  behind (a leak would pollute `.opsblobs` on a real vault).
 
 import { describe, test, expect } from 'vitest';
 import { runAppendBench, formatAppendBench } from '../src/core/append-bench';
@@ -31,7 +31,7 @@ describe('append-bench harness', () => {
     expect(r.packed.perChunkAvgMs).toBeCloseTo(r.packed.totalMs / params.chunks, 6);
 
     // No scratch files survive — every bench path is removed in the `finally`.
-    const leaked = await meta.list('.vault-sync/bench');
+    const leaked = await meta.list('.opsblobs/bench');
     expect(leaked).toEqual([]);
   });
 
