@@ -107,6 +107,11 @@ export class SyncSettingTab extends PluginSettingTab {
       .setName('Vault ID')
       .setDesc('Identifies this vault on the server. Use the same value on every device. ' +
         'Changing it switches which vault this device syncs against — click "Switch vault" to apply.')
+      // Name/desc stay on their own line, then the input+button drop to a line of their
+      // own (vault-sync-setting-wrap below) — on narrow/mobile widths the default
+      // side-by-side layout squeezes the text input down to a sliver, so short values
+      // are unreadable while typing.
+      .then(s => s.settingEl.addClass('vault-sync-setting-wrap'))
       .addText(t => {
         t.setValue(this.settings.vaultId)
           .setPlaceholder('my-notes')

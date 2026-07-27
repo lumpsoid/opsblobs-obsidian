@@ -11,6 +11,19 @@
 .vault-sync-binary-side { flex: 1 1 40%; min-width: 0; padding: 0.4rem 0.6rem; border: 1px solid var(--background-modifier-border); border-radius: 6px; background: var(--background-primary-alt); }
 .vault-sync-binary-side-meta { font-size: 0.78rem; color: var(--text-muted); overflow-wrap: anywhere; }
 
+/* Settings — Vault ID: name/desc on their own line, input+button dropped to a line of
+   their own beneath (title, subtitle, input+button = 3 lines). The default Setting
+   layout puts name/desc and controls side by side, which squeezes the text input down
+   to a sliver on mobile/tablet widths — too narrow to read even a single typed symbol. */
+.vault-sync-setting-wrap { flex-wrap: wrap; }
+.vault-sync-setting-wrap > .setting-item-info { flex-basis: 100%; }
+.vault-sync-setting-wrap > .setting-item-control {
+  flex-basis: 100%;
+  margin-top: 0.5rem;
+  justify-content: stretch;
+}
+.vault-sync-setting-wrap > .setting-item-control input[type='text'] { flex: 1 1 auto; min-width: 0; }
+
 /* Type-to-confirm gate for the most dangerous action (UX audit §4) */
 .vault-sync-confirm-input { width: 100%; margin: 0.25rem 0 0.5rem; font-family: var(--font-monospace); }
 
