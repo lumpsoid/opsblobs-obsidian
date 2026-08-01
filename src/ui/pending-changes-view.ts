@@ -6,8 +6,10 @@
 //  ("12 pending · 2 deferred · 1 waiting on content"); this ItemView, opened as a
 //  main-area tab (mirroring ConflictsView/PerfLogView), is where the full detail
 //  behind that line lives:
-//    - Pending: every local edit not yet pushed, one row per file, color-coded by
-//      the op's type (create/update/delete/move) instead of a plain path string.
+//    - Pending: every local edit not yet pushed, one row per *op* (a file saved
+//      three times is three rows), color-coded by the op's type
+//      (create/update/delete/move) instead of a plain path string, and ordered
+//      oldest-first by HLC so the list reads as the changes happened.
 //    - Deferred: F5 on-disk-drift files, retried automatically — path list + the
 //      explanation of why nothing needs doing.
 //    - Stranded: content stranded waiting on a blob (F3) — count only, since these
@@ -15,7 +17,8 @@
 //  Obsidian glue only; no sync-engine decisions live here.
 
 import { ItemView, WorkspaceLeaf } from 'obsidian';
-import { OperationType } from '../types';
+import { HLC, OperationType } from '../types';
+import { hlcCompare } from '../core/hlc';
 import { DeferredFile } from '../network/sync-state-store';
 
 export const PENDING_CHANGES_VIEW_TYPE = 'vault-sync-pending-changes';
@@ -23,6 +26,11 @@ export const PENDING_CHANGES_VIEW_TYPE = 'vault-sync-pending-changes';
 export interface PendingOpRow {
   path: string;
   type: OperationType;
+  /** The op's HLC — the sort key for the list. Carried per row (rather than the
+   *  view trusting the host's array order) so the ordering is the view's own
+   *  guarantee: `pendingOps` is appended chronologically, but offline capture and
+   *  journal reload build it in scan/line order, which is not the same thing. */
+  hlcTimestamp: HLC;
 }
 
 /** The narrow surface the view needs from the plugin — keeps it decoupled from
@@ -77,7 +85,12 @@ export class PendingChangesView extends ItemView {
 
     root.createEl('h3', { text: 'Pending changes' });
 
-    const ops = [...this.host.listPendingOps()].sort((a, b) => a.path.localeCompare(b.path));
+    // Oldest first, newest at the bottom: the list should read as the changes
+    // happened. Sorting by path instead would scatter a single editing session
+    // across the alphabet, and split one file's history in two whenever a move
+    // rewrote its path mid-session (a move records the new path, while that
+    // file's earlier pending ops still carry the old one).
+    const ops = [...this.host.listPendingOps()].sort((a, b) => hlcCompare(a.hlcTimestamp, b.hlcTimestamp));
     const deferred = this.host.listDeferred();
     const stranded = this.host.strandedCount();
 

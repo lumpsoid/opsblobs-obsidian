@@ -1323,7 +1323,8 @@ export default class VaultSyncPlugin extends Plugin {
    *  exactly when pending/deferred/stranded counts can have moved. */
   private pendingChangesHost(): PendingChangesViewHost {
     return {
-      listPendingOps: () => this.opLogger.getPendingOps().map(op => ({ path: op.path, type: op.type })),
+      listPendingOps: () => this.opLogger.getPendingOps()
+        .map(op => ({ path: op.path, type: op.type, hlcTimestamp: op.hlcTimestamp })),
       listDeferred: () => this.syncState.get().deferred,
       strandedCount: () => this.syncState.get().stranded.length,
       onChange: (cb) => {
