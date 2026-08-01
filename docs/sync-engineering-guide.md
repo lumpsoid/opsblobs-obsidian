@@ -287,6 +287,14 @@ docs.
   cursor held — the in-flight edit is never overwritten.
 - **F7 — HLC persistence.** Logical time is persisted per-op and on shutdown so a
   wall-clock regression can't rewind below an already-issued timestamp.
+- **F8 — an apply action that throws is isolated, not fatal.** The applicator catches
+  per action, adds the fileId to `deferred` (so `safeCursor` holds the cursor and the
+  op re-pulls) and continues, so an unforeseen failure on one file can't skip the
+  remaining actions or the post-loop `updateSyncedPaths` / resolution re-emit / F5
+  recapture. Failures ride the round summary as `applyFailures` and the coordinator
+  records them as the round's error — a held-and-retried file must never *look* like
+  it is healing itself when it isn't. Past `MAX_ACTION_FAILURES` the round rethrows:
+  a systemic fault must still fail loudly. See §7's reorganization incident.
 
 **Tombstones are a bounded local cache, not the record of a delete.** `markDeleted` only
 flips `deleted = true`, so the entry set used to grow with the vault's *lifetime* file
@@ -511,6 +519,37 @@ test; the *classes* are what to watch for.
   base still degrades to a conflict (F1), never a union. See
   `docs/build-local-state-perf-spec.md` and `scoped-content-staging.test.ts`.
 
+- **Folders are not synced entities, and one throwing action used to wedge the vault
+  (real-world incident).** A vault reorganized on device A — many files moved into
+  newly-created folders — replicated to B as `move_local` actions into directories B
+  had never created. `ObsidianVaultFiles.move` called `fileManager.renameFile`
+  *without* the `ensureDir` its sibling `write` has always done, and Obsidian rejects
+  a rename into a missing parent ("The parent object of the destination does not
+  exist"). Whether it bit at all was **apply-order luck**: any `write_local` into the
+  same folder ran `ensureDir` first and made every later move there succeed — which
+  is why earlier reorganizations synced fine and a moves-and-deletes-only round did
+  not. Two distinct fixes, because there were two distinct bugs:
+  1. *The adapter.* `move` now ensures the destination's parent, mirroring `write`;
+     the `VaultFiles` port doc states the requirement. **Folders exist only as
+     parents of files — the op log never carries a "create folder", so any path a
+     remote op names may be a directory this device has never seen.**
+  2. *The applicator.* The throw escaped the action loop, so every later action was
+     skipped, `updateSyncedPaths` / the resolution re-emit / the F5 recapture never
+     ran, and the vault was left half-applied — while the (correctly) held cursor made
+     the next round replay the identical list and fail at the identical spot, forever.
+     The loop now isolates a throwing action: defer that fileId (cursor held, re-pulls
+     next round) and carry on, reporting it in the round's `applyFailures` so a
+     *permanent* failure surfaces as an error rather than an ever-retrying deferral.
+     `MAX_ACTION_FAILURES` still rethrows for a systemic fault (disk full, permissions
+     revoked), where every action fails and a "completed" round would be misleading.
+     Pinned by `apply-action-failure-isolation.test.ts`.
+  **Lesson — the blast radius of an unexpected error is a design decision, not an
+  accident.** Deferral machinery already existed for exactly this shape (F5 drift):
+  routing an unforeseen failure into it costs one file, while letting it propagate
+  costs the whole round *and* re-costs it every round after. And the general trap:
+  when one method of a port guarantees a precondition (`write` → parent dir), check
+  every sibling that needs the same one — the fakes can't catch adapter asymmetries,
+  so that check is a review-time habit (`__tests__/helpers/fakes/README.md`).
 - **Live watcher during a sync round vs. the startup-scan dirty-tracker — same surface, different mechanism.** A proposal to detach the `VaultWatcher` during a sync round and reconcile with a post-round rescan (mirroring the startup-capture fix) was considered and rejected. F5's drift guard (`driftedSinceSnapshot`, `sync-applicator.ts:410`) is a direct disk-hash check performed at apply time — it doesn't depend on the watcher being attached, so detaching it buys no extra safety. And propagation to a peer always waits for the *next* round regardless of when the edit is captured, since this round's push list is already snapshotted at `buildLocalIdentity` (step 1) before the edit happens — so detaching buys no extra speed either. It would only reintroduce an O(vault) rescan into the steady-state round, exactly what A2/A3 spent effort removing. The startup offline-changes scan is different in kind: it runs *before* `startListening()` ever attaches a watcher, so an edit landing in that window has **nothing** observing it at all — not a slower path to capture, an absent one. That's the real gap `captureOfflineChangesAndReconcile`'s disposable dirty-tracker closes (`docs/startup-capture-live-edits-spec.md`). **Lesson:** before generalizing a fix to a similar-looking window, check whether the two cases share the actual failure mode (nothing is observing) or just the surface shape (an edit lands during a slow scan) — same shape can still mean a different mechanism and a different verdict.
 
 Meta-lesson across all of them: **the dangerous failures are silent** — an edit that

@@ -45,6 +45,20 @@ one side should be mirrored here:
   sweeps the 256 known shard prefixes and lists each. `FakeMetadataStore` defaults
   to a permissive recursive prefix match; flip `listMode = 'one-level'` to pin
   behavior against the real device semantics (see `content-store-gc.test.ts`).
+- **`VaultFiles.move` must create the destination's parent folder** — the same
+  guarantee `write` gives. **Folders are not synced entities:** the op log carries
+  file moves only, so a peer that reorganized its vault into a *new* folder
+  replicates `move`s into a directory this device has never created. Obsidian's
+  `fileManager.renameFile` does **not** mkdir — it rejects with "The parent object of
+  the destination does not exist" — so `ObsidianVaultFiles.move` `ensureDir`s the
+  destination first, mirroring `write`. `FakeVaultFiles`' flat map has no folders, so
+  **the fake cannot catch a regression here** (it is a manual-smoke/device concern,
+  like the `mkdir` item below). What the fake *does* pin is the engine's tolerance of
+  the failure: `failNextOn(path, message)` arms a one-shot throw on `move`/`write`/
+  `trash` so `apply-action-failure-isolation.test.ts` can assert that one throwing
+  action defers only its own file instead of aborting the round. This asymmetry —
+  one method ensuring a precondition its siblings don't — is worth re-checking
+  whenever the port grows a method.
 - **`MetadataStore.write` does not auto-mkdir parents.** A caller writing into a
   not-yet-created subdirectory must `mkdir` it first (`ContentStore.put` ensures the
   shard dir once per shard per session). The fake's `mkdir` is a no-op (dirs are

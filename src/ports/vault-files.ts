@@ -28,7 +28,11 @@ export interface VaultFiles {
   read(path: string): Promise<Uint8Array | null>;
   /** Create-or-modify the file, ensuring its parent directory exists. */
   write(path: string, content: Uint8Array): Promise<void>;
-  /** Move/rename a file (was `fileManager.renameFile`); no-op if absent. */
+  /** Move/rename a file (was `fileManager.renameFile`); no-op if absent.
+   *  Like {@link write}, this MUST ensure `toPath`'s parent directory exists —
+   *  folders are not synced entities, so a peer's reorganization replicates as
+   *  moves into directories this device has never created. Obsidian's raw
+   *  `renameFile` rejects instead of creating them. */
   move(fromPath: string, toPath: string): Promise<void>;
   /** Move the file to trash (was `vault.trash(file, true)`); no-op if absent. */
   trash(path: string): Promise<void>;

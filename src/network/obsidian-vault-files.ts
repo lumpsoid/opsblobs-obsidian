@@ -52,9 +52,22 @@ export class ObsidianVaultFiles implements VaultFiles {
 
   async move(fromPath: string, toPath: string): Promise<void> {
     const file = this.app.vault.getAbstractFileByPath(normalizePath(fromPath));
-    if (file) {
-      await this.app.fileManager.renameFile(file, normalizePath(toPath));
+    if (!file) return;
+    const normalized = normalizePath(toPath);
+    // Ensure the DESTINATION's parent directory exists — same guarantee `write`
+    // gives, and for the same reason. Folders are not synced entities: the op log
+    // carries file moves only, so a peer that reorganized its vault into a NEW
+    // folder replicates `move`s into a directory this device has never created.
+    // `renameFile` does not mkdir — it rejects with "The parent object of the
+    // destination does not exist", which aborted the whole apply and wedged the
+    // round on every retry (the reorganization-sync incident). Whether it bit at
+    // all was pure apply-order luck: any `write_local` into the same folder ran
+    // `ensureDir` first and made every later move there succeed.
+    const parts = normalized.split('/');
+    if (parts.length > 1) {
+      await this.ensureDir(parts.slice(0, -1).join('/'));
     }
+    await this.app.fileManager.renameFile(file, normalized);
   }
 
   async trash(path: string): Promise<void> {

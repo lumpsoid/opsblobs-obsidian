@@ -44,6 +44,23 @@ interface PendingResolution {
   deleted?: boolean;
 }
 
+/** An action that threw while being applied. The file is deferred (so its remote op
+ *  re-pulls next round) and this rides the round summary up to the observable
+ *  sync-state, so a *permanently* failing action reads as an error rather than as a
+ *  file quietly claiming it will retry itself. */
+export interface ApplyFailure {
+  fileId: string;
+  path: string;
+  actionType: MergeAction['type'];
+  message: string;
+}
+
+/** How many actions may fail before the apply gives up and rethrows. Past this the
+ *  fault is systemic (disk full, permissions revoked, vault unmounted) rather than
+ *  one awkward file, and grinding through thousands of throwing actions to defer
+ *  every one of them buys nothing — the round should fail loudly instead. */
+const MAX_ACTION_FAILURES = 20;
+
 export class SyncApplicator {
   constructor(
     private files: VaultFiles,
@@ -60,21 +77,25 @@ export class SyncApplicator {
   ) {}
 
   /**
-   * Apply the round's merge actions to the vault. Returns two sets of fileIds:
+   * Apply the round's merge actions to the vault. Returns two sets of fileIds plus
+   * the per-action failures:
    *  · `deferred` — a destructive action was *skipped* because the file drifted on
-   *    disk since the snapshot (F5) or an auto-round deferred a conflict (S5); the
-   *    caller holds the cursor so those remote ops re-pull and re-merge next round.
+   *    disk since the snapshot (F5), an auto-round deferred a conflict (S5), or the
+   *    action *threw* (see `failures`); the caller holds the cursor so those remote
+   *    ops re-pull and re-merge next round.
    *  · `deferredConflicts` — the subset of `deferred` that is an auto-deferred
    *    delete/binary *conflict* (needs a manual sync to resolve), as opposed to F5
    *    drift (which retries automatically). The plugin tags these `reason:'conflict'`
    *    in the observable state so the badge/status reflects them — the derived
    *    replacement for the old hand-maintained outstanding-conflict set (Step 7).
+   *  · `failures` — actions that threw an *unexpected* error (see the isolation
+   *    note on the apply loop). Surfaced so the round can report them loudly.
    */
   async applyActions(
     actions: MergeAction[],
     localState: VaultState,
     remoteState: VaultState,
-  ): Promise<{ deferred: Set<string>; deferredConflicts: Set<string> }> {
+  ): Promise<{ deferred: Set<string>; deferredConflicts: Set<string>; failures: ApplyFailure[] }> {
     // Pause op logging while we apply sync changes (we don't want to re-log them)
     this.opLogger.stopListening();
 
@@ -100,6 +121,9 @@ export class SyncApplicator {
     // The subset of `deferred` that is an auto-deferred delete/binary conflict
     // (not F5 drift) — surfaced with reason 'conflict' by the plugin (Step 7).
     const deferredConflicts = new Set<string>();
+    // Actions that threw. Each is deferred (cursor held) and reported; see the
+    // isolation rationale on the loop below.
+    const failures: ApplyFailure[] = [];
 
     // Bounded pack flushing shared with the capture path (pack-checkpoint.ts): the
     // applicator buffers each pulled blob via `putBuffered` (no per-blob I/O) and this
@@ -113,8 +137,39 @@ export class SyncApplicator {
     try {
       try {
         for (const action of actions) {
-          const resolved = await this.applyAction(action, localState, remoteState, deferred, deferredConflicts);
-          if (resolved) resolutions.push(resolved);
+          // ── Per-action isolation ────────────────────────────────────────────
+          // An unexpected throw here used to abort the WHOLE apply: every later
+          // action was skipped, `updateSyncedPaths` and the resolution/F5-recapture
+          // re-emits below never ran, and the vault was left half-applied — while
+          // the held cursor made the next round replay the identical action list
+          // and fail at the identical spot. One bad action wedged the vault
+          // permanently (the reorganization-sync incident: a `move_local` into a
+          // folder Obsidian wouldn't create).
+          //
+          // So treat an unexpected error exactly like an F5 drift: skip THIS file,
+          // defer it (holding the cursor, so its remote op re-pulls and re-merges
+          // next round against real state) and carry on with the rest. Nothing is
+          // dropped or overwritten — the same guarantee the abort gave — but a
+          // localized failure now costs one file instead of the whole vault.
+          //
+          // Deliberately *not* silent: `failures` rides the round summary up to the
+          // observable sync-state so a permanent failure surfaces as an error, not
+          // as a file that quietly claims it will retry (guide §7: loud beats
+          // silent). The `MAX_ACTION_FAILURES` bail preserves the loud abort for a
+          // *systemic* fault (disk full, permissions revoked, vault unmounted),
+          // where every action throws and deferring all of them one by one would be
+          // both pointless and indistinguishable from a healthy round.
+          try {
+            const resolved = await this.applyAction(action, localState, remoteState, deferred, deferredConflicts);
+            if (resolved) resolutions.push(resolved);
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            const path = localState.fileEntries.get(action.fileId)?.path ?? action.fileId;
+            console.error(`OpsBlobs: failed to apply ${action.type} for ${path} — ${message}`, err);
+            deferred.add(action.fileId);
+            failures.push({ fileId: action.fileId, path, actionType: action.type, message });
+            if (failures.length > MAX_ACTION_FAILURES) throw err;
+          }
           await checkpoint.tick();
         }
       } finally {
@@ -185,7 +240,7 @@ export class SyncApplicator {
       await this.registry.compact({ now: this.now(), pinned });
     }
 
-    return { deferred, deferredConflicts };
+    return { deferred, deferredConflicts, failures };
   }
 
   private async applyAction(

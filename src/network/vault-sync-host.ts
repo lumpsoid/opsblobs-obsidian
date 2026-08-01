@@ -15,7 +15,7 @@ import { FileRegistry } from '../core/file-registry';
 import { ContentStore, hashContent } from '../core/content-store';
 import { OperationLogger } from '../core/operation-logger';
 import { dedupeOpsById } from '../core/operations';
-import { SyncApplicator } from './sync-applicator';
+import { SyncApplicator, ApplyFailure } from './sync-applicator';
 import { HybridLogicalClock } from '../core/hlc';
 import { CursorStore } from './cursor-store';
 import { VersionDagStore, EdgeRecord } from './version-dag-store';
@@ -205,7 +205,7 @@ export class PluginVaultSyncHost implements VaultSyncHost {
     return served;
   }
 
-  async applyMerge(actions: MergeAction[], local: VaultState, remote: VaultState): Promise<{ deferred: Set<string>; deferredConflicts: Set<string> }> {
+  async applyMerge(actions: MergeAction[], local: VaultState, remote: VaultState): Promise<{ deferred: Set<string>; deferredConflicts: Set<string>; failures: ApplyFailure[] }> {
     return this.applicator.applyActions(actions, local, remote);
   }
 

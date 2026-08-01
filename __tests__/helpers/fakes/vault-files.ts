@@ -59,14 +59,32 @@ export class FakeVaultFiles implements VaultFiles {
 
   async write(path: string, content: Uint8Array): Promise<void> {
     this.io.writes++;
+    this.throwIfArmed(path);
     this.io.bytesWritten += content.length;
     // Every write advances the file's mtime (a fresh monotonic tick), so the
     // capture stat-gate re-hashes it next pass; an unwritten file keeps its mtime.
     this.files.set(path, { content, mtime: ++this.clock });
   }
 
+  /** Test hook: make the next `move`/`write`/`trash` of `path` throw. Models an
+   *  adapter-level failure the engine cannot anticipate — Obsidian rejecting a
+   *  rename into a folder it won't create, a permissions error, a locked file. The
+   *  engine must isolate it (defer that one file, hold the cursor) rather than let
+   *  it abort the whole apply; see `apply-action-failure-isolation.test.ts`. */
+  failNextOn(path: string, message: string): void {
+    this.failures.set(path, message);
+  }
+  private failures = new Map<string, string>();
+  private throwIfArmed(path: string): void {
+    const message = this.failures.get(path);
+    if (message === undefined) return;
+    this.failures.delete(path);
+    throw new Error(message);
+  }
+
   async move(fromPath: string, toPath: string): Promise<void> {
     this.io.renames++;
+    this.throwIfArmed(toPath);
     const f = this.files.get(fromPath);
     if (f === undefined) return;
     // A move preserves content *and* mtime (a rename isn't a content change).
@@ -76,6 +94,7 @@ export class FakeVaultFiles implements VaultFiles {
 
   async trash(path: string): Promise<void> {
     this.io.removes++;
+    this.throwIfArmed(path);
     this.files.delete(path);
   }
 
