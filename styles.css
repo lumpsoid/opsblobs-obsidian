@@ -97,6 +97,19 @@ a.vault-sync-notice-link { display: inline-block; margin-top: 0.4rem; text-decor
 .vault-sync-conflicts-header h3 { margin: 0 0 0.25rem; }
 .vault-sync-conflicts-count { color: var(--text-muted); font-size: 0.85rem; margin-bottom: 1rem; }
 .vault-sync-conflicts-empty { display: flex; justify-content: center; padding: 1.5rem; color: var(--text-muted); }
+
+/* List-scope bulk bar: the per-file side pickers widened to every text conflict, plus
+   one "Apply all". Sits above the cards so it reads as acting on all of them. */
+.vault-sync-conflicts-bulk { display: flex; gap: 0.4rem; flex-wrap: wrap; align-items: center; margin-bottom: 1rem; }
+.vault-sync-conflicts-bulk-label { color: var(--text-muted); font-size: 0.85rem; font-weight: 600; margin-right: 0.2rem; }
+
+/* Resolved cards stay listed (frozen, dimmed) until the tab is left, so the list never
+   reflows under the pointer mid-resolution. */
+.vault-sync-conflicts-resolved-note { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; margin-bottom: 1rem; color: var(--text-muted); font-size: 0.85rem; }
+.vault-sync-conflict-card.is-resolved { opacity: 0.55; }
+.vault-sync-conflict-card.is-resolved .vault-sync-pane { cursor: default; }
+.vault-sync-conflict-resolved-badge { margin-top: 0.4rem; font-size: 0.78rem; font-weight: 600; color: var(--text-success); }
+
 .vault-sync-conflict-card { border: 1px solid var(--background-modifier-border); border-radius: 8px; margin-bottom: 1rem; overflow: hidden; }
 .vault-sync-conflict-card-header { padding: 0.6rem 0.75rem; background: var(--background-secondary); }
 .vault-sync-conflict-path { display: flex; align-items: center; gap: 0.4rem; font-weight: 600; overflow-wrap: anywhere; word-break: break-word; }
@@ -175,10 +188,12 @@ a.vault-sync-notice-link { display: inline-block; margin-top: 0.4rem; text-decor
      The conflict/confirm modal buttons get the same treatment so a phone tap can't
      miss. */
   .vault-sync-conflict-global,
+  .vault-sync-conflicts-bulk,
   .vault-sync-hunk-actions,
   .vault-sync-conflict-actions,
   .confirm-modal-buttons { gap: 0.6rem; }
   .vault-sync-conflict-global button,
+  .vault-sync-conflicts-bulk button,
   .vault-sync-hunk-actions button,
   .vault-sync-conflict-actions button,
   .confirm-modal-buttons button {
