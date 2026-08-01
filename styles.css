@@ -102,6 +102,12 @@ a.vault-sync-notice-link { display: inline-block; margin-top: 0.4rem; text-decor
    one "Apply all". Sits above the cards so it reads as acting on all of them. */
 .vault-sync-conflicts-bulk { display: flex; gap: 0.4rem; flex-wrap: wrap; align-items: center; margin-bottom: 1rem; }
 .vault-sync-conflicts-bulk-label { color: var(--text-muted); font-size: 0.85rem; font-weight: 600; margin-right: 0.2rem; }
+/* The decisions bar's consequence line — what applying the current picks will do. Reads
+   as prose next to the button, which is why it isn't bolded like the label. */
+.vault-sync-conflicts-bulk-summary { color: var(--text-muted); font-size: 0.85rem; margin-right: 0.2rem; }
+/* "Picked — waiting to apply" on a delete/binary card: the highlight alone would read as
+   already-applied, so the state is spelled out until the round commits it. */
+.vault-sync-conflict-pick-hint { align-self: center; color: var(--text-accent); font-size: 0.8rem; font-weight: 600; }
 
 /* Resolved cards stay listed (frozen, dimmed) until the tab is left, so the list never
    reflows under the pointer mid-resolution. */
