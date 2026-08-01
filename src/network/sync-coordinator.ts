@@ -30,6 +30,28 @@ import { SyncCancelledError } from './sync-cancellation';
 
 export type SyncSource = 'manual' | 'auto';
 
+/** How often the content-store GC runs at most (once a day). The retention window
+ *  itself is `ancestorRetentionDays` (a setting); this is just how often we bother to
+ *  *check* it. A day is far below the shortest sensible retention, so nothing ages out
+ *  meaningfully late, and it keeps the DAG load + per-pack stat off all but one round. */
+export const GC_MIN_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Is a content-store GC due? Pure so the schedule is assertable without a round.
+ *
+ * `null` (this device has never run one) is deliberately **not** due: the very first
+ * round after enabling the plugin follows the first-enable capture — the heaviest pass
+ * the plugin has — and nothing captured minutes ago can have aged past the retention
+ * window anyway. The caller seeds `lastGcAt` instead, so the first real GC lands one
+ * interval later. A `lastGcAt` in the future (the device clock moved backwards) counts
+ * as due rather than wedging the schedule until the clock catches up.
+ */
+export function gcDue(lastGcAt: number | null, now: number, intervalMs: number): boolean {
+  if (lastGcAt === null) return false;
+  const elapsed = now - lastGcAt;
+  return elapsed >= intervalMs || elapsed < 0;
+}
+
 /** The result of a round, so the plugin can drive the ribbon (idle/conflict/error)
  *  without the coordinator knowing anything about Obsidian UI. */
 export interface SyncOutcome {
@@ -60,6 +82,13 @@ export interface SyncCoordinatorDeps {
   /** Open the plugin's settings tab — attached to the durable notice a setup-class
    *  error raises (§5), so the toast is actionable. Optional — omitted in tests. */
   openSettings?: () => void;
+  /** Garbage-collect the content store down to the retention window, returning how many
+   *  blobs went away. Called at most once per {@link GC_MIN_INTERVAL_MS} after a
+   *  successful round; the plugin wires the same body the settings "Clear cache" button
+   *  uses. Optional — omitted → the schedule never fires. */
+  runGc?: () => Promise<number>;
+  /** Override for {@link GC_MIN_INTERVAL_MS} (tests). */
+  gcIntervalMs?: number;
   /** Wall clock, injected for deterministic tests. Defaults to Date.now. */
   now?: () => number;
 }
@@ -75,6 +104,8 @@ export class SyncCoordinator {
   private readonly persistHlc: () => Promise<void>;
   private readonly markSynced: () => Promise<void>;
   private readonly openSettings?: () => void;
+  private readonly runGc?: () => Promise<number>;
+  private readonly gcIntervalMs: number;
   private readonly now: () => number;
 
   /** Delete/binary conflict descriptors accumulated by the `decide*` handlers while
@@ -93,6 +124,8 @@ export class SyncCoordinator {
     this.persistHlc = deps.persistHlc ?? (async () => {});
     this.markSynced = deps.markSynced ?? (async () => {});
     this.openSettings = deps.openSettings;
+    this.runGc = deps.runGc;
+    this.gcIntervalMs = deps.gcIntervalMs ?? GC_MIN_INTERVAL_MS;
     this.now = deps.now ?? (() => Date.now());
   }
 
@@ -130,6 +163,9 @@ export class SyncCoordinator {
       await this.markSynced();
 
       if (source === 'manual') this.notifier.info('Sync complete');
+      // Maintenance, after the round is fully recorded and the user has been told it
+      // finished: nothing below this point can change the round's outcome.
+      await this.maybeRunGc();
       return { ok: true, summary };
     } catch (err) {
       const error = err as Error;
@@ -159,6 +195,36 @@ export class SyncCoordinator {
       await this.syncState.setError(error.message, this.now());
       return { ok: false, error };
     }
+  }
+
+  /**
+   * Run the content-store GC if the interval has elapsed, then stamp the clock. This is
+   * the ONLY thing that enforces `ancestorRetentionDays` unattended — without it the
+   * window is advisory: packs keep every superseded version, and the pack index (re-read
+   * in full at every startup) grows for the life of the vault.
+   *
+   * Runs *inside* the round, after it has settled: the plugin's `syncInProgress` guard
+   * is still held, so a GC — which rewrites the pack index — can never overlap a round
+   * or the manual "Clear cache" button. It also means a failure here is never allowed to
+   * fail the round: GC is opportunistic, and the next round retries it.
+   */
+  private async maybeRunGc(): Promise<void> {
+    if (!this.runGc) return;
+    const now = this.now();
+    const lastGcAt = this.syncState.get().lastGcAt;
+    if (!gcDue(lastGcAt, now, this.gcIntervalMs)) {
+      // Never run on this device → seed the window rather than GC right after the
+      // first-enable capture (see `gcDue`). Otherwise it simply isn't due yet.
+      if (lastGcAt === null) await this.syncState.setLastGcAt(now);
+      return;
+    }
+    try {
+      await this.runGc();
+    } catch (err) {
+      console.error('OpsBlobs: content-store GC failed:', err);
+    }
+    // Stamped even on failure: a GC that throws every round must not retry every round.
+    await this.syncState.setLastGcAt(now);
   }
 
   /** Delete/binary conflicts awaiting a decision in the Conflicts panel — a *derived*

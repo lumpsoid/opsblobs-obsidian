@@ -125,6 +125,11 @@ export default class VaultSyncPlugin extends Plugin {
    *  already disabled the plugin. Tripped in `onunload`, checked at the top of the
    *  capture loop, which then persists its partial progress and returns early. */
   private captureAbort = new AbortController();
+  /** True while a content-store GC is running. GC rewrites the pack index, so it must
+   *  never overlap itself or a sync round. The scheduled GC runs inside `triggerSync`
+   *  (so `syncInProgress` already covers it against rounds); this flag is what stops the
+   *  settings "Clear cache" button from starting a second one on top of it. */
+  private gcInProgress = false;
 
   /** Subscribers (the conflicts panel) to notify when the two-headed set may have
    *  changed — an op recorded/cleared, or a sync round finished. `opLogger.onChange`
@@ -235,6 +240,7 @@ export default class VaultSyncPlugin extends Plugin {
       registry: this.registry,
       runRound: () => this.runRound(),
       openSettings: () => this.openSettings(),
+      runGc: () => this.runContentGc(),
       persistHlc: () => this.hlcStore.save(this.hlc.getCurrent()),
       markSynced: async () => {
         this.settings.lastSyncTime = Date.now();
@@ -988,19 +994,41 @@ export default class VaultSyncPlugin extends Plugin {
 
   // ─── Maintenance (wired from settings) ───────────────────────────────────────
 
-  /** Garbage-collect the content store down to what the registry still
-   *  references (live content + the DAG-reachable merge bases of each live head).
-   *  Returns the count removed. The version-DAG's parent links are retained
-   *  separately (and are tiny), so a base whose bytes are GC'd only degrades a deep
-   *  merge to a conflict — never data loss. */
+  /** Settings "Clear cache" button — the manual escape hatch for the same GC the
+   *  coordinator now schedules after a round (see `maybeRunGc`). Refuses while a round
+   *  is in flight rather than racing it: the scheduled GC runs *inside* a round, and GC
+   *  rewrites the pack index. Returns the count removed (0 when it declined). */
   async clearContentCache(): Promise<number> {
-    const dag = await new VersionDagStore(this.metadata).load();
-    const keep = this.registry.referencedHashes(dag);
-    const before = (await this.contentStore.listHashes()).length;
-    const retentionMs = this.settings.ancestorRetentionDays * 86_400_000;
-    await this.contentStore.gc(keep, retentionMs, Date.now());
-    const after = (await this.contentStore.listHashes()).length;
-    return before - after;
+    if (this.syncInProgress || this.startupCaptureInProgress) {
+      new Notice('OpsBlobs: finish the current sync before clearing the cache.');
+      return 0;
+    }
+    return this.runContentGc();
+  }
+
+  /** Garbage-collect the content store down to what the registry still
+   *  references (live content + the DAG-reachable merge bases of each live head),
+   *  honouring `ancestorRetentionDays`. Returns the count removed. The version-DAG's
+   *  parent links are retained separately (and are tiny), so a base whose bytes are
+   *  GC'd only degrades a deep merge to a conflict — never data loss.
+   *
+   *  Single-flight ({@link gcInProgress}): two concurrent passes would both rewrite the
+   *  pack index from their own in-memory view, and the loser's retirements would be
+   *  resurrected on the next load. */
+  private async runContentGc(): Promise<number> {
+    if (this.gcInProgress) return 0;
+    this.gcInProgress = true;
+    try {
+      const dag = await new VersionDagStore(this.metadata).load();
+      const keep = this.registry.referencedHashes(dag);
+      const before = (await this.contentStore.listHashes()).length;
+      const retentionMs = this.settings.ancestorRetentionDays * 86_400_000;
+      await this.contentStore.gc(keep, retentionMs, Date.now());
+      const after = (await this.contentStore.listHashes()).length;
+      return before - after;
+    } finally {
+      this.gcInProgress = false;
+    }
   }
 
   /**

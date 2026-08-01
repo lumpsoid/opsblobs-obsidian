@@ -91,10 +91,17 @@ export interface SyncState {
   stranded: StrandedContent[];
   lastError: { message: string; at: number } | null;
   lastSync: SyncRoundSummaryRecord | null;
+  /** When the content-store GC last ran (ms epoch), or null if it never has on this
+   *  device. The retention window is only enforced when something actually calls
+   *  `ContentStore.gc()`, so the coordinator runs it opportunistically after a round
+   *  and stamps this — see `gcDue` in sync-coordinator.ts. Bookkeeping, not something
+   *  the user is asked to act on; it lives here because this is the state the
+   *  coordinator already loads and persists once per round. */
+  lastGcAt: number | null;
 }
 
 function emptyState(): SyncState {
-  return { deferred: [], conflicts: [], pendingDecisions: {}, stranded: [], lastError: null, lastSync: null };
+  return { deferred: [], conflicts: [], pendingDecisions: {}, stranded: [], lastError: null, lastSync: null, lastGcAt: null };
 }
 
 export class SyncStateStore {
@@ -126,6 +133,7 @@ export class SyncStateStore {
         stranded: Array.isArray(parsed.stranded) ? parsed.stranded : [],
         lastError: parsed.lastError ?? null,
         lastSync: parsed.lastSync ?? null,
+        lastGcAt: typeof parsed.lastGcAt === 'number' ? parsed.lastGcAt : null,
       };
     } catch {
       this.state = emptyState();
@@ -181,6 +189,14 @@ export class SyncStateStore {
     return this.state.pendingDecisions[fileId];
   }
 
+  /** Stamp the content-store GC clock (ms epoch). Written both when a GC actually ran
+   *  and when the coordinator seeds the window on a device that has never run one, so
+   *  the "never" case can't re-trigger every round. */
+  async setLastGcAt(at: number): Promise<void> {
+    this.state.lastGcAt = at;
+    await this.persist();
+  }
+
   async setError(message: string, at: number): Promise<void> {
     this.state.lastError = { message, at };
     await this.persist();
@@ -196,7 +212,8 @@ export class SyncStateStore {
   /** Wipe back to a clean empty state (vault-switch guard) — every field here is
    *  keyed by fileIds/paths from a registry/DAG that a vault switch also resets,
    *  so a stale `deferred`/`conflicts`/`pendingDecisions` entry would reference
-   *  state that no longer exists. */
+   *  state that no longer exists. `lastGcAt` goes with them — it isn't vault-scoped,
+   *  but losing it only re-seeds the GC window (one deferred GC), never data. */
   async resetAll(): Promise<void> {
     this.state = emptyState();
     await this.persist();

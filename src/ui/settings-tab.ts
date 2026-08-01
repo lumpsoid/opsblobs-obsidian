@@ -467,6 +467,7 @@ export class SyncSettingTab extends PluginSettingTab {
     new Setting(details)
       .setName('Clear sync cache')
       .setDesc('Remove content-store blobs the registry no longer references. ' +
+        'Runs on its own about once a day after a sync; this button runs it now. ' +
         'Safe — only affects three-way merge quality, not vault content.')
       .addButton(btn => {
         // No warning styling: its own description says it's safe (merge-quality only,
