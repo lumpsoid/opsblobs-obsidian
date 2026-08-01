@@ -1311,13 +1311,19 @@ export default class VaultSyncPlugin extends Plugin {
       describeDevice: (deviceId) =>
         deviceId === this.settings.deviceId ? 'this device' : `device ${deviceId.slice(0, 6)}`,
       // Delete/binary conflicts (§3 "full inline"): the panel lists the round's
-      // descriptors and resolves them by recording a decision the next sync consumes.
+      // descriptors and resolves them by recording decisions the next sync consumes.
       listDeleteBinaryConflicts: () => this.syncState.get().conflicts,
-      resolveDeleteBinary: async (fileId, decision) => {
-        await this.syncState.recordDecision(fileId, decision);
-        // The recorded decision is applied by the next round's applicator (mints the
-        // merge node). Trigger it now so the resolution lands promptly; the finally
-        // block's emitConflictChange refreshes the panel once the entry is gone.
+      // The panel batches: it hands over every pick at once and we record them all
+      // before triggering a single round. One round per decision would be wrong — a
+      // round is exclusive, so the second call onward would hit `syncInProgress`, bail
+      // with "Sync already in progress", and leave those decisions sitting until some
+      // later round picked them up. The applicator consumes every pending decision in
+      // the one pass (each mints its merge node); the finally block's
+      // emitConflictChange refreshes the panel once the entries are gone.
+      applyDeleteBinaryDecisions: async (picks) => {
+        for (const { fileId, decision } of picks) {
+          await this.syncState.recordDecision(fileId, decision);
+        }
         await this.triggerSync('manual');
       },
       onChange: (cb) => {

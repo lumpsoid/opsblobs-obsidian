@@ -12,11 +12,16 @@
 //  resolving save (a modify event → the op-logger's two-headed branch → the two-parent
 //  merge node). Manual-smoke surface per the engineering guide.
 //
-//  Two list-level affordances sit above the cards:
+//  Three list-level affordances sit above the cards:
+//    • a **decisions bar** — the commit point for the delete/binary cards. Those still
+//      take an explicit inline choice per card (§3 of the UX audit), but a tap only
+//      *picks*; this bar records every pick and runs the one sync round that applies
+//      them. Batched because a round is exclusive: applying card-by-card bounced every
+//      tap after the first off "Sync already in progress".
 //    • a **bulk bar** — the per-file "All mine / All theirs / Keep both" pickers widened
 //      to *every* text conflict, plus one "Apply all" that writes them in a single
-//      confirmed pass. Delete/binary cards are deliberately excluded: §3 of the UX audit
-//      makes an explicit inline choice the only way those resolve.
+//      confirmed pass. Text conflicts only — those resolve by writing the file, not by
+//      recording a decision a round consumes.
 //    • a **sticky list** — a card resolved while the tab is open stays in place, frozen
 //      and dimmed, instead of vanishing and reflowing every card below it under the
 //      pointer. Resolved cards clear when the user leaves the tab (or on "Clear
@@ -38,9 +43,10 @@ export interface ConflictsViewHost {
   listConflicts(): ConflictListItem[];
   /** Delete/binary conflicts awaiting a decision (persisted descriptors, §3). */
   listDeleteBinaryConflicts(): ConflictDescriptor[];
-  /** Record the user's inline decision for a delete/binary conflict and apply it (the
-   *  next sync round consumes it and mints the merge node). */
-  resolveDeleteBinary(fileId: string, decision: ConflictDecision): Promise<void>;
+  /** Record every picked delete/binary decision and run ONE sync round that applies them
+   *  all (each mints its merge node). Batched deliberately: a round per card would
+   *  serialise behind the in-progress flag and strand every decision after the first. */
+  applyDeleteBinaryDecisions(picks: DeleteBinaryPick[]): Promise<void>;
   /** Current on-disk text of a tracked file (its marked working copy), or null. */
   readFile(path: string): Promise<string | null>;
   /** Write the resolved (marker-free) text — the Step-5 resolving save. */
@@ -52,6 +58,12 @@ export interface ConflictsViewHost {
   /** Subscribe to "conflicts may have changed" (an op recorded, a round finished);
    *  returns an unsubscribe. */
   onChange(cb: () => void): () => void;
+}
+
+/** One delete/binary card's picked decision, ready to record. */
+export interface DeleteBinaryPick {
+  fileId: string;
+  decision: ConflictDecision;
 }
 
 type SelectionKind = 'local' | 'remote' | 'both';
@@ -73,6 +85,9 @@ export class ConflictsView extends ItemView {
   /** Per-file, per-hunk choice. Kept across re-renders so a spurious refresh (an op
    *  recorded elsewhere) doesn't discard an in-progress selection. */
   private selections = new Map<string, Map<number, SelectionKind>>();
+  /** Per-file delete/binary pick, by fileId. Purely local until "Apply decisions" —
+   *  same contract as {@link selections}, so a stray tap on a card can never write. */
+  private decisions = new Map<string, ConflictDecision>();
   /** Files whose resolved-result preview is expanded. Tracked (like {@link selections})
    *  so the preview survives the re-render every side-pick triggers and updates live. */
   private previewOpen = new Set<string>();
@@ -86,6 +101,9 @@ export class ConflictsView extends ItemView {
   private renderToken = 0;
   /** True while a bulk apply is in flight — keeps a second click from re-firing it. */
   private applyingAll = false;
+  /** True while the delete/binary round is in flight — same re-fire guard, and what
+   *  stops a second batch queueing up behind a sync that's already running. */
+  private applyingDecisions = false;
 
   constructor(leaf: WorkspaceLeaf, private host: ConflictsViewHost) {
     super(leaf);
@@ -112,6 +130,7 @@ export class ConflictsView extends ItemView {
     this.order = [];
     this.snapshots.clear();
     this.selections.clear();
+    this.decisions.clear();
     this.previewOpen.clear();
   }
 
@@ -163,6 +182,7 @@ export class ConflictsView extends ItemView {
     const kept = new Set(this.order);
     for (const id of [...this.selections.keys()]) if (!kept.has(textKey(id))) this.selections.delete(id);
     for (const id of [...this.previewOpen]) if (!kept.has(textKey(id))) this.previewOpen.delete(id);
+    for (const id of [...this.decisions.keys()]) if (!kept.has(dbKey(id))) this.decisions.delete(id);
 
     root.empty();
     root.addClass('vault-sync-conflicts-view');
@@ -180,6 +200,16 @@ export class ConflictsView extends ItemView {
       setIcon(root.createDiv('vault-sync-conflicts-empty'), 'check-circle-2');
       return;
     }
+
+    // The decisions bar comes first: delete/binary cards sort to the top of a first
+    // paint, and applying them is the one action here that costs a sync round. It shows
+    // for a single card too — it is the *only* way a decision gets written.
+    const liveDb = this.order
+      .filter(key => live.has(key))
+      .map(key => this.snapshots.get(key))
+      .filter((s): s is Extract<CardSnapshot, { kind: 'db' }> => s?.kind === 'db')
+      .map(s => s.descriptor);
+    if (liveDb.length > 0) this.renderDecisionsBar(root, liveDb);
 
     // The bulk bar acts on the live text conflicts that actually still hold markers.
     const bulk = this.order
@@ -233,6 +263,64 @@ export class ConflictsView extends ItemView {
       .setTooltip('Write the current picks for every file above, in one pass.')
       .setDisabled(this.applyingAll)
       .onClick(() => { void this.applyAll(targets); });
+  }
+
+  /** List-scope bar for the delete/binary cards: how many are picked, what applying them
+   *  will do, and the single button that records the picks and runs the one round that
+   *  applies them. No per-card apply exists on purpose — each round is exclusive
+   *  (`syncInProgress`), so a card-at-a-time apply would bounce every tap after the
+   *  first off "Sync already in progress" and leave those cards looking hung.
+   *
+   *  The summary line stands in for a confirm modal: the consequence is spelled out
+   *  right beside the button, and no version is actually lost (the other side stays in
+   *  the sync history), so a second dialog would be friction without a payoff. */
+  private renderDecisionsBar(root: HTMLElement, live: ConflictDescriptor[]): void {
+    const picks = this.picksFor(live);
+    const bar = root.createDiv('vault-sync-conflicts-bulk');
+    bar.createSpan({
+      cls: 'vault-sync-conflicts-bulk-label',
+      text: `${picks.length}/${live.length} deleted & binary picked:`,
+    });
+    bar.createSpan({
+      cls: 'vault-sync-conflicts-bulk-summary',
+      text: picks.length === 0
+        ? 'Choose on each card below — nothing is written until you apply.'
+        : summarisePicks(picks),
+    });
+
+    new ButtonComponent(bar)
+      .setButtonText(decisionsButtonLabel(this.applyingDecisions, picks.length))
+      .setCta()
+      .setTooltip('Record every pick above and run one sync round that applies them all.')
+      .setDisabled(this.applyingDecisions || picks.length === 0)
+      .onClick(() => { void this.applyDecisions(picks); });
+  }
+
+  /** The picked decisions among the live delete/binary cards, in list order. */
+  private picksFor(live: ConflictDescriptor[]): DeleteBinaryPick[] {
+    const picks: DeleteBinaryPick[] = [];
+    for (const c of live) {
+      const decision = this.decisions.get(c.fileId);
+      if (decision) picks.push({ fileId: c.fileId, decision });
+    }
+    return picks;
+  }
+
+  /** Record every pick and run the single applying round. The picks are kept afterwards
+   *  (not dropped) so a frozen card keeps showing what was chosen — same rule as the
+   *  text cards' hunk selections. */
+  private async applyDecisions(picks: DeleteBinaryPick[]): Promise<void> {
+    if (picks.length === 0 || this.applyingDecisions) return;
+    this.applyingDecisions = true;
+    void this.render();
+    try {
+      await this.host.applyDeleteBinaryDecisions(picks);
+    } catch {
+      new Notice(`Could not apply ${picks.length} decision${picks.length !== 1 ? 's' : ''} — they stay picked; try again.`);
+    } finally {
+      this.applyingDecisions = false;
+      void this.render(); // drop "Applying…" even if the round threw
+    }
   }
 
   /** The "held in place" explainer for resolved-but-still-listed cards, so a frozen card
@@ -299,9 +387,11 @@ export class ConflictsView extends ItemView {
     window.setTimeout(() => this.refresh(), 400);
   }
 
-  /** A delete/binary conflict card: one decision, resolved inline (§3 "full inline").
-   *  Recording a choice triggers a sync that applies it; once it lands the card stays,
-   *  frozen, until the tab is left. */
+  /** A delete/binary conflict card: one decision, picked inline (§3 "full inline").
+   *  Tapping a side only *records the pick locally* — the same contract as the text
+   *  cards' hunk pickers, so a stray tap writes nothing and picking on several cards in
+   *  a row never blocks. The decisions bar above the list is what commits them, in one
+   *  round. Once that lands the card stays, frozen, until the tab is left. */
   private renderDecisionCard(root: HTMLElement, c: ConflictDescriptor, frozen: boolean): void {
     const card = root.createDiv(`vault-sync-conflict-card${frozen ? ' is-resolved' : ''}`);
     const head = card.createDiv('vault-sync-conflict-card-header');
@@ -321,10 +411,12 @@ export class ConflictsView extends ItemView {
     }
     const actions = card.createDiv('vault-sync-conflict-actions');
 
-    const resolve = (decision: ConflictDecision) => {
-      // Optimistically disable the whole card while the applying round runs.
-      disableButtons(actions);
-      void this.host.resolveDeleteBinary(c.fileId, decision);
+    const picked = this.decisions.get(c.fileId);
+    /** A side button: highlights when it holds the pick, and only ever sets local state. */
+    const picker = (label: string, decision: ConflictDecision, tooltip: string) => {
+      const b = new ButtonComponent(actions).setButtonText(label).setTooltip(tooltip)
+        .onClick(() => { this.decisions.set(c.fileId, decision); void this.render(); });
+      if (picked?.decision === decision.decision) b.setCta();
     };
 
     if (c.kind === 'delete') {
@@ -334,20 +426,31 @@ export class ConflictsView extends ItemView {
         `${deletedHere ? 'another device' : 'this device'}. Keep the deletion, or restore the ` +
         'modified version?',
       );
-      new ButtonComponent(actions).setButtonText('Keep modified version').setCta()
-        .onClick(() => resolve({ kind: 'delete', decision: 'keep_modified' }));
-      new ButtonComponent(actions).setButtonText('Keep deleted')
-        .onClick(() => resolve({ kind: 'delete', decision: 'keep_deleted' }));
+      picker('Keep modified version', { kind: 'delete', decision: 'keep_modified' },
+        'Restore the file with the modified content. Nothing is written until you apply.');
+      picker('Keep deleted', { kind: 'delete', decision: 'keep_deleted' },
+        'Let the deletion stand. Nothing is written until you apply.');
     } else {
       body.setText('Changed on two devices at once. Binary files can\'t be merged — keep one whole ' +
         'version (the other stays in the sync history and can be recovered later).');
-      new ButtonComponent(actions).setButtonText("Keep this device's version").setCta()
-        .onClick(() => resolve({ kind: 'binary', decision: 'keep_local' }));
-      new ButtonComponent(actions).setButtonText("Keep other device's version")
-        .onClick(() => resolve({ kind: 'binary', decision: 'keep_remote' }));
+      picker("Keep this device's version", { kind: 'binary', decision: 'keep_local' },
+        'Nothing is written until you apply.');
+      picker("Keep other device's version", { kind: 'binary', decision: 'keep_remote' },
+        'Nothing is written until you apply.');
     }
 
-    if (frozen) disableButtons(actions);
+    // A picked-but-uncommitted card says so, so the highlight can't read as "done" — the
+    // one state the old one-tap-per-card flow left ambiguous.
+    if (picked && !frozen) {
+      actions.createSpan({
+        cls: 'vault-sync-conflict-pick-hint',
+        text: this.applyingDecisions ? 'Applying…' : 'Picked — waiting to apply.',
+      });
+    }
+
+    // A frozen card's decision is already applied; the applying round owns every pick
+    // until it settles, so neither may be re-tapped.
+    if (frozen || this.applyingDecisions) disableButtons(actions);
   }
 
   /** The one marker that says a card is history, not work. Colour + word (no glyph). */
@@ -524,6 +627,30 @@ export class ConflictsView extends ItemView {
     if (!s) { s = new Map(); this.selections.set(fileId, s); }
     return s;
   }
+}
+
+/** The decisions-bar button label — the count is in the label so the button itself says
+ *  how much it is about to do. */
+function decisionsButtonLabel(applying: boolean, n: number): string {
+  if (applying) return 'Applying…';
+  if (n === 0) return 'Apply decisions';
+  return `Apply ${n} decision${n !== 1 ? 's' : ''}`;
+}
+
+/** Plain-language consequence of the current picks ("1 deletion, 2 restored") — what
+ *  stands in for a confirm dialog on the decisions bar. */
+function summarisePicks(picks: DeleteBinaryPick[]): string {
+  let deleted = 0, restored = 0, binary = 0;
+  for (const p of picks) {
+    if (p.decision.kind === 'binary') binary++;
+    else if (p.decision.decision === 'keep_deleted') deleted++;
+    else restored++;
+  }
+  const parts: string[] = [];
+  if (deleted > 0) parts.push(`${deleted} deletion${deleted !== 1 ? 's' : ''} kept`);
+  if (restored > 0) parts.push(`${restored} restored`);
+  if (binary > 0) parts.push(`${binary} binary version${binary !== 1 ? 's' : ''} chosen`);
+  return `${parts.join(', ')}.`;
 }
 
 /** Disable every button inside a container — used to freeze a resolved card's actions
