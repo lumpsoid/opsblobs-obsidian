@@ -42,7 +42,10 @@ describe('perfLog per-phase timing', () => {
     const names = phases.map(p => p.phase);
     // Every instrumented boundary reported, in order, ending with the total.
     expect(names).toEqual([
-      'keycheck+dag-guard',
+      // Split deliberately: 'keycheck' is the preflight network RTT, 'dag-guard' the
+      // local DAG deserialization — fused, a slow prologue was unattributable.
+      'keycheck',
+      'dag-guard',
       'buildLocalIdentity',
       'pull',
       'fetchBlobs',

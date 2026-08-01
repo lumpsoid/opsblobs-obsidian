@@ -334,7 +334,8 @@ Model on `__tests__/capture-stat-gate.test.ts` / `__tests__/round-stat-gate.test
 `roundMs` should drop at L (the DAG-load laps shrink); counts (`sha256=2`, `fileReads=1`)
 unchanged. To see the lap breakdown directly, wire a `perfLog` sink into a throwaway
 `ServerSyncClient` (as the decomposition did — see the git history around this spec's
-commit, or `src/network/perf-timer.ts`) and confirm `keycheck+dag-guard` +
+commit, or `src/network/perf-timer.ts`) and confirm `dag-guard` (since split out of the
+former `keycheck+dag-guard` lap, which fused it with the preflight network RTT) +
 `recordVersionEdges` + the DAG portion of `buildLocalState` fall to ~one load's worth.
 ⚠ `npm run bench` overwrites the profile-stamped results file — `git checkout --` or
 discard the untracked run after; the committed baselines are

@@ -457,6 +457,12 @@ export class ServerSyncClient {
       throw new KeyMismatchError();
     }
     const keyCheckAbsent = existingKeyCheck === null;
+    // Lapped separately from the DAG guard below: this half is a **network** round-trip
+    // (preflight RTT, plus a TLS handshake on a cold connection) and the crypto verify,
+    // while the next is **local** disk+parse. Fused, a slow lap couldn't be attributed
+    // to either — link latency and graph size are different problems with different
+    // fixes, so they get different lines in perf-log.txt.
+    timer?.lap('keycheck');
 
     // Self-heal a lost/corrupt version-DAG before reading the cursor. If the graph
     // was torn away (an old build's non-atomic write, a deleted metadata file) but
@@ -475,7 +481,9 @@ export class ServerSyncClient {
       this.onProgress?.('Rebuilding sync history…');
       await this.host.saveCursor(0);
     }
-    timer?.lap('keycheck+dag-guard');
+    // Local half: one `version-dag.json` read + `VersionDag.fromJSON` (O(nodes)) + the
+    // journal replay, then the (free) guard check. Grows with graph size, not the link.
+    timer?.lap('dag-guard');
     this.cancelToken?.throwIfCancelled();
 
     // Build the local IDENTITY only (entries + pending ops + the A1 stat-gate hash
