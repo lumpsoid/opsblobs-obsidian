@@ -27,6 +27,25 @@ export interface VersionNode {
   fileId: string;
 }
 
+/** Bounds for {@link VersionDag.reachableContentHashes}'s ancestor walk. Both are
+ *  optional; omitting them walks the complete ancestor chain (the original,
+ *  unbounded behaviour). */
+export interface ReachableBounds {
+  /**
+   * Whether the content store still holds a version's bytes. The walk stops
+   * *descending past* an ancestor whose bytes are gone: a base with no bytes can
+   * never be staged, and every deeper ancestor is older still, so its bytes are
+   * gone too (packs age and retire in write order). The boundary hash itself is
+   * still returned — only the walk past it is cut — so a caller's disk/path
+   * fallback and the GC keep-set see exactly what they saw before. Must be a
+   * cheap in-memory check (`ContentStore.hasStored`), never I/O.
+   */
+  has?: (contentHash: string) => boolean;
+  /** Hard cap on how many generations above the start version to walk. `0` visits
+   *  only the start version. Used as a backstop; `has` is the primary bound. */
+  maxDepth?: number;
+}
+
 /** Returned by {@link VersionDag.mergeBase} when two heads have more than one
  *  incomparable common ancestor (an ambiguous criss-cross). The caller must not
  *  pick a base — surface a conflict instead of guessing. */
@@ -226,12 +245,45 @@ export class VersionDag {
    * staging the bytes of these hashes (those the content store still holds) makes
    * every reachable base available to the pure merge without knowing the peer head
    * in advance. Cycle-safe.
+   *
+   * **Bounded walk (`bounds`).** The complete chain is as long as the file's whole
+   * edit history, so an unbounded walk costs O(edits-ever) on every sync round that
+   * touches the file, and again per live entry when building the GC keep-set — while
+   * the merge can use at most ONE of those versions (the LCA), and everything past
+   * the retention horizon has had its bytes collected and can never be staged at all.
+   * `bounds.has` cuts each branch at the first ancestor whose bytes are gone (see
+   * {@link ReachableBounds}); `bounds.maxDepth` caps generations outright. Neither
+   * changes the outcome for a base that is still usable — a base left unstaged
+   * degrades that merge to a conflict (F1), exactly as an absent base does today.
+   *
+   * The start version is always expanded, even when its own bytes are missing: a
+   * live head whose bytes aren't in the store yet (an un-opped in-window edit) must
+   * not collapse its whole ancestor set — that set is the GC keep-set.
+   *
+   * Walked breadth-first by generation so `maxDepth` means depth, not visit order.
    */
-  reachableContentHashes(versionId: string): Set<string> {
+  reachableContentHashes(versionId: string, bounds?: ReachableBounds): Set<string> {
+    const has = bounds?.has;
+    const maxDepth = bounds?.maxDepth ?? Infinity;
     const out = new Set<string>();
-    for (const v of this.ancestors(versionId)) {
-      const ch = this.nodes.get(v)?.contentHash;
-      if (ch) out.add(ch);
+    const seen = new Set<string>([versionId]);
+    let frontier = [versionId];
+    let depth = 0;
+    while (frontier.length > 0 && depth <= maxDepth) {
+      const next: string[] = [];
+      for (const cur of frontier) {
+        const node = this.nodes.get(cur);
+        if (!node) continue;                       // parent-only stub: nothing to add or walk
+        if (node.contentHash) out.add(node.contentHash);
+        // Bytes gone ⇒ this branch is exhausted (the start version excepted, above).
+        if (has && depth > 0 && node.contentHash && !has(node.contentHash)) continue;
+        if (depth === maxDepth) continue;
+        for (const p of node.parents) {
+          if (!seen.has(p)) { seen.add(p); next.push(p); }
+        }
+      }
+      frontier = next;
+      depth++;
     }
     return out;
   }

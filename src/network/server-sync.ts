@@ -159,6 +159,11 @@ export interface VaultSyncHost {
    *  hash-verified `ContentStore.get` (F1-safe) keeps a locally-sourced blob exactly as
    *  trustworthy as a downloaded-and-verified one. Already-present hashes count served. */
   stageLocalContent(state: VaultState, hashes: Iterable<string>): Promise<Set<string>>;
+  /** Whether the persistent content store already holds `hash`. Synchronous and
+   *  in-memory (an index/cache probe, no I/O) because it is called once per node of
+   *  the version-DAG ancestor walk, to cut that walk at the first base whose bytes
+   *  are gone — see `stageForFiles`. */
+  hasStoredContent(hash: string): boolean;
   /** Apply merge actions to the real vault (writes/deletes/moves, conflict
    *  prompts). Returns `deferred` (fileIds whose destructive action was skipped for
    *  on-disk drift (F5) or an auto-deferred conflict — the caller holds the cursor
@@ -1074,15 +1079,28 @@ export class ServerSyncClient {
    * reaches its base. A base whose bytes are genuinely absent is left unstaged and the
    * merge degrades it to a conflict (F1). Shared by the main round
    * (`stageMergeContent`) and the multi-head reconcile sweep.
+   *
+   * The ancestor walk is **bounded by what the store still holds**: the full chain is
+   * as long as the file's whole edit history, so a note edited a thousand times used
+   * to walk a thousand nodes and hand a thousand hashes to `stageContent` — one
+   * content-store probe each — on every round that touched it, though the merge can
+   * use at most one of them (the LCA) and everything past the retention horizon was
+   * collected long ago. Cutting each branch at the first version whose bytes are gone
+   * makes the round cost O(retained history) instead of O(edits-ever); the boundary
+   * hash is still requested, so `stageContent`'s live-path fallback is unaffected and
+   * a base that survives is staged exactly as before.
    */
   private async stageForFiles(state: VaultState, fileIds: Iterable<string>, dag: VersionDag): Promise<void> {
+    // A hash already staged this round (identity's drift bytes) is usable even if the
+    // persistent store never held it — so it must not cut the walk either.
+    const bounds = { has: (h: string) => state.contentStore.has(h) || this.host.hasStoredContent(h) };
     const needed = new Set<string>();
     for (const id of fileIds) {
       const le = state.fileEntries.get(id);
       if (!le || le.deleted) continue;
       if (le.contentHash !== '') needed.add(le.contentHash);
       if (le.headVersionId) {
-        for (const h of dag.reachableContentHashes(le.headVersionId)) needed.add(h);
+        for (const h of dag.reachableContentHashes(le.headVersionId, bounds)) needed.add(h);
       }
     }
     await this.host.stageContent(state, needed);

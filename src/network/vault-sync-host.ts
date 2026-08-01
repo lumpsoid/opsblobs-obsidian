@@ -161,6 +161,13 @@ export class PluginVaultSyncHost implements VaultSyncHost {
     }
   }
 
+  /** Whether the pack store already holds `hash` — the in-memory index/cache probe
+   *  ({@link ContentStore.hasStored}), synchronous so the caller can use it as the
+   *  per-node guard of the version-DAG ancestor walk (`stageForFiles`). */
+  hasStoredContent(hash: string): boolean {
+    return this.contentStore.hasStored(hash);
+  }
+
   /**
    * Stage every hash the persistent pack store already durably holds into
    * `state.contentStore`, returning the set served so the pull can drop them from its

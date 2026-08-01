@@ -9,7 +9,7 @@
 import { FileEntry, HLC, SyncSettings } from '../types';
 import { MetadataStore } from '../ports/metadata-store';
 import { VaultFiles, VaultFileStat } from '../ports/vault-files';
-import { VersionDag } from './version-dag';
+import { VersionDag, ReachableBounds } from './version-dag';
 import { hlcCompare, hlcToString } from './hlc';
 import { nowMs } from './perf-clock';
 import { isExcluded } from './exclusion-policy';
@@ -517,14 +517,24 @@ export class FileRegistry {
    * absent) degrades a deep merge to a conflict (safe — the merge surfaces markers
    * rather than fabricating an empty ancestor), never data loss. The DAG parent
    * links themselves are tiny and persisted separately, so they outlive the bytes.
+   *
+   * `bounds` bounds each head's ancestor walk (see
+   * {@link VersionDag.reachableContentHashes}) so the keep-set costs O(live entries ×
+   * retained history) instead of O(live entries × edits-ever). Pass the content
+   * store's `hasStored` as `bounds.has`: a hash the store does not hold cannot be
+   * garbage-collected anyway (GC only ever deletes what it holds), so cutting the
+   * walk there never shortens the keep-set below what `gc()` needs — the boundary
+   * hash is still returned, and only strictly-older ancestors are dropped. Do NOT
+   * pass a `maxDepth` shorter than the retention window: that WOULD drop still-stored
+   * bases and let GC delete them early.
    */
-  referencedHashes(dag?: VersionDag): Set<string> {
+  referencedHashes(dag?: VersionDag, bounds?: ReachableBounds): Set<string> {
     const keep = new Set<string>();
     for (const entry of this.entries.values()) {
       if (entry.deleted) continue;
       if (entry.contentHash) keep.add(entry.contentHash);
       if (dag && entry.headVersionId) {
-        for (const hash of dag.reachableContentHashes(entry.headVersionId)) keep.add(hash);
+        for (const hash of dag.reachableContentHashes(entry.headVersionId, bounds)) keep.add(hash);
       }
     }
     return keep;

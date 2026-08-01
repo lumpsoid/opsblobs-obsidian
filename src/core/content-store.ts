@@ -336,6 +336,15 @@ export class ContentStore {
 
   /** Check if content is available without loading it. */
   async has(hash: string): Promise<boolean> {
+    return this.hasStored(hash);
+  }
+
+  /** The synchronous twin of {@link has} — both are pure in-memory lookups (the
+   *  memCache and the pack index), never I/O. Exposed sync so it can be used as the
+   *  per-node guard of the version-DAG's ancestor walk
+   *  ({@link ReachableBounds.has}), which is itself synchronous and calls it once
+   *  per node. */
+  hasStored(hash: string): boolean {
     return this.memCache.has(hash) || this.index.has(hash);
   }
 

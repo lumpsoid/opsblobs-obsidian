@@ -1020,7 +1020,11 @@ export default class VaultSyncPlugin extends Plugin {
     this.gcInProgress = true;
     try {
       const dag = await new VersionDagStore(this.metadata).load();
-      const keep = this.registry.referencedHashes(dag);
+      // Bound each head's ancestor walk at the first version whose bytes are already
+      // gone: GC can only ever delete what the store holds, so an unheld hash — and
+      // every strictly-older ancestor behind it — contributes nothing to the keep-set.
+      // Without this the keep-set costs O(live entries × edits-ever).
+      const keep = this.registry.referencedHashes(dag, { has: h => this.contentStore.hasStored(h) });
       const before = (await this.contentStore.listHashes()).length;
       const retentionMs = this.settings.ancestorRetentionDays * 86_400_000;
       await this.contentStore.gc(keep, retentionMs, Date.now());
