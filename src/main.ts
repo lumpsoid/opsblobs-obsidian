@@ -39,9 +39,13 @@ import { PendingChangesView, PENDING_CHANGES_VIEW_TYPE, PendingChangesViewHost }
 import { listTwoHeadedConflicts, ConflictListItem } from './core/conflict-inventory';
 
 // ─── Ribbon icon SVG ────────────────────────────────────────────────────────
-/** Above this file count, a first-enable capture surfaces indexing progress in the
- *  status bar (and a notice) so a minutes-long pass doesn't look like a freeze. */
-const CAPTURE_PROGRESS_UI_MIN = 500;
+/** Once a capture pass has been running this long, it surfaces indexing progress in
+ *  the status bar (and a notice) so a minutes-long pass doesn't look like a freeze.
+ *  Gated on *elapsed time*, not the vault's file count: the capture's progress
+ *  callback reports `total` = every file in the vault, so a size gate fired on every
+ *  single launch — including the routine startup sweep that the O1 stat gate elides
+ *  in well under a second, which is not something the user needs told about. */
+const CAPTURE_PROGRESS_UI_MIN_MS = 1500;
 
 /** The perf log (perf baseline, Layer 3). A dotfolder, so effectively unreachable
  *  through the iOS Files app — {@link PerfLogView} surfaces it as an in-app tab. */
@@ -98,9 +102,10 @@ export default class VaultSyncPlugin extends Plugin {
    *  pass against the same registry/oplog state. */
   private startupCaptureInProgress = false;
   private autoSyncHandle: number | null = null;
-  /** Live progress of the first-enable capture (building the local DAG), or null when
-   *  it isn't running. Surfaced in the status modal so a minutes-long first pass shows
-   *  how far along it is. Only set for a *large* capture (see CAPTURE_PROGRESS_UI_MIN). */
+  /** Live progress of a startup capture (building the local DAG), or null when it
+   *  isn't running. Surfaced in the status modal so a minutes-long first pass shows
+   *  how far along it is. Only set once a pass has run past
+   *  {@link CAPTURE_PROGRESS_UI_MIN_MS} — a routine sweep stays silent. */
   private indexingProgress: { scanned: number; total: number } | null = null;
   /** The current phase of an in-flight sync round ("Pulling changes…", "Uploading
    *  files 340/8000…", "Merging…"), or null when no round is running. Fed by the sync
@@ -649,17 +654,22 @@ export default class VaultSyncPlugin extends Plugin {
     const flushPerf = sink ? { stringifyMs: 0, writeMs: 0 } : null;
     this.opLogger.captureOplogPerf = oplogPerf;
     this.registry.captureFlushPerf = flushPerf;
-    // Only surface a progress UI for a *large* first-enable — a routine capture (a
-    // handful of changed files) fires the callback at most once and should stay quiet.
-    // This one closure is reused for every pass `captureOfflineChangesAndReconcile`
-    // runs (main + any reconcile passes) — `announced` therefore still fires the
-    // notice at most once across the whole startup sequence, not once per pass.
+    // Only surface a progress UI once the pass has actually been grinding for a
+    // while — a routine startup sweep skips every unchanged file on the stat gate and
+    // is done in well under a second, so it should stay silent no matter how big the
+    // vault is. This one closure is reused for every pass
+    // `captureOfflineChangesAndReconcile` runs (main + any reconcile passes) —
+    // `announced` therefore still fires the notice at most once across the whole
+    // startup sequence, not once per pass.
     let announced = false;
     const passes = await this.opLogger.captureOfflineChangesAndReconcile((scanned, total) => {
-      if (total > CAPTURE_PROGRESS_UI_MIN) {
+      if (performance.now() - t0 > CAPTURE_PROGRESS_UI_MIN_MS) {
         if (!announced) {
           announced = true;
-          new Notice(`OpsBlobs: preparing ${total} files for first sync…`, 8000);
+          // The same sentence whether or not this is the first enable: the pass does
+          // exactly this in both cases (scan every file, capture what drifted), and a
+          // "first sync" wording was wrong on every launch after the first.
+          new Notice(`OpsBlobs: indexing changes across ${total} files…`, 8000);
         }
         // The status bar is the always-visible surface; a coarse label is enough to
         // show the vault isn't frozen during a minutes-long capture — the live
@@ -735,7 +745,7 @@ export default class VaultSyncPlugin extends Plugin {
     // Capture done — the modal's indexing section clears itself once this reads null.
     this.indexingProgress = null;
     if (announced) {
-      new Notice('OpsBlobs: vault prepared.', 4000);
+      new Notice('OpsBlobs: indexing complete.', 4000);
       this.updateStatusBar();
     }
   }
