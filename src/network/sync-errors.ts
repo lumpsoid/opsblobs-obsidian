@@ -118,6 +118,16 @@ export class DecryptError extends Error {
   }
 }
 
+/** Is this a failure of the *link* rather than an answer from the server — no
+ *  response at all, or none within the budget? These are the only errors worth
+ *  retrying inside a single round: a momentary blip (radio waking, VPN/Wi-Fi
+ *  handover, DNS cold start) resolves in well under a second, whereas anything the
+ *  server actually answered (auth, 404, 5xx) will answer the same way immediately.
+ *  Used by the round's preflight gate; see ServerSyncClient's retry schedule. */
+export function isTransientLinkError(err: unknown): boolean {
+  return err instanceof NetworkError || err instanceof TimeoutError;
+}
+
 /** Is this a *setup-class* failure — one the user must fix in settings (wrong token,
  *  wrong server/vault, passphrase mismatch, undecryptable data) — as opposed to a
  *  transient transport error (network/timeout/5xx) that self-retries on the next

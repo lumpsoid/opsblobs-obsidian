@@ -30,11 +30,20 @@ export class FakeSyncServer implements ServerApi {
   private blobs = new Map<string, Uint8Array>();
   private byClientOpId = new Map<string, number>(); // clientOpId → assigned seq
   private seq = 0;
-  // Whether a real (claiming) touch has happened. The first mutating call claims
-  // the vault for the account; `preflight` reads this flag but never sets it.
+  // Whether this account owns the vault. Mirrors the Go server, where *every*
+  // endpoint but `preflight` runs `EnsureVaultAccess` and so claims an unclaimed
+  // vault on first touch — reads included. `preflight` alone reads the ownership
+  // verdict without staking one, which is what makes it safe to retry.
   private claimed = false;
 
+  /** First touch claims the vault (the server's `EnsureVaultAccess`). Called by every
+   *  endpoint except `preflight`. */
+  private claim(): void {
+    this.claimed = true;
+  }
+
   async pullOps(since: number, limit: number): Promise<PullOpsResult> {
+    this.claim();
     const after = this.log.filter(o => o.seq > since);
     const ops = after.slice(0, limit);
     const last = ops.length > 0 ? ops[ops.length - 1]!.seq : since;
@@ -42,7 +51,7 @@ export class FakeSyncServer implements ServerApi {
   }
 
   async appendOps(_baseCursor: number, ops: AppendOp[]): Promise<AppendResult> {
-    this.claimed = true; // a real append is a claiming touch
+    this.claim();
     const assigned: Array<{ clientOpId: string; seq: number }> = [];
     for (const op of ops) {
       const prior = this.byClientOpId.get(op.clientOpId);
@@ -63,17 +72,18 @@ export class FakeSyncServer implements ServerApi {
   }
 
   async checkBlobs(hashes: string[]): Promise<{ missing: string[] }> {
+    this.claim();
     return { missing: hashes.filter(h => !this.blobs.has(h)) };
   }
 
   async putBlob(hash: string, bytes: Uint8Array): Promise<void> {
-    this.claimed = true; // a real upload is a claiming touch
+    this.claim();
     // Idempotent by hash — first write wins, re-puts are no-ops.
     if (!this.blobs.has(hash)) this.blobs.set(hash, bytes);
   }
 
   async putBlobBatch(blobs: BlobUpload[]): Promise<void> {
-    this.claimed = true; // a real upload is a claiming touch
+    this.claim();
     // Same idempotent, content-addressed store as putBlob — one call, many blobs.
     for (const b of blobs) {
       if (!this.blobs.has(b.hash)) this.blobs.set(b.hash, b.bytes);
@@ -81,10 +91,12 @@ export class FakeSyncServer implements ServerApi {
   }
 
   async getBlob(hash: string): Promise<Uint8Array | null> {
+    this.claim();
     return this.blobs.get(hash) ?? null;
   }
 
   async getBlobBatch(hashes: string[]): Promise<{ blobs: Map<string, Uint8Array>; missing: string[] }> {
+    this.claim();
     // Download-side twin of putBlobBatch: return the bytes for every held hash
     // (once, even if requested twice) and list the rest as missing, in request order.
     const blobs = new Map<string, Uint8Array>();
@@ -98,8 +110,9 @@ export class FakeSyncServer implements ServerApi {
   }
 
   async preflight(keyCheckKey: string): Promise<{ claimed: boolean; keyCheck: Uint8Array | null }> {
-    // Read-only: never sets `claimed` (a preflight must not stake a claim). An
-    // unclaimed vault reports no key-check even if a blob is somehow present.
+    // The one endpoint that never claims: it reads the ownership verdict and stops.
+    // Like the server, it skips the key-check lookup entirely for an unclaimed vault
+    // (an unowned vault holds no blobs), and only honors a non-empty `keyCheckKey`.
     if (!this.claimed) return { claimed: false, keyCheck: null };
     const record = keyCheckKey ? this.blobs.get(keyCheckKey) ?? null : null;
     // A blob larger than a plausible record is treated as "not a key-check":
@@ -112,4 +125,6 @@ export class FakeSyncServer implements ServerApi {
   get opCount(): number { return this.log.length; }
   get blobCount(): number { return this.blobs.size; }
   get headSeq(): number { return this.seq; }
+  /** Whether a touch has claimed the vault — the state `preflight` reports. */
+  get isClaimed(): boolean { return this.claimed; }
 }

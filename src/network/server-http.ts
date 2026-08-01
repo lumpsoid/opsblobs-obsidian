@@ -31,6 +31,15 @@ import { withTimeout } from './with-timeout';
 const DEFAULT_TIMEOUT_MS = 30_000;
 /** Blob bodies can be large on a slow link, so they get a longer budget. */
 const DEFAULT_BLOB_TIMEOUT_MS = 120_000;
+/**
+ * Preflight is the round's *reachability gate*, not a data transfer: it decides
+ * whether there is a server to talk to at all, and the round's caller retries it a
+ * couple of times before giving up. A tight budget is the whole point — the user is
+ * usually watching, and a dead link must fail in seconds, not minutes. Deliberately
+ * far below {@link DEFAULT_TIMEOUT_MS}: the response is a few hundred bytes, so any
+ * link that can sync at all answers this well inside it.
+ */
+const DEFAULT_PREFLIGHT_TIMEOUT_MS = 5_000;
 
 export interface HttpServerConfig {
   /** e.g. https://sync.example.com — trailing slash optional. */
@@ -42,6 +51,9 @@ export interface HttpServerConfig {
   timeoutMs?: number;
   /** Per-request timeout for blob transfers (ms). Default 120s. `0` disables. */
   blobTimeoutMs?: number;
+  /** Per-request timeout for the preflight reachability gate (ms). Default 5s.
+   *  `0` disables. */
+  preflightTimeoutMs?: number;
 }
 
 export class HttpServerApi implements ServerApi {
@@ -78,6 +90,7 @@ export class HttpServerApi implements ServerApi {
 
   private get metaTimeout(): number { return this.cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS; }
   private get blobTimeout(): number { return this.cfg.blobTimeoutMs ?? DEFAULT_BLOB_TIMEOUT_MS; }
+  private get preflightTimeout(): number { return this.cfg.preflightTimeoutMs ?? DEFAULT_PREFLIGHT_TIMEOUT_MS; }
 
   /** Map a non-success status to the typed error family (shared across endpoints). */
   private statusError(status: number, operation: string): Error {
@@ -157,7 +170,7 @@ export class HttpServerApi implements ServerApi {
       url: `${this.vaultBase()}/preflight${q}`,
       method: 'GET',
       headers: this.authHeader(),
-    }, this.metaTimeout);
+    }, this.preflightTimeout);
     // 401 (bad token) / 403 (vault owned by another account) → AuthError; other
     // non-200 → ServerError. A reachable 200 with no throw is the full URL+token+vault check.
     if (resp.status !== 200) throw this.statusError(resp.status, 'checking the server');

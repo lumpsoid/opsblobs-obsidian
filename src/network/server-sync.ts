@@ -59,6 +59,7 @@ import {
   KeyMismatchError,
   DecryptError,
   BatchTooLargeError,
+  isTransientLinkError,
 } from './sync-errors';
 export {
   StaleCursorError,
@@ -245,7 +246,29 @@ export interface ServerSyncOptions {
    *  module's doc for why this is always safe. Omitted (the default) means the round
    *  can't be cancelled (e.g. the preflight check never wires one). */
   cancelToken?: SyncCancelToken;
+  /** Wait before each attempt of the preflight gate, in order (so `[0, …]` fires the
+   *  first attempt immediately). Its length is the attempt count. Test hook; defaults
+   *  to {@link DEFAULT_PREFLIGHT_RETRY_DELAYS_MS}. */
+  preflightRetryDelaysMs?: number[];
+  /** How the retry schedule waits. Test hook (tests pass a no-op so the schedule is
+   *  assertable without real time); defaults to a `setTimeout` sleep. */
+  sleep?: (ms: number) => Promise<void>;
 }
+
+/**
+ * When the round's preflight gate fires: immediately, then 500 ms later, then 1 s
+ * after that — three attempts spanning ~1.5 s of waiting plus whatever the attempts
+ * themselves take.
+ *
+ * Sized for the failure it exists to absorb: a link that is *momentarily* down
+ * (radio waking from doze, Wi-Fi/VPN handover, a cold DNS cache) rather than absent.
+ * Those recover in hundreds of milliseconds, so spacing the retries across a second
+ * and a half catches them while keeping a genuinely offline device's total wait at
+ * roughly the transport's preflight budget — seconds, not the two minutes a blob-path
+ * timeout used to cost. Nothing here retries a server that *answered*: see
+ * {@link isTransientLinkError}.
+ */
+const DEFAULT_PREFLIGHT_RETRY_DELAYS_MS = [0, 500, 1000];
 
 /** Default page size for the pull loop's `GET /ops?limit=`. Set to the server's
  *  default `MaxPullLimit` (`SYNC_MAX_PULL_LIMIT`, spec §9.6) so a full-sync drain
@@ -337,6 +360,8 @@ export class ServerSyncClient {
   private readonly onUploadProgress?: (uploaded: number, total: number) => void;
   private readonly perfLog?: PhaseTimingSink;
   private readonly cancelToken?: SyncCancelToken;
+  private readonly preflightRetryDelaysMs: number[];
+  private readonly sleep: (ms: number) => Promise<void>;
 
   constructor(opts: ServerSyncOptions) {
     this.api = opts.api;
@@ -360,6 +385,10 @@ export class ServerSyncClient {
     this.onUploadProgress = opts.onUploadProgress;
     this.perfLog = opts.perfLog;
     this.cancelToken = opts.cancelToken;
+    // An empty schedule would mean "never even try", so fall back to the default.
+    const delays = opts.preflightRetryDelaysMs;
+    this.preflightRetryDelaysMs = delays && delays.length > 0 ? delays : DEFAULT_PREFLIGHT_RETRY_DELAYS_MS;
+    this.sleep = opts.sleep ?? ((ms: number) => new Promise(resolve => setTimeout(resolve, ms)));
   }
 
   /**
@@ -389,18 +418,31 @@ export class ServerSyncClient {
     // so every `timer?.lap(...)` below is a no-op — zero overhead by default.
     const timer = this.perfLog ? new PhaseTimer(this.perfLog) : undefined;
 
-    // ── 0. Passphrase / key-agreement guard ─────────────────────────────────
+    // ── 0. Reachability gate + passphrase / key-agreement guard ─────────────
     // Before we decrypt a single pulled op or push under our key, confirm this
     // device's derived key is the one the vault was established with. A present
     // record that our key can't reproduce means a mistyped passphrase (or wrong
     // salt): fail loudly and actionably here rather than wedging the vault into two
     // key regimes or dying on a raw AES exception mid-pull. Absent → nobody has
     // stamped the vault yet; we claim it below once our key is established (we
-    // decrypted existing ops, or we're the first device pushing). The GET degrades
+    // decrypted existing ops, or we're the first device pushing). The read degrades
     // to "no record" on a withholding server (spec threat model: omission → the
     // pre-guard status quo, never corruption).
+    //
+    // The record comes from `preflight`, not `getBlob`, because this call is also the
+    // round's first contact with the server and therefore its de-facto reachability
+    // check. `getBlob` rides the *blob* budget — sized for multi-megabyte attachments
+    // on a slow link (two minutes) — so an unreachable network used to wedge the whole
+    // round, and every UI control gated on it, for that entire budget before failing.
+    // `preflight` returns the same bytes in one round-trip on a tight budget, is
+    // retried across a blip (`preflightWithRetry`), and unlike every other endpoint
+    // does not *claim* an unclaimed vault, so a failed round leaves no trace.
     const keyCheckKey = await this.keyCheckBlobKey();
-    const existingKeyCheck = await this.api.getBlob(keyCheckKey);
+    // `keyCheck` is null for an unclaimed vault, an unstamped one, or a blob too large
+    // to be a record (the server declines to inline those). All three mean "no key
+    // agreement to check yet" — the same verdict the old GET produced for an absent
+    // slot — and the stamp below re-establishes it.
+    const { keyCheck: existingKeyCheck } = await this.preflightWithRetry(keyCheckKey);
     if (existingKeyCheck && !(await this.crypto.verifyKeyCheck(existingKeyCheck))) {
       throw new KeyMismatchError();
     }
@@ -593,11 +635,39 @@ export class ServerSyncClient {
    */
   async preflight(): Promise<PreflightResult> {
     if (!this.crypto.isReady()) throw new Error('Vault key not derived');
-    const { keyCheck } = await this.api.preflight(await this.keyCheckBlobKey());
+    const { keyCheck } = await this.preflightWithRetry(await this.keyCheckBlobKey());
     const keyState: PreflightKeyState =
       keyCheck === null ? 'unstamped'
         : (await this.crypto.verifyKeyCheck(keyCheck)) ? 'match' : 'mismatch';
     return { keyState };
+  }
+
+  /**
+   * The preflight call under {@link DEFAULT_PREFLIGHT_RETRY_DELAYS_MS}: a couple of
+   * closely-spaced re-attempts so a link that is merely *waking* isn't reported as
+   * offline, then the last link error is raised for the caller to surface.
+   *
+   * Only link failures are retried — a server that answered (bad token, wrong vault,
+   * 5xx) will answer identically a half-second later, and re-asking just delays an
+   * actionable message. Retrying is safe precisely because preflight is the one
+   * non-mutating, non-claiming endpoint: N attempts and 1 attempt leave the server in
+   * the same state.
+   */
+  private async preflightWithRetry(keyCheckKey: string): Promise<{ claimed: boolean; keyCheck: Uint8Array | null }> {
+    let lastError: unknown;
+    for (const waitMs of this.preflightRetryDelaysMs) {
+      // A cancel requested while we're spacing out attempts shouldn't have to wait
+      // for the schedule to run out (this whole gate precedes any local mutation).
+      this.cancelToken?.throwIfCancelled();
+      if (waitMs > 0) await this.sleep(waitMs);
+      try {
+        return await this.api.preflight(keyCheckKey);
+      } catch (err) {
+        if (!isTransientLinkError(err)) throw err;
+        lastError = err;
+      }
+    }
+    throw lastError as Error;
   }
 
   /**

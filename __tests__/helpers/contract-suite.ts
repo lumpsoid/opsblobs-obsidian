@@ -150,7 +150,13 @@ export function runContractSuite(label: string, newServer: () => ContractServer)
       expect(await a.preflight(keyCheckKey)).toEqual({ claimed: false, keyCheck: null });
       expect(await a.preflight(keyCheckKey)).toEqual({ claimed: false, keyCheck: null });
 
-      // A real upload claims the vault and stamps the key-check slot.
+      // Every OTHER endpoint claims the vault on first touch (the server's
+      // `EnsureVaultAccess`) — reads included, not just writes. A bare pull is enough,
+      // and preflight then *reports* that claim without having caused it.
+      await a.pullOps(0, 10);
+      expect((await a.preflight(keyCheckKey)).claimed).toBe(true);
+
+      // A real upload stamps the key-check slot.
       await a.putBlob(keyCheckKey, record);
 
       const held = await a.preflight(keyCheckKey);
