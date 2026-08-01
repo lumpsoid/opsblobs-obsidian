@@ -101,6 +101,24 @@ export class OperationLogger {
    *  (`clearOps`, `pruneCreateDeletePair`) resets it to `pendingOps.length`, and
    *  `load()` sets it to the count replayed from disk. */
   private oplogPersistedCount = 0;
+  /** Serializes every oplog persist (append *and* rewrite) into a FIFO chain.
+   *
+   *  `appendOpLog` reads {@link oplogPersistedCount}, `await`s the write, and only then
+   *  advances the marker. Without this chain, anything that starts during that await
+   *  re-reads the *un-advanced* marker and re-appends a delta that is already on disk.
+   *  Nothing serialized the callers: the debounced `flushModify` is invoked
+   *  fire-and-forget, and a bulk external change (empty a folder in Finder, paste a new
+   *  one in) delivers a burst of watcher events that all reach here at once. Observed in
+   *  the field: ~20 overlapping appends turned 290 real ops into 1988 journal lines
+   *  (1698 byte-identical duplicates), which `load()` then read back as duplicate
+   *  pending ops and pushed — wedging sync on a server-side duplicate-id rejection.
+   *
+   *  The chain is kept never-rejecting so one failed write can't wedge every later
+   *  persist; the rejection still propagates to *its own* caller, which is what leaves
+   *  the marker un-advanced so the same delta re-appends once on retry (spec §5 inv. 4).
+   *  Cost is one promise hop per persist — the writes were already serialized by the
+   *  filesystem, this only stops them from *overlapping*. */
+  private oplogPersistQueue: Promise<void> = Promise.resolve();
   private debounceTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   /** Notified whenever the pending oplog is persisted — i.e. an op was
    *  recorded, cleared, or cancelled. Lets the UI reflect "changes to sync"
@@ -154,16 +172,47 @@ export class OperationLogger {
     // blob, since blobs flush before the oplog append). A pre-journal single-array file
     // (old on-disk format) parses to zero lines and loads empty — `.opsblobs/` is
     // disposable (rebuild), so no migration is carried (ground rule §0).
+    // Replay is also where a duplicated journal is healed. An op id is unique by
+    // construction (HLC + device), so the same id on two lines can only mean the line
+    // was written twice — the overlapping-append bug this file's `oplogPersistQueue`
+    // now prevents. Reading duplicates back in would push them: a batch carrying the
+    // same op id 20 times is rejected server-side, and the retry replays the identical
+    // batch, so sync stays wedged until the journal is fixed. Drop them here (first
+    // occurrence wins — later copies are byte-identical) and, when any were found,
+    // rewrite the file so the vault heals itself once rather than on every load.
     const raw = await this.metadata.read(OPLOG_PATH);
     const ops: Operation[] = [];
+    const seenIds = new Set<string>();
+    let duplicates = 0;
     if (raw !== null) {
       for (const line of raw.split('\n')) {
         if (!line) continue;
-        try { ops.push(JSON.parse(line) as Operation); } catch { /* torn/partial line — skip */ }
+        let op: Operation;
+        try { op = JSON.parse(line) as Operation; } catch { continue; /* torn/partial line — skip */ }
+        if (op.id !== undefined) {
+          if (seenIds.has(op.id)) { duplicates++; continue; }
+          seenIds.add(op.id);
+        }
+        ops.push(op);
       }
     }
     this.pendingOps = ops;
     this.oplogPersistedCount = ops.length;
+
+    if (duplicates > 0) {
+      console.warn(
+        `[opsblobs] oplog: dropped ${duplicates} duplicate op line(s) on load ` +
+          `(${ops.length} distinct op(s) kept) and compacted the journal.`,
+      );
+      // Deliberately not `rewriteOpLog()`: its shared tail persists the HLC and notifies
+      // the change listener, and `load()` runs before either is wired up. A direct
+      // atomic write is the whole job here — `oplogPersistedCount` already matches.
+      await this.ensureOplogDir();
+      await this.metadata.write(
+        OPLOG_PATH,
+        ops.length === 0 ? '' : ops.map(op => JSON.stringify(op)).join('\n') + '\n',
+      );
+    }
   }
 
   /**
@@ -716,6 +765,27 @@ export class OperationLogger {
     const entry = this.registry.getByPath(path);
     if (!entry) return;
 
+    // ── Stale-delete guard ────────────────────────────────────────────────────
+    // A bulk external replace (select-all + delete in Finder/Explorer, then paste a
+    // fresh set into the same folder) delivers a burst of delete and create events with
+    // no ordering guarantee between them. When a delete lands *after* the re-create for
+    // its path has already been processed, `markDeleted` tombstones an entry whose file
+    // is live on disk. Nothing corrects that: `registerFile`'s resurrect path already
+    // ran, so the next startup capture sees a live file with no *active* entry, mints a
+    // SECOND id for it, and the path ends up with two registry entries (one tombstoned
+    // holding the old id, one live holding the new) — which is a duplicate file on every
+    // peer. Observed in the field on 10 of 149 replaced files.
+    //
+    // So confirm the file is actually gone before tombstoning. If it is back, this event
+    // describes a file that no longer exists in the state it referred to: what matters is
+    // the current bytes, so route to the modify path, which emits an update (or nothing,
+    // if the re-create already recorded this content). Costs one `exists` per delete —
+    // and deleting is not a hot path. G13: bias against the destructive false positive.
+    if (await this.files.exists(path)) {
+      await this.flushModify(path);
+      return;
+    }
+
     const hlcTs = this.hlc.now();
     await this.registry.markDeleted(path, hlcTs);
 
@@ -826,7 +896,27 @@ export class OperationLogger {
    * never twice, never skipped (spec §5 inv. 4). Persisting the HLC + notifying is
    * shared with the rewrite path via {@link finishOpLog}.
    */
-  private async appendOpLog(): Promise<void> {
+  private appendOpLog(): Promise<void> {
+    return this.enqueuePersist(() => this.appendOpLogLocked());
+  }
+
+  /**
+   * Run `work` after every persist already queued, and hand its outcome back to *this*
+   * caller. The stored chain swallows rejections so a failed write can't wedge the
+   * queue; see {@link oplogPersistQueue}.
+   */
+  private enqueuePersist(work: () => Promise<void>): Promise<void> {
+    const run = this.oplogPersistQueue.then(work);
+    this.oplogPersistQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  /** {@link appendOpLog}'s body. Only ever runs inside {@link enqueuePersist}, so the
+   *  marker it reads is the one the previous persist left behind. */
+  private async appendOpLogLocked(): Promise<void> {
     const delta = this.pendingOps.slice(this.oplogPersistedCount);
     if (delta.length > 0) {
       await this.ensureOplogDir();
@@ -841,7 +931,13 @@ export class OperationLogger {
       const tw = nowMs();
       await this.metadata.append(OPLOG_PATH, data);
       if (this.captureOplogPerf) this.captureOplogPerf.writeMs += nowMs() - tw;
-      this.oplogPersistedCount = this.pendingOps.length;
+      // Advance by exactly what was written — NOT to `pendingOps.length`, which is read
+      // after the await and so includes ops pushed *during* the write. Setting the marker
+      // past the delta silently skips those: they stay in memory, never reach the journal,
+      // and are lost on the next load. (Latent since the append journal landed; the write
+      // used to resolve fast enough to rarely lose the race, and serializing the queue
+      // above makes the window deterministic rather than creating it.)
+      this.oplogPersistedCount += delta.length;
     }
     await this.finishOpLog();
   }
@@ -854,13 +950,25 @@ export class OperationLogger {
    * §4.2). Resets `oplogPersistedCount` so a subsequent append doesn't re-emit or skip
    * anything. Written atomically (`metadata.write`) so a reader never sees a torn file.
    */
-  private async rewriteOpLog(): Promise<void> {
+  private rewriteOpLog(): Promise<void> {
+    // Shares the append queue: a rewrite that interleaved with an in-flight append
+    // would either resurrect the ops the rewrite just dropped or truncate ops the
+    // append had already counted as durable.
+    return this.enqueuePersist(() => this.rewriteOpLogLocked());
+  }
+
+  /** {@link rewriteOpLog}'s body — only ever runs inside {@link enqueuePersist}. */
+  private async rewriteOpLogLocked(): Promise<void> {
     await this.ensureOplogDir();
-    const data = this.pendingOps.length === 0
+    // Count what this write actually covers *before* the await, for the same reason
+    // `appendOpLogLocked` advances by `delta.length`: an op pushed while the write is in
+    // flight is not in `data`, so crediting it here would skip it forever.
+    const written = this.pendingOps.length;
+    const data = written === 0
       ? ''
       : this.pendingOps.map(op => JSON.stringify(op)).join('\n') + '\n';
     await this.metadata.write(OPLOG_PATH, data);
-    this.oplogPersistedCount = this.pendingOps.length;
+    this.oplogPersistedCount = written;
     await this.finishOpLog();
   }
 
