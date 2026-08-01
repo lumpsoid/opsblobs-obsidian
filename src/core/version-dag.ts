@@ -52,6 +52,32 @@ export interface ReachableBounds {
 export const MULTIPLE_BASES = 'MULTIPLE' as const;
 export type MergeBaseResult = string | null | typeof MULTIPLE_BASES;
 
+/**
+ * Sweep `dag` down to `roots` and their ancestors ({@link VersionDag.prune}), with the
+ * guards that keep a sweep from being mistaken for data loss. Returns how many nodes went
+ * away — `0` means it declined, and the graph is untouched.
+ *
+ * It declines when:
+ *  · the graph is already empty — nothing to do;
+ *  · the vault names no versions at all — a registry with no heads (a fresh or
+ *    just-rebuilt device) is not evidence that the whole graph is garbage;
+ *  · **no root is even present in the graph.** The sweep's contract is "keep what the
+ *    vault points at"; if it points at nothing the graph holds, the two are describing
+ *    different vaults (a stale snapshot, a vaultId switch) and pruning would empty the
+ *    graph. An empty graph on a device with a non-zero cursor is what `dagNeedsRebuild`
+ *    reads as a lost `version-dag.json`, and it answers with a full cursor rewind and
+ *    re-pull of the entire server log — a far worse outcome than carrying dead nodes.
+ */
+export function sweepToRoots(dag: VersionDag, roots: Set<string>): number {
+  if (dag.size() === 0 || roots.size === 0) return 0;
+  let anchored = false;
+  for (const r of roots) {
+    if (dag.has(r)) { anchored = true; break; }
+  }
+  if (!anchored) return 0;
+  return dag.prune(roots);
+}
+
 export class VersionDag {
   private nodes = new Map<string, VersionNode>();
 
@@ -286,6 +312,70 @@ export class VersionDag {
       depth++;
     }
     return out;
+  }
+
+  /**
+   * Drop every node that is not `roots` itself or an ancestor of one — a mark-and-sweep
+   * from the version-ids the vault still names. Returns how many nodes went away.
+   *
+   * WHY. Nothing else ever removes a node, so the graph accumulates every op this device
+   * ever authored or pulled, for the life of the vault. The bulk of that is not history:
+   * it is whole *files* the registry no longer knows — a tombstone reclaimed past its
+   * horizon (`FileRegistry.reclaimTombstones`), a divergent duplicate dropped by
+   * `adoptRemote`, or a metadata rebuild that re-minted fileIds. Their subgraphs are
+   * unreachable from anything the vault can ask about, yet they are re-read, re-parsed
+   * and rebuilt into the Map on every sync round, and re-serialized by every `compact()`.
+   *
+   * WHY THIS IS SAFE — the sweep cannot change any answer this class gives, provided the
+   * caller roots on **every** version-id the vault names (see
+   * {@link FileRegistry.versionRoots}: the head of every entry, live *and* tombstoned,
+   * plus both open heads of a conflicted file):
+   *
+   *  · {@link mergeBase} — `LCA(ourHead, anyPeerHead)` is by definition an ancestor of
+   *    `ourHead`, and `ourHead` is a root, so every base we could ever need is retained.
+   *    The maximal-ancestor (dominance) walk only ever steps from a common node to its
+   *    parents, and common nodes are ancestors of ours, so it too stays inside the kept
+   *    set. This is what makes reachability pruning categorically different from horizon
+   *    pruning: a *horizon* deletes oldest-first — the `create` node two heads most often
+   *    share — and a lost base does not surface as a conflict, it makes `mergeBase` return
+   *    `null`, which `resolveThreeWayBase` reports as "no common ancestor" and the merge
+   *    then unions both sides against an empty base (state-merge.ts §the F1 comment),
+   *    silently duplicating the file. Reachability never removes a reachable base, so it
+   *    cannot reach that failure mode.
+   *  · {@link isAncestor} / {@link reachableContentHashes} — both walk *up* from a head we
+   *    root on; the kept set is upward-closed, so neither walk can reach a dropped node.
+   *  · {@link leaves} / {@link leavesByFile} — a kept node either has a kept descendant
+   *    (that is why it was kept) or is itself a root, so no node becomes a leaf that was
+   *    not one before.
+   *  · Dangling parent ids are impossible for the same reason: keeping a node keeps all
+   *    of its ancestors, so a kept node's `parents` only ever name kept nodes (or the
+   *    parent-only stubs it already named, which are not nodes at all).
+   *
+   * The caller must NOT sweep with an empty root set on a device that has synced — that
+   * would empty the graph, which `dagNeedsRebuild` reads as a lost `version-dag.json` and
+   * answers with a full cursor rewind.
+   */
+  prune(roots: Iterable<string>): number {
+    const keep = new Set<string>();
+    const stack: string[] = [];
+    for (const r of roots) {
+      if (r && !keep.has(r)) { keep.add(r); stack.push(r); }
+    }
+    while (stack.length > 0) {
+      const cur = stack.pop()!;
+      const node = this.nodes.get(cur);
+      if (!node) continue;                       // parent-only stub: nothing above it
+      for (const p of node.parents) {
+        if (!keep.has(p)) { keep.add(p); stack.push(p); }
+      }
+    }
+    let dropped = 0;
+    // Deleting the current key while iterating a Map is well-defined (the iterator only
+    // ever moves forward over the remaining entries).
+    for (const id of this.nodes.keys()) {
+      if (!keep.has(id)) { this.nodes.delete(id); dropped++; }
+    }
+    return dropped;
   }
 
   /** Every ancestor of `hash`, including `hash` itself. Cycle-safe. */

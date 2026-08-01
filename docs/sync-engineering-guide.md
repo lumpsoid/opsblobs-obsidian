@@ -66,7 +66,17 @@ v2 records the structure and **derives** the ancestor.
    - `delete` → a tombstone version with `parents: [prevHeadVersionId]`
 3. **The DAG is persisted and accumulated** (`.opsblobs/version-dag.json`): every op
    ever authored or pulled contributes its `(versionId → parents, contentHash, fileId)`
-   edge. Version-ids/hashes are tiny, so the graph survives content GC.
+   edge. Version-ids/hashes are tiny, so the graph survives content GC. The one thing
+   that removes a node is the **reachability sweep** (`sweepToRoots`, on the content-GC
+   schedule): mark from every version the registry still names — the head of every entry,
+   live *and* tombstoned, plus both `conflictParents` of a two-headed file — keep their
+   ancestors, drop the rest. That is answer-preserving by construction (`LCA(ourHead, any
+   head)` is an ancestor of `ourHead`, which is a root), so it reclaims *forgotten files'*
+   subgraphs only; per-file history is still unbounded. Note the asymmetry that makes a
+   *retention horizon* a different and much riskier proposition: a horizon deletes
+   oldest-first — the shared `create` — and a lost base does **not** degrade to a
+   conflict. `mergeBase` returns `null`, which reads as "no common ancestor" and merges
+   both sides against an *empty* base, silently duplicating the file (§the F1 rule).
 4. **A "head" is a leaf** (no child). One head = converged; **two heads = divergence**.
    The registry names the local head per file (`FileEntry.headVersionId`).
 5. **Merging two heads is pure and total** (`mergeVaultStates`):

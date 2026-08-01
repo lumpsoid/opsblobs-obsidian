@@ -590,6 +590,34 @@ export class FileRegistry {
     return keep;
   }
 
+  /**
+   * Every version-id the registry still names — the root set for
+   * {@link VersionDag.prune}'s mark-and-sweep. Deliberately *wider* than
+   * {@link referencedHashes}' roots, which cover only live entries' content:
+   *
+   *  · **Tombstoned entries too.** A tombstone's head is what makes a peer's late edit to
+   *    a file we deleted surface as a delete/edit conflict; dropping its lineage would
+   *    take the base for that merge with it. (Once the tombstone itself is reclaimed past
+   *    its horizon the entry is gone from here and the subgraph becomes collectable —
+   *    which is exactly the garbage this sweep exists to reclaim.)
+   *  · **Both `conflictParents`.** While a file is two-headed, the *remote* head is not
+   *    the entry's `headVersionId` and is named nowhere else; the resolving save re-emits
+   *    it as the merge node's second parent, so it must survive until then.
+   *
+   * Ancestors are not listed — `prune` walks them itself. Callers should union in any
+   * version-ids held outside the registry (the pending oplog) before sweeping.
+   */
+  versionRoots(): Set<string> {
+    const roots = new Set<string>();
+    for (const entry of this.entries.values()) {
+      if (entry.headVersionId) roots.add(entry.headVersionId);
+      if (entry.conflictParents) {
+        for (const p of entry.conflictParents) if (p) roots.add(p);
+      }
+    }
+    return roots;
+  }
+
   // ─── Private helpers ──────────────────────────────────────────────────────
 
   /**
@@ -626,9 +654,11 @@ export class FileRegistry {
    * device replays the delete op and rebuilds the tombstone — so reclaiming here is a
    * local-cache decision of the same kind as the blob and DAG windows.
    *
-   * Dropping an id does NOT prune its version-DAG nodes (the DAG still has no removal
-   * API — see the DAG-pruning task). Harmless, and mildly helpful: the nodes are tiny
-   * and, unreachable from any live head, they stop feeding `referencedHashes`' keep-set.
+   * Dropping an id does not prune its version-DAG nodes here, but it does make them
+   * collectable: the entry no longer appears in {@link versionRoots}, so the next
+   * reachability sweep (`sweepToRoots`, run on the GC's schedule) takes the whole
+   * subgraph. Until then they are harmless — tiny, and unreachable from any live head, so
+   * they stop feeding `referencedHashes`' keep-set immediately.
    */
   private reclaimTombstones({ now, pinned }: TombstoneReclaim): number {
     const horizon = now - this.tombstoneRetentionMs();

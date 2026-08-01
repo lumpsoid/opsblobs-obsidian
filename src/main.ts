@@ -22,6 +22,7 @@ import { KeyMismatchError } from './network/sync-errors';
 import { HttpServerApi } from './network/server-http';
 import { CursorStore } from './network/cursor-store';
 import { VersionDagStore } from './network/version-dag-store';
+import { VersionDag, sweepToRoots } from './core/version-dag';
 import { VaultBindingStore } from './network/vault-binding-store';
 import { HlcStore } from './network/hlc-store';
 import { SyncStateStore } from './network/sync-state-store';
@@ -1024,7 +1025,9 @@ export default class VaultSyncPlugin extends Plugin {
     if (this.gcInProgress) return 0;
     this.gcInProgress = true;
     try {
-      const dag = await new VersionDagStore(this.metadata).load();
+      const dagStore = new VersionDagStore(this.metadata);
+      const dag = await dagStore.load();
+      await this.sweepVersionDag(dagStore, dag);
       // Bound each head's ancestor walk at the first version whose bytes are already
       // gone: GC can only ever delete what the store holds, so an unheld hash — and
       // every strictly-older ancestor behind it — contributes nothing to the keep-set.
@@ -1038,6 +1041,41 @@ export default class VaultSyncPlugin extends Plugin {
     } finally {
       this.gcInProgress = false;
     }
+  }
+
+  /**
+   * Mark-and-sweep the version-DAG down to what the vault still names, and rewrite the
+   * snapshot when that dropped anything. Runs on the GC's schedule (daily, inside a
+   * settled round) because it is the same kind of decision as the blob retention window
+   * and wants the same cadence — and because the graph is already loaded here.
+   *
+   * WHY IT MATTERS. Nothing else removes a DAG node, so every file the registry has since
+   * forgotten — a reclaimed tombstone, a dropped divergent duplicate, a metadata rebuild
+   * that re-minted fileIds — leaves its whole subgraph behind to be re-read, re-parsed and
+   * re-Mapped by *every* sync round. On a real 8.4k-file vault that was half the graph.
+   *
+   * The sweep is answer-preserving, not a retention decision: it keeps every root and
+   * every ancestor of one, so no merge base, fast-forward check or leaf computation can
+   * change (see {@link VersionDag.prune} for the argument). It therefore does NOT bound
+   * per-file history — a note edited ten thousand times keeps ten thousand nodes, which is
+   * the horizon question the DAG-pruning task holds open.
+   *
+   * The cases where sweeping would be indistinguishable from a lost `version-dag.json`
+   * (which `dagNeedsRebuild` answers with a full cursor rewind) are {@link sweepToRoots}'s
+   * to refuse; this only assembles the root set and persists a sweep that happened.
+   */
+  private async sweepVersionDag(dagStore: VersionDagStore, dag: VersionDag): Promise<void> {
+    const roots = this.registry.versionRoots();
+    // The pending oplog holds versions the registry may not name yet (an op recorded
+    // against an entry whose head write is still in flight). Rooting them is defensive and
+    // costs O(pending) — the log is bounded by a round.
+    for (const op of this.opLogger.getPendingOps()) {
+      if (op.id) roots.add(op.id);
+      for (const p of op.parents) if (p) roots.add(p);
+    }
+    // `save` rewrites the snapshot and folds away the journal — the same O(N) write
+    // `compact` already does, so it is only worth paying when the sweep found something.
+    if (sweepToRoots(dag, roots) > 0) await dagStore.save(dag);
   }
 
   /**
