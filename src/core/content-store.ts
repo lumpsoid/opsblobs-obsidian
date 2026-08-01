@@ -48,6 +48,17 @@ const PACK_INDEX_PATH = `${PACK_DIR}/index`;
 // repacking; too low → slow reclamation. Not load-bearing for correctness.
 const COMPACT_LIVE_FRACTION = 0.5;
 
+/**
+ * Byte budget for the in-memory blob cache (§ memCache below). Sized to hold a few
+ * whole packs (a 200-note pack of markdown is ~1 MB) so the whole-pack amortisation
+ * `getFromPack` relies on still pays off across a sync round, while staying well
+ * under what Obsidian mobile can absorb. Not load-bearing for correctness — every
+ * cached blob is durable in a pack, so an eviction only costs a re-read + C4
+ * re-verify. Exported so tests can reason about it; the constructor takes an
+ * override so a test can drive eviction with a handful of tiny blobs.
+ */
+export const MEM_CACHE_BUDGET_BYTES = 8 * 1024 * 1024;
+
 /** Where a packed blob's base64 body lives: which pack, the char offset of the body
  *  within it, and the body's char length. base64 is ASCII so char offset == byte
  *  offset; `pack.substr(offset, len)` slices the body with no delimiter scan. */
@@ -70,7 +81,20 @@ export async function hashString(s: string): Promise<string> {
 
 export class ContentStore {
   // In-memory cache to avoid repeated disk reads during a single sync session.
+  //
+  // **Bounded, LRU.** The store outlives every pass (one instance per plugin load), and
+  // a steady-state round applies far fewer items than a `PackCheckpoint` needs to fire,
+  // so nothing was ever dropping this: each round staged more, `keepWarm` skipped the
+  // terminal clear, and `getFromPack` pins a WHOLE pack per single-blob lookup. That is
+  // unbounded RAM growth for the life of the plugin. So the cache carries a byte budget
+  // ({@link MEM_CACHE_BUDGET_BYTES}) and evicts least-recently-used entries past it —
+  // which keeps the whole-pack amortisation (the reason `getFromPack` caches greedily)
+  // safe instead of merely tolerated. Map iteration order is insertion order, and a
+  // cache hit re-inserts, so the front of the map is the LRU end.
   private memCache: Map<string, Uint8Array> = new Map();
+  // Σ byteLength of everything in `memCache`, maintained on every insert/evict/delete
+  // so the budget check is O(1) rather than a walk.
+  private memBytes = 0;
 
   // ── Packed-blob state (A3) ──────────────────────────────────────────────────
   // In-memory index of every packed blob's location, loaded from `pack/index` at
@@ -81,6 +105,11 @@ export class ContentStore {
   // cleared) by `flushPack` at each checkpoint / on every `put`. Bounded to one chunk
   // of base64 (~MB).
   private packBuffer: Array<{ hash: string; b64: string }> = [];
+  // Hashes currently in `packBuffer`. Two jobs: (a) eviction skips them — a buffered
+  // blob is not durable yet, and dropping it would let a second `putBuffered` of the
+  // same hash re-buffer the same bytes into the pack; (b) it stands in for the memCache
+  // dedup guard in `putBuffered` once eviction can remove a still-pending entry.
+  private pending: Set<string> = new Set();
   // Monotonic per-chunk pack id, resumed past any pack already on disk at `init()` so
   // a new session never reuses an id and clobbers a pack.
   private nextPackId = 0;
@@ -91,7 +120,60 @@ export class ContentStore {
    *  diagnostics). Set by `main.ts` around the first-enable capture; null otherwise. */
   capturePutPerf: PutPerf | null = null;
 
-  constructor(private metadata: MetadataStore) {}
+  /**
+   * @param metadata      vault-metadata port the packs live on.
+   * @param memBudgetBytes  in-memory blob-cache ceiling; see {@link MEM_CACHE_BUDGET_BYTES}.
+   */
+  constructor(
+    private metadata: MetadataStore,
+    private readonly memBudgetBytes: number = MEM_CACHE_BUDGET_BYTES,
+  ) {}
+
+  /** Bytes currently held in the in-memory blob cache. Diagnostics + tests: this is the
+   *  number that must NOT trend upward across sync rounds. */
+  get memCacheBytes(): number {
+    return this.memBytes;
+  }
+
+  /** Entry count of the in-memory blob cache (diagnostics + tests). */
+  get memCacheEntries(): number {
+    return this.memCache.size;
+  }
+
+  /** Insert (or refresh) a cached blob and evict LRU entries until the budget holds. */
+  private cacheSet(hash: string, content: Uint8Array): void {
+    const prev = this.memCache.get(hash);
+    if (prev) this.memBytes -= prev.byteLength;
+    this.memCache.delete(hash); // re-insert at the MRU end
+    this.memCache.set(hash, content);
+    this.memBytes += content.byteLength;
+    this.evictToBudget();
+  }
+
+  /** Drop a cached blob, keeping the byte counter honest. */
+  private cacheDelete(hash: string): void {
+    const prev = this.memCache.get(hash);
+    if (!prev) return;
+    this.memBytes -= prev.byteLength;
+    this.memCache.delete(hash);
+  }
+
+  /**
+   * Evict from the LRU end until the cache fits its budget. Pending (buffered-not-yet-
+   * flushed) blobs are skipped — they are the one thing the cache is *authoritative*
+   * for. So the ceiling is `budget + one checkpoint's worth of buffered blobs`, the
+   * same bound the pack buffer itself already carries; it drains at the next
+   * `flushPack`. Stops when nothing evictable remains (never spins).
+   */
+  private evictToBudget(): void {
+    if (this.memBytes <= this.memBudgetBytes) return;
+    for (const [hash, content] of this.memCache) {
+      if (this.memBytes <= this.memBudgetBytes) return;
+      if (this.pending.has(hash)) continue;
+      this.memBytes -= content.byteLength;
+      this.memCache.delete(hash);
+    }
+  }
 
   async init(): Promise<void> {
     if (!(await this.metadata.exists(CONTENT_DIR))) {
@@ -138,19 +220,24 @@ export class ContentStore {
   /**
    * Buffer a blob for the next pack — NO I/O. The single write primitive: both bulk
    * writers (first-enable capture; the sync applicator) and the steady-state {@link put}
-   * go through here. A memCache hit means the blob was already written, buffered, or
-   * loaded this session — all imply it is on disk or about to be — so it is a no-op.
+   * go through here. A memCache or `pending` hit means the blob was already written,
+   * buffered, or loaded this session — all imply it is on disk or about to be — so it is
+   * a no-op. (An LRU eviction can drop a cached blob, so a later re-put may re-append
+   * bytes that are already packed; the index resolves that last-wins, exactly as it does
+   * for a blob re-captured in a later session.)
    *
    * Bulk writers call this in a loop and `flushPack()` once per checkpoint, amortising
    * to ~2 native writes per chunk. The base64 encode (CPU) + a RAM push are the only
    * cost here; the buffer is bounded to one chunk by the flush.
    */
   async putBuffered(hash: string, content: Uint8Array): Promise<void> {
-    if (this.memCache.has(hash)) return;
-    this.memCache.set(hash, content);
+    if (this.memCache.has(hash) || this.pending.has(hash)) return;
     const t = nowMs();
     const b64 = uint8ToBase64(content);
     if (this.capturePutPerf) this.capturePutPerf.encodeMs += nowMs() - t;
+    // Mark pending BEFORE caching so this blob is eviction-proof until it is flushed.
+    this.pending.add(hash);
+    this.cacheSet(hash, content);
     this.packBuffer.push({ hash, b64 });
   }
 
@@ -198,6 +285,10 @@ export class ContentStore {
     await this.metadata.append(this.packPath(packId), packBody);
     await this.metadata.append(PACK_INDEX_PATH, idxDelta);
     this.packBuffer = [];
+    // These blobs are durable now, so they lose their eviction exemption. Re-apply the
+    // budget: a bulk pass parks a whole checkpoint's worth of pending blobs above it.
+    this.pending.clear();
+    this.evictToBudget();
   }
 
   /** Retrieve content by hash. Returns null if not found — or if the stored bytes fail
@@ -207,7 +298,12 @@ export class ContentStore {
    *  three-way-merging against corrupt bytes. */
   async get(hash: string): Promise<Uint8Array | null> {
     const cached = this.memCache.get(hash);
-    if (cached) return cached;
+    if (cached) {
+      // Re-insert at the MRU end so the LRU order reflects reads, not just writes.
+      this.memCache.delete(hash);
+      this.memCache.set(hash, cached);
+      return cached;
+    }
     return this.getFromPack(hash);
   }
 
@@ -223,14 +319,19 @@ export class ContentStore {
     if (!loc) return null;
     const pack = await this.metadata.read(this.packPath(loc.packId));
     if (pack === null) return null;
+    // Hold the requested blob locally: a pack larger than the cache budget can evict it
+    // again before the loop ends, and the caller must still get its bytes.
+    let found: Uint8Array | null = this.memCache.get(hash) ?? null;
     for (const [h, l] of this.index) {
       if (l.packId !== loc.packId || this.memCache.has(h)) continue;
       const body = pack.substr(l.offset, l.len);
       if (body.length !== l.len) continue; // truncated/torn record → skip (reads missing)
       const content = base64ToUint8(body);
-      if ((await hashContent(content)) === h) this.memCache.set(h, content);
+      if ((await hashContent(content)) !== h) continue;
+      if (h === hash) found = content;
+      this.cacheSet(h, content);
     }
-    return this.memCache.get(hash) ?? null;
+    return found;
   }
 
   /** Check if content is available without loading it. */
@@ -243,7 +344,7 @@ export class ContentStore {
    *  read as missing (`get`/`has` miss) and the space is reclaimed when GC later retires
    *  or compacts the pack. The index rewrite keeps the drop durable across a reload. */
   async delete(hash: string): Promise<void> {
-    this.memCache.delete(hash);
+    this.cacheDelete(hash);
     if (this.index.delete(hash)) await this.rewriteIndex();
   }
 
@@ -291,7 +392,7 @@ export class ContentStore {
         await this.metadata.remove(this.packPath(packId));
         for (const h of hashes) {
           this.index.delete(h);
-          this.memCache.delete(h);
+          this.cacheDelete(h);
         }
         dirty = true;
       } else if (liveCount < hashes.length && liveCount / hashes.length < COMPACT_LIVE_FRACTION) {
@@ -324,10 +425,11 @@ export class ContentStore {
     const live = packMembers.filter(h => keepHashes.has(h));
     // Re-buffer each live blob. `get` whole-pack-reads the old pack once, hash-verifies
     // per blob (C4), and caches; a torn/missing blob returns null and is simply dropped
-    // (F1-safe). Push straight into the buffer, bypassing putBuffered's memCache guard.
+    // (F1-safe). Push straight into the buffer, bypassing putBuffered's dedup guard.
     for (const h of live) {
       const bytes = await this.get(h);
       if (bytes === null) continue;
+      this.pending.add(h); // mirrors packBuffer — keeps it eviction-exempt until flushed
       this.packBuffer.push({ hash: h, b64: uint8ToBase64(bytes) });
     }
     await this.flushPack(); // durable: reassigns each live hash's index entry to the new pack
@@ -337,7 +439,7 @@ export class ContentStore {
     for (const h of packMembers) {
       if (this.index.get(h)?.packId === packId) {
         this.index.delete(h);
-        this.memCache.delete(h);
+        this.cacheDelete(h);
       }
     }
   }
@@ -366,8 +468,13 @@ export class ContentStore {
     await this.metadata.write(PACK_INDEX_PATH, body);
   }
 
+  /** Drop the whole in-memory blob cache (bulk-pass checkpoints). The LRU budget already
+   *  bounds RAM, so this is now an optimisation — release a pass's working set at once
+   *  rather than paying for it to age out — not the only thing keeping the cache finite.
+   *  `packBuffer`/`pending` are untouched: buffered bytes live in the buffer itself. */
   clearMemCache(): void {
     this.memCache.clear();
+    this.memBytes = 0;
   }
 
   /** Ensure the `pack/` directory exists (once per session). */

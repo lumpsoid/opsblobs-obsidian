@@ -71,6 +71,7 @@ Two distinct problems remain:
 
 **Non-goals**
 - Steady-state round `memCache` bounding (perf-baseline B6) — a separate follow-up.
+  (Done 2026-08-01: an LRU byte budget in `ContentStore`; see B6 / Appendix A #3.)
 - The DAG-walk (B2) and cold-pull (B4) costs — separate.
 - Any migration/compat tooling (see §0).
 

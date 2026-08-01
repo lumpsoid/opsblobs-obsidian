@@ -219,6 +219,12 @@ With C1 reverted, the warm tail is **inherent** and needs no special-casing: the
 simply never reaches the threshold again on the final window. Recorded here so any future re-clearing
 of the memCache (a pack-writes rewrite, a chunked retry) preserves it.
 
+**Bounded cache (2026-08-01).** The memCache now evicts LRU past a byte budget (perf-baseline B6),
+so the warm tail is warm *up to the budget* rather than unconditionally: a capture whose tail exceeds
+8 MiB of content loses its oldest blobs and pays the disk read + C4 verify for those in the next
+round. That is the intended trade (the alternative was dropping the tail entirely every round), and
+`round-stat-gate.test.ts` still pins the sub-budget case — the one the property was written for.
+
 ## 6. Testing plan
 
 Drive the **real** device stack (TestDevice over the in-memory fakes; guide testing doctrine) —

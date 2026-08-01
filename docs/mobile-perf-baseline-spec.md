@@ -233,7 +233,8 @@ delta-sized writer. Confirm bytes-written scales O(F) per mutated file (O(F²) p
 **B6 — Memory over a session.**
 Run N=50 consecutive rounds touching different files; sample RSS (post-GC) after each.
 *Hypothesis:* `ContentStore.memCache` grows unbounded toward total distinct content bytes —
-`clearMemCache()` exists but is **never called** (`content-store.ts:31,112`). Also record the
+`clearMemCache()` exists but is **never called** (`content-store.ts:31,112`). **Confirmed and
+fixed 2026-08-01** — the cache is now LRU-bounded by a byte budget; see Appendix A #3. Also record the
 transient per-round peak (B1) and the resident DAG footprint at each profile (nodes ≈ H).
 
 **B7 — Concurrent-head fold vs C.**
@@ -374,6 +375,14 @@ are not fixes** — they are the map of what to measure.
    B2/B2b §5 measured-notes.
 3. **`ContentStore.memCache` is unbounded; `clearMemCache()` is never called** —
    `content-store.ts:31,112`. Session-lifetime RAM growth toward total content bytes. (B6)
+   — **FIXED (2026-08-01).** The cache now carries a byte budget
+   (`MEM_CACHE_BUDGET_BYTES`, 8 MiB) and evicts LRU past it, so RAM is bounded whether or
+   not anything calls `clearMemCache()`. Blobs still buffered for the next pack flush are
+   eviction-exempt (the buffer must not be undercut), so the ceiling is
+   budget + one checkpoint's buffered blobs. Keeping the budget rather than clearing per
+   round is what preserves `getFromPack`'s whole-pack amortisation and the §5.1 warm tail.
+   Pinned by `__tests__/content-store-mem-budget.test.ts` (including 20 real sync rounds
+   over the device stack).
 4. **FileRegistry full pretty-printed JSON rewrite on every one of ~12 mutation sites**, looped
    per-file during capture/apply → up to O(F²) bytes written, ×~3 fs ops via the atomic
    temp+remove+rename dance. `file-registry.ts`, `obsidian-metadata-store.ts:33-49`. (B3, B5)

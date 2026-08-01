@@ -15,7 +15,7 @@
 import { FileEntry, Operation, MergeAction, HLC, SyncSettings, DEFAULT_SETTINGS } from '../../src/types';
 import { HybridLogicalClock } from '../../src/core/hlc';
 import { FileRegistry } from '../../src/core/file-registry';
-import { ContentStore } from '../../src/core/content-store';
+import { ContentStore, MEM_CACHE_BUDGET_BYTES } from '../../src/core/content-store';
 import { OperationLogger } from '../../src/core/operation-logger';
 import { SyncApplicator, DeferConflict } from '../../src/network/sync-applicator';
 import { PluginVaultSyncHost } from '../../src/network/vault-sync-host';
@@ -39,6 +39,9 @@ export interface TestDeviceOptions {
   wall?: number;
   /** Override any DEFAULT_SETTINGS field (e.g. `maxFileSizeMb`, `excludedPatterns`). */
   settings?: Partial<SyncSettings>;
+  /** Shrink the ContentStore's in-memory blob budget so a test can drive LRU eviction
+   *  with a handful of small notes instead of megabytes. Default: production's. */
+  memBudgetBytes?: number;
 }
 
 /** How a device resolves a delete/modify(-or-rename) conflict. */
@@ -94,7 +97,11 @@ export class TestDevice {
    *  can assert which decision the genuine `mergeVaultStates` produced. */
   readonly applied: MergeAction[] = [];
 
+  /** Blob-cache budget this device was built with, carried across `reload()`. */
+  private readonly memBudgetBytes: number;
+
   constructor(private deviceId: string, opts: TestDeviceOptions = {}) {
+    this.memBudgetBytes = opts.memBudgetBytes ?? MEM_CACHE_BUDGET_BYTES;
     // Reuse the caller's fakes on a reload (persisted state survives) or start fresh.
     this.files = opts.files ?? new FakeVaultFiles();
     this.metadata = opts.metadata ?? new FakeMetadataStore();
@@ -107,7 +114,7 @@ export class TestDevice {
     this.hlc = new HybridLogicalClock(deviceId, opts.seedHlc, () => this.clock.wall);
     this.hlcStore = new HlcStore(this.metadata);
     this.registry = new FileRegistry(this.metadata, this.files, deviceId, getSettings);
-    this.contentStore = new ContentStore(this.metadata);
+    this.contentStore = new ContentStore(this.metadata, this.memBudgetBytes);
     this.opLogger = new OperationLogger(
       this.files,
       this.watcher,
@@ -178,6 +185,7 @@ export class TestDevice {
       metadata: this.metadata,
       seedHlc: persistedHlc ?? undefined,
       wall: this.clock.wall,
+      memBudgetBytes: this.memBudgetBytes,
     });
   }
 
