@@ -301,6 +301,20 @@ Findings:
   later" button. The "full inline" follow-up then **deleted the modals** — delete/binary conflicts
   defer on every round into the Conflicts panel and are only ever resolved by an explicit inline
   choice, so a silent-dismiss default no longer exists to guard against.
+- **P1 — resolving many conflicts was one file at a time, and the list moved under you. ✅ SHIPPED
+  (post-audit).** The "All mine / All theirs / Keep both" pickers only existed in *file* scope, so a
+  round that conflicted twenty notes meant twenty identical passes; and every resolution dropped its
+  card immediately, reflowing everything below it mid-click.
+  **Shipped:** (a) a list-scope **bulk bar** above the cards — the same three pickers applied to
+  every live text conflict, plus one **Apply all** behind a `ConfirmModal` (it states that unpicked
+  changes keep Mine, the `resolveMarkedText` default). It appears only at ≥2 text conflicts, and
+  like the per-file bar the pickers *only set picks* — the single confirmed write is Apply all.
+  Delete/binary cards are deliberately **excluded** from the bulk sweep: the "full inline" decision
+  above makes an explicit per-card choice the only way those resolve. (b) a **sticky list** — a
+  resolved card keeps its slot, frozen (dimmed, actions disabled, "Resolved" badge, "Open note" still
+  live) rather than vanishing. Frozen cards clear when the user leaves the tab (`active-leaf-change`
+  away from the leaf, or `onClose`) or on an explicit **Clear now** — the only moments a height
+  change can't cost a misclick.
 - **P2 — binary conflict shows only text metadata ◑ PARTIAL.** The binary decision is now an inline
   panel card showing size + device + time per side; the raw UUID is gone (it uses the same
   `describeDevice` short label as the text-conflict provenance chips). **Still open:** an image

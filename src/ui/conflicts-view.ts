@@ -11,12 +11,23 @@
 //  marker-free text back through the vault, which is exactly the ordinary Step-5
 //  resolving save (a modify event → the op-logger's two-headed branch → the two-parent
 //  merge node). Manual-smoke surface per the engineering guide.
+//
+//  Two list-level affordances sit above the cards:
+//    • a **bulk bar** — the per-file "All mine / All theirs / Keep both" pickers widened
+//      to *every* text conflict, plus one "Apply all" that writes them in a single
+//      confirmed pass. Delete/binary cards are deliberately excluded: §3 of the UX audit
+//      makes an explicit inline choice the only way those resolve.
+//    • a **sticky list** — a card resolved while the tab is open stays in place, frozen
+//      and dimmed, instead of vanishing and reflowing every card below it under the
+//      pointer. Resolved cards clear when the user leaves the tab (or on "Clear
+//      resolved") — the one moment a height change can't cost a misclick.
 
-import { ButtonComponent, ItemView, WorkspaceLeaf, setIcon } from 'obsidian';
+import { ButtonComponent, ItemView, Notice, WorkspaceLeaf, setIcon } from 'obsidian';
 import { ConflictResolution } from '../types';
 import { ConflictListItem } from '../core/conflict-inventory';
 import { ConflictDescriptor, ConflictDecision } from '../network/sync-state-store';
 import { parseConflictMarkers, resolveMarkedText, ConflictMarkerSegment } from '../merge/diff3';
+import { ConfirmModal } from './confirm-modal';
 
 export const CONFLICTS_VIEW_TYPE = 'vault-sync-conflicts';
 
@@ -45,6 +56,18 @@ export interface ConflictsViewHost {
 
 type SelectionKind = 'local' | 'remote' | 'both';
 
+/** What a card needs to paint, captured at the last render where it was still live.
+ *  Once the conflict clears, the snapshot is what the frozen card keeps showing — same
+ *  content, so the card keeps exactly the height it had. */
+type CardSnapshot =
+  | { kind: 'text'; item: ConflictListItem; text: string | null; segments: ConflictMarkerSegment[] | null }
+  | { kind: 'db'; descriptor: ConflictDescriptor };
+
+/** Card keys are namespaced because a text conflict and a delete/binary conflict for the
+ *  same file would otherwise collide on `fileId`. */
+const textKey = (fileId: string): string => `t:${fileId}`;
+const dbKey = (fileId: string): string => `d:${fileId}`;
+
 export class ConflictsView extends ItemView {
   private unsubscribe: (() => void) | null = null;
   /** Per-file, per-hunk choice. Kept across re-renders so a spurious refresh (an op
@@ -53,8 +76,16 @@ export class ConflictsView extends ItemView {
   /** Files whose resolved-result preview is expanded. Tracked (like {@link selections})
    *  so the preview survives the re-render every side-pick triggers and updates live. */
   private previewOpen = new Set<string>();
+  /** Render order of every card the tab has shown, live or resolved — append-only for as
+   *  long as the tab is open. This is what makes the list stable: a resolved card keeps
+   *  its slot instead of collapsing and dragging the rest up under the pointer. */
+  private order: string[] = [];
+  /** The last-live paint data per card key (see {@link CardSnapshot}). */
+  private snapshots = new Map<string, CardSnapshot>();
   /** Guards against overlapping async renders clobbering each other. */
   private renderToken = 0;
+  /** True while a bulk apply is in flight — keeps a second click from re-firing it. */
+  private applyingAll = false;
 
   constructor(leaf: WorkspaceLeaf, private host: ConflictsViewHost) {
     super(leaf);
@@ -66,12 +97,22 @@ export class ConflictsView extends ItemView {
 
   async onOpen(): Promise<void> {
     this.unsubscribe = this.host.onChange(() => { void this.render(); });
+    // Leaving the tab is the moment the list may safely shrink — nothing is under the
+    // pointer here anymore. Drop the resolved cards then, so coming back shows only
+    // what still needs attention.
+    this.registerEvent(this.app.workspace.on('active-leaf-change', leaf => {
+      if (leaf !== this.leaf) this.clearResolved();
+    }));
     await this.render();
   }
 
   async onClose(): Promise<void> {
     this.unsubscribe?.();
     this.unsubscribe = null;
+    this.order = [];
+    this.snapshots.clear();
+    this.selections.clear();
+    this.previewOpen.clear();
   }
 
   /** Public so the plugin can force a refresh right after a sync round. */
@@ -91,6 +132,38 @@ export class ConflictsView extends ItemView {
     const texts = await Promise.all(items.map(i => this.host.readFile(i.path)));
     if (token !== this.renderToken) return; // a newer render superseded us
 
+    // ── Sticky bookkeeping ────────────────────────────────────────────────────
+    // Refresh the snapshot of every live card and give any newcomer a slot at the end.
+    // Delete/binary first on a first paint (one decision each, cheapest to clear), then
+    // the text cards; later arrivals just append, so nothing already on screen moves.
+    const live = new Set<string>();
+    for (const c of dbConflicts) {
+      const key = dbKey(c.fileId);
+      live.add(key);
+      this.snapshots.set(key, { kind: 'db', descriptor: c });
+      if (!this.order.includes(key)) this.order.push(key);
+    }
+    items.forEach((item, idx) => {
+      const key = textKey(item.fileId);
+      live.add(key);
+      const text = texts[idx] ?? null;
+      this.snapshots.set(key, {
+        kind: 'text',
+        item,
+        text,
+        segments: text === null ? null : parseConflictMarkers(text),
+      });
+      if (!this.order.includes(key)) this.order.push(key);
+    });
+    // Everything left in `order` but no longer live was resolved while the tab is open.
+    const resolvedCount = this.order.reduce((n, key) => (live.has(key) ? n : n + 1), 0);
+
+    // Prune per-file UI state only once a card leaves the list entirely — a resolved
+    // card still renders, and its picks are what it shows.
+    const kept = new Set(this.order);
+    for (const id of [...this.selections.keys()]) if (!kept.has(textKey(id))) this.selections.delete(id);
+    for (const id of [...this.previewOpen]) if (!kept.has(textKey(id))) this.previewOpen.delete(id);
+
     root.empty();
     root.addClass('vault-sync-conflicts-view');
 
@@ -103,33 +176,139 @@ export class ConflictsView extends ItemView {
         : `${total} item${total !== 1 ? 's' : ''} need${total === 1 ? 's' : ''} your attention.`,
     });
 
-    // Prune per-file UI state for text files that are no longer conflicted.
-    const liveIds = new Set(items.map(i => i.fileId));
-    for (const id of [...this.selections.keys()]) if (!liveIds.has(id)) this.selections.delete(id);
-    for (const id of [...this.previewOpen]) if (!liveIds.has(id)) this.previewOpen.delete(id);
-
-    if (total === 0) {
+    if (this.order.length === 0) {
       setIcon(root.createDiv('vault-sync-conflicts-empty'), 'check-circle-2');
       return;
     }
 
-    // Delete/binary conflicts first (a single decision each), then the text-merge cards.
-    if (dbConflicts.length > 0) {
-      for (const c of dbConflicts) this.renderDecisionCard(root, c);
+    // The bulk bar acts on the live text conflicts that actually still hold markers.
+    const bulk = this.order
+      .filter(key => live.has(key))
+      .map(key => this.snapshots.get(key))
+      .filter((s): s is Extract<CardSnapshot, { kind: 'text' }> =>
+        s?.kind === 'text' && !!s.segments?.some(seg => seg.kind === 'conflict'));
+    if (bulk.length >= 2) this.renderBulkBar(root, bulk);
+
+    if (resolvedCount > 0) this.renderResolvedNote(root, resolvedCount);
+
+    for (const key of this.order) {
+      const snap = this.snapshots.get(key);
+      if (!snap) continue;
+      const frozen = !live.has(key);
+      if (snap.kind === 'db') this.renderDecisionCard(root, snap.descriptor, frozen);
+      else this.renderFileCard(root, snap.item, snap.text, snap.segments, frozen);
     }
-    items.forEach((item, idx) => {
-      this.renderFileCard(root, item, texts[idx] ?? null);
+  }
+
+  /** List-scope side pickers + one "Apply all" — the per-file bar widened to every text
+   *  conflict. The pickers only *set* picks (same as in-file, so a stray tap can't write
+   *  anything); "Apply all" is the single confirmed write. */
+  private renderBulkBar(root: HTMLElement, targets: Extract<CardSnapshot, { kind: 'text' }>[]): void {
+    const bar = root.createDiv('vault-sync-conflicts-bulk');
+    bar.createSpan({
+      cls: 'vault-sync-conflicts-bulk-label',
+      text: `All ${targets.length} files:`,
     });
+
+    const setAll = (kind: SelectionKind) => {
+      for (const t of targets) {
+        const sel = this.selectionFor(t.item.fileId);
+        let ci = 0;
+        for (const seg of t.segments ?? []) if (seg.kind === 'conflict') sel.set(ci++, kind);
+      }
+      void this.render();
+    };
+    const picker = (label: string, kind: SelectionKind, tooltip: string) => {
+      new ButtonComponent(bar).setButtonText(label).setTooltip(tooltip)
+        .setDisabled(this.applyingAll)
+        .onClick(() => setAll(kind));
+    };
+    picker('All mine', 'local', `Pick Mine for every change in all ${targets.length} files — nothing is written until you apply.`);
+    picker('All theirs', 'remote', `Pick Theirs for every change in all ${targets.length} files — nothing is written until you apply.`);
+    picker('Keep both', 'both', `Keep both on every change in all ${targets.length} files — Mine first, then Theirs.`);
+
+    new ButtonComponent(bar)
+      .setButtonText(this.applyingAll ? 'Applying…' : 'Apply all')
+      .setCta()
+      .setTooltip('Write the current picks for every file above, in one pass.')
+      .setDisabled(this.applyingAll)
+      .onClick(() => { void this.applyAll(targets); });
+  }
+
+  /** The "held in place" explainer for resolved-but-still-listed cards, so a frozen card
+   *  reads as intentional rather than stuck. */
+  private renderResolvedNote(root: HTMLElement, count: number): void {
+    const note = root.createDiv('vault-sync-conflicts-resolved-note');
+    note.createSpan({
+      text: `${count} resolved — kept in place so the list doesn't jump. Cleared when you leave this tab.`,
+    });
+    new ButtonComponent(note).setButtonText('Clear now').onClick(() => this.clearResolved());
+  }
+
+  /** Drop the frozen cards and repaint. Called on "Clear now" and when the tab loses
+   *  focus — never mid-list, which is the whole point. */
+  private clearResolved(): void {
+    if (this.order.length === 0) return;
+    const live = new Set<string>([
+      ...this.host.listDeleteBinaryConflicts().map(c => dbKey(c.fileId)),
+      ...this.host.listConflicts().map(i => textKey(i.fileId)),
+    ]);
+    if (this.order.every(key => live.has(key))) return; // nothing frozen — don't repaint
+    this.order = this.order.filter(key => live.has(key));
+    for (const key of [...this.snapshots.keys()]) if (!live.has(key)) this.snapshots.delete(key);
+    void this.render();
+  }
+
+  /** Apply every live text conflict's current picks in one pass. Confirmed first: this
+   *  is N resolving saves, and unpicked changes silently take Mine (the
+   *  `resolveMarkedText` default), which the prompt says out loud. */
+  private async applyAll(targets: Extract<CardSnapshot, { kind: 'text' }>[]): Promise<void> {
+    const confirmed = await new Promise<boolean>(resolve => {
+      new ConfirmModal(this.app, {
+        title: 'Apply all resolutions',
+        message:
+          `Write the current picks to ${targets.length} files? Any change you haven't picked a ` +
+          'side for keeps Mine. The other versions stay in the sync history and can be recovered.',
+        confirmText: `Apply to ${targets.length} files`,
+      }, resolve).open();
+    });
+    if (!confirmed) return;
+
+    this.applyingAll = true;
+    void this.render();
+    const failed: string[] = [];
+    try {
+      for (const t of targets) {
+        if (t.text === null) continue;
+        const resolved = resolveMarkedText(t.text, this.resolutionsFrom(this.selectionFor(t.item.fileId)));
+        try {
+          await this.host.resolveFile(t.item.path, resolved);
+        } catch {
+          // One bad write must not strand the rest — carry on and report at the end.
+          failed.push(t.item.path);
+        }
+      }
+    } finally {
+      this.applyingAll = false;
+      void this.render(); // drop the "Applying…" state even if a write threw
+    }
+    if (failed.length > 0) {
+      new Notice(`Could not resolve ${failed.length} file${failed.length !== 1 ? 's' : ''}: ${failed.join(', ')}`);
+    }
+    // Same debounced-flush wait as the single-file apply.
+    window.setTimeout(() => this.refresh(), 400);
   }
 
   /** A delete/binary conflict card: one decision, resolved inline (§3 "full inline").
-   *  Recording a choice triggers a sync that applies it; the card drops on refresh. */
-  private renderDecisionCard(root: HTMLElement, c: ConflictDescriptor): void {
-    const card = root.createDiv('vault-sync-conflict-card');
+   *  Recording a choice triggers a sync that applies it; once it lands the card stays,
+   *  frozen, until the tab is left. */
+  private renderDecisionCard(root: HTMLElement, c: ConflictDescriptor, frozen: boolean): void {
+    const card = root.createDiv(`vault-sync-conflict-card${frozen ? ' is-resolved' : ''}`);
     const head = card.createDiv('vault-sync-conflict-card-header');
     const title = head.createDiv('vault-sync-conflict-path');
     setIcon(title.createSpan('vault-sync-conflict-path-icon'), c.kind === 'delete' ? 'trash-2' : 'image');
     title.createSpan({ text: c.path });
+    if (frozen) this.renderResolvedBadge(head);
 
     // Explanation, then any per-side detail, then the decision buttons last — so the
     // buttons always sit at the bottom of the card, below the context they act on.
@@ -144,7 +323,7 @@ export class ConflictsView extends ItemView {
 
     const resolve = (decision: ConflictDecision) => {
       // Optimistically disable the whole card while the applying round runs.
-      actions.querySelectorAll('button').forEach(btn => (btn as HTMLButtonElement).disabled = true);
+      disableButtons(actions);
       void this.host.resolveDeleteBinary(c.fileId, decision);
     };
 
@@ -167,6 +346,13 @@ export class ConflictsView extends ItemView {
       new ButtonComponent(actions).setButtonText("Keep other device's version")
         .onClick(() => resolve({ kind: 'binary', decision: 'keep_remote' }));
     }
+
+    if (frozen) disableButtons(actions);
+  }
+
+  /** The one marker that says a card is history, not work. Colour + word (no glyph). */
+  private renderResolvedBadge(head: HTMLElement): void {
+    head.createDiv({ cls: 'vault-sync-conflict-resolved-badge', text: 'Resolved' });
   }
 
   private renderBinarySide(parent: HTMLElement, label: string, bytes: number, deviceId: string, at: number): void {
@@ -177,14 +363,21 @@ export class ConflictsView extends ItemView {
     el.createDiv({ text: `${formatBytes(bytes)} · ${who}${when ? ` · ${when}` : ''}`, cls: 'vault-sync-binary-side-meta' });
   }
 
-  private renderFileCard(root: HTMLElement, item: ConflictListItem, text: string | null): void {
-    const card = root.createDiv('vault-sync-conflict-card');
+  private renderFileCard(
+    root: HTMLElement,
+    item: ConflictListItem,
+    text: string | null,
+    segments: ConflictMarkerSegment[] | null,
+    frozen: boolean,
+  ): void {
+    const card = root.createDiv(`vault-sync-conflict-card${frozen ? ' is-resolved' : ''}`);
 
     // ── Header: path + per-head provenance ────────────────────────────────────
     const head = card.createDiv('vault-sync-conflict-card-header');
     const title = head.createDiv('vault-sync-conflict-path');
     setIcon(title.createSpan('vault-sync-conflict-path-icon'), 'file-text');
     title.createSpan({ text: item.path });
+    if (frozen) this.renderResolvedBadge(head);
 
     const prov = head.createDiv('vault-sync-conflict-provenance');
     const sideLabels = ['Mine', 'Theirs'];
@@ -195,7 +388,7 @@ export class ConflictsView extends ItemView {
       chip.setText(`${sideLabels[i] ?? `Head ${i + 1}`}: ${who}${when ? ` · ${when}` : ''}`);
     });
 
-    if (text === null || parseConflictMarkers(text).every(s => s.kind === 'clean')) {
+    if (text === null || segments === null || segments.every(s => s.kind === 'clean')) {
       // The file no longer holds markers (resolved out-of-band, or mid-write) — offer
       // to open it; the next round/refresh will drop it from the list.
       const note = card.createDiv('vault-sync-conflict-note');
@@ -206,7 +399,6 @@ export class ConflictsView extends ItemView {
       return;
     }
 
-    const segments = parseConflictMarkers(text);
     const conflictIdxs: number[] = [];
     segments.forEach((s, i) => { if (s.kind === 'conflict') conflictIdxs.push(i); });
 
@@ -223,13 +415,14 @@ export class ConflictsView extends ItemView {
     new ButtonComponent(globalBar).setButtonText('Keep both')
       .setTooltip('Keep both on every change — Mine first, then Theirs')
       .onClick(() => setAll('both'));
+    if (frozen) disableButtons(globalBar);
 
     // ── Per-hunk 3-way compare ────────────────────────────────────────────────
     const list = card.createDiv('vault-sync-conflict-hunks');
     let ci = 0;
     for (const seg of segments) {
       if (seg.kind !== 'conflict') continue;
-      this.renderHunk(list, seg, ci, sel);
+      this.renderHunk(list, seg, ci, sel, frozen);
       ci++;
     }
 
@@ -253,9 +446,12 @@ export class ConflictsView extends ItemView {
     new ButtonComponent(footer)
       .setButtonText('Apply resolution')
       .setCta()
+      // A frozen card's picks are already on disk; "Edit in note" stays live so the
+      // user can still open what they just resolved.
+      .setDisabled(frozen || this.applyingAll)
       .onClick(() => { void this.applyResolution(item, text, sel); });
     new ButtonComponent(footer)
-      .setButtonText('Edit in note')
+      .setButtonText(frozen ? 'Open note' : 'Edit in note')
       .onClick(() => { void this.host.openFile(item.path); });
   }
 
@@ -272,6 +468,7 @@ export class ConflictsView extends ItemView {
     seg: Extract<ConflictMarkerSegment, { kind: 'conflict' }>,
     ci: number,
     sel: Map<number, SelectionKind>,
+    frozen: boolean,
   ): void {
     const chosen = sel.get(ci) ?? 'local';
     const hunk = list.createDiv('vault-sync-hunk');
@@ -286,7 +483,7 @@ export class ConflictsView extends ItemView {
       el.createDiv({ cls: 'vault-sync-pane-label', text: label });
       const pre = el.createEl('pre', { cls: 'vault-sync-pane-code' });
       pre.createEl('code', { text: lines.length ? lines.join('\n') : '(empty)' });
-      if (kind) {
+      if (kind && !frozen) {
         el.addEventListener('click', () => { sel.set(ci, kind); void this.render(); });
       }
     };
@@ -302,6 +499,7 @@ export class ConflictsView extends ItemView {
         .onClick(() => { sel.set(ci, kind); void this.render(); });
       if (tooltip) b.setTooltip(tooltip);
       if (chosen === kind) b.setCta();
+      if (frozen) b.setDisabled(true);
     };
     btn('Mine', 'local');
     btn('Theirs', 'remote');
@@ -315,9 +513,9 @@ export class ConflictsView extends ItemView {
   ): Promise<void> {
     const resolved = resolveMarkedText(text, this.resolutionsFrom(sel));
     await this.host.resolveFile(item.path, resolved);
-    this.selections.delete(item.fileId);
-    // The resolving save clears the two-headed marker asynchronously (debounced op
-    // flush); refresh shortly after so the card drops once it's really resolved.
+    // The picks are kept (not dropped) so the frozen card keeps showing what was
+    // applied. The resolving save clears the two-headed marker asynchronously
+    // (debounced op flush); refresh shortly after so the card freezes once it lands.
     window.setTimeout(() => this.refresh(), 400);
   }
 
@@ -326,6 +524,12 @@ export class ConflictsView extends ItemView {
     if (!s) { s = new Map(); this.selections.set(fileId, s); }
     return s;
   }
+}
+
+/** Disable every button inside a container — used to freeze a resolved card's actions
+ *  and to lock a decision card while its applying round runs. */
+function disableButtons(container: HTMLElement): void {
+  container.querySelectorAll('button').forEach(btn => { btn.disabled = true; });
 }
 
 /** A compact relative-time label ("just now" / "5m ago" / "3h ago" / "2d ago") from
