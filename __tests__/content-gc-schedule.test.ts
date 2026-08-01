@@ -18,7 +18,7 @@ import { SyncRoundSummary } from '../src/network/server-sync';
 import { SyncCoordinator, gcDue, GC_MIN_INTERVAL_MS } from '../src/network/sync-coordinator';
 import { TestDevice } from './helpers/test-device';
 
-const EMPTY_SUMMARY: SyncRoundSummary = { pushed: 0, pulled: 0, deferred: [], stranded: [], deferredConflicts: [] };
+const EMPTY_SUMMARY: SyncRoundSummary = { pushed: 0, pulled: 0, deferred: [], stranded: [], deferredConflicts: [], applyFailures: [] };
 const DAY = 24 * 60 * 60 * 1000;
 
 /** A coordinator over a real device stack + a real SyncStateStore, with a settable

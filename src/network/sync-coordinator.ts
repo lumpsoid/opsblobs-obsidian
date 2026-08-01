@@ -159,10 +159,27 @@ export class SyncCoordinator {
       // auto-defers are just this round's `deferredConflicts`, replaced wholesale
       // below. A conflict that resolved automatically simply stops appearing.
       await this.recordRoundOutcome(summary);
-      await this.syncState.clearError();
+      // A round can now COMPLETE while individual actions failed: the applicator
+      // isolates a throwing action, defers that file and carries on, so one awkward
+      // file no longer aborts the apply and wedges the vault. But those files are
+      // only deferred — they will retry forever if the fault is permanent, and a
+      // deferral on its own reads as "retries automatically, nothing to do here".
+      // So a round with failures is reported as an error even though it finished
+      // (guide §7: a loud failure is fine, a silent loop is not).
+      const failed = summary.applyFailures;
+      const first = failed[0];
+      if (first) {
+        const rest = failed.length - 1;
+        const message = `Couldn't apply ${failed.length} change(s): ${first.path} — ${first.message}`
+          + (rest > 0 ? ` (and ${rest} more)` : '');
+        await this.syncState.setError(message, this.now());
+        this.notifier.error(message);
+      } else {
+        await this.syncState.clearError();
+      }
       await this.markSynced();
 
-      if (source === 'manual') this.notifier.info('Sync complete');
+      if (source === 'manual' && !first) this.notifier.info('Sync complete');
       // Maintenance, after the round is fully recorded and the user has been told it
       // finished: nothing below this point can change the round's outcome.
       await this.maybeRunGc();

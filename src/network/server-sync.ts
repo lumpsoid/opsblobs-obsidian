@@ -72,6 +72,7 @@ export {
   DecryptError,
 } from './sync-errors';
 import { SyncCancelToken } from './sync-cancellation';
+import { ApplyFailure } from './sync-applicator';
 export { SyncCancelToken, SyncCancelledError } from './sync-cancellation';
 
 /** One blob in a batch upload: its (blinded) hash and the *encrypted* envelope. */
@@ -170,8 +171,11 @@ export interface VaultSyncHost {
    *  on-disk drift (F5) or an auto-deferred conflict — the caller holds the cursor
    *  so their remote ops re-pull next round) and `deferredConflicts` (the subset of
    *  `deferred` that is an auto-deferred delete/binary conflict, surfaced with
-   *  reason 'conflict' — Step 7's derived replacement for the outstanding badge). */
-  applyMerge(actions: MergeAction[], local: VaultState, remote: VaultState): Promise<{ deferred: Set<string>; deferredConflicts: Set<string> }>;
+   *  reason 'conflict' — Step 7's derived replacement for the outstanding badge).
+   *  `failures` are actions that threw: each is also in `deferred` (so the cursor is
+   *  held and it retries), reported separately so a permanent failure surfaces as an
+   *  error instead of an ever-retrying deferral. */
+  applyMerge(actions: MergeAction[], local: VaultState, remote: VaultState): Promise<{ deferred: Set<string>; deferredConflicts: Set<string>; failures: ApplyFailure[] }>;
   /** Drop the pending ops once they are durably on the server. */
   clearPendingOps(): Promise<void>;
   loadCursor(): Promise<number>;
@@ -329,6 +333,12 @@ export interface SyncRoundSummary {
    *  `reason:'conflict'` in the observable state — the derived replacement for the
    *  old hand-maintained outstanding-conflict set (sync v2 Step 7). */
   deferredConflicts: string[];
+  /** Actions that THREW while being applied. Each fileId is also in `deferred` (the
+   *  cursor is held, so it re-pulls and retries next round), but a deferral alone
+   *  reads as "retries automatically, no action needed" — which is a lie for a
+   *  permanent fault. The plugin records these as the round's error so a repeatedly
+   *  failing action is visible instead of silently looping (guide §7). */
+  applyFailures: ApplyFailure[];
 }
 
 /** Whether this device's passphrase agrees with the vault already on the server:
@@ -447,6 +457,12 @@ export class ServerSyncClient {
       throw new KeyMismatchError();
     }
     const keyCheckAbsent = existingKeyCheck === null;
+    // Lapped separately from the DAG guard below: this half is a **network** round-trip
+    // (preflight RTT, plus a TLS handshake on a cold connection) and the crypto verify,
+    // while the next is **local** disk+parse. Fused, a slow lap couldn't be attributed
+    // to either — link latency and graph size are different problems with different
+    // fixes, so they get different lines in perf-log.txt.
+    timer?.lap('keycheck');
 
     // Self-heal a lost/corrupt version-DAG before reading the cursor. If the graph
     // was torn away (an old build's non-atomic write, a deleted metadata file) but
@@ -465,7 +481,9 @@ export class ServerSyncClient {
       this.onProgress?.('Rebuilding sync history…');
       await this.host.saveCursor(0);
     }
-    timer?.lap('keycheck+dag-guard');
+    // Local half: one `version-dag.json` read + `VersionDag.fromJSON` (O(nodes)) + the
+    // journal replay, then the (free) guard check. Grows with graph size, not the link.
+    timer?.lap('dag-guard');
     this.cancelToken?.throwIfCancelled();
 
     // Build the local IDENTITY only (entries + pending ops + the A1 stat-gate hash
@@ -569,7 +587,7 @@ export class ServerSyncClient {
     // an unchanged vault report "Applying 8390 changes" when nothing local was written.
     const localChanges = merge.actions.filter(affectsLocalVault).length;
     if (localChanges > 0) this.onProgress?.(`Applying ${localChanges} change(s)…`);
-    const { deferred, deferredConflicts } = await this.host.applyMerge(merge.actions, local, remote);
+    const { deferred, deferredConflicts, failures } = await this.host.applyMerge(merge.actions, local, remote);
     timer?.lap('applyMerge');
 
     // ── 4b. Multi-head reconciliation sweep (causal audit Finding B) ─────────
@@ -587,7 +605,7 @@ export class ServerSyncClient {
     // conflict) are skipped: their cursor is held so the whole round re-pulls, and
     // reconciling them here would write over the very in-window edit F5 protects.
     this.onProgress?.('Reconciling…');
-    await this.reconcileConcurrentHeads(pulled, dag, local.deviceId, missingContent, deferred);
+    await this.reconcileConcurrentHeads(pulled, dag, local.deviceId, missingContent, deferred, failures);
     timer?.lap('reconcileConcurrentHeads');
 
     // ── 5. Advance the cursor past everything we consumed ────────────────────
@@ -617,6 +635,7 @@ export class ServerSyncClient {
       deferred: [...deferred],
       stranded: [...missingContent],
       deferredConflicts: [...deferredConflicts],
+      applyFailures: failures,
     };
   }
 
@@ -1204,6 +1223,10 @@ export class ServerSyncClient {
     ownDeviceId: string,
     missingContent: Set<string>,
     deferred: Set<string>,
+    /** Accumulator for actions that threw inside a fold's apply — appended to the
+     *  round's `applyFailures` so a fold failure is as visible as a main-apply one
+     *  instead of being swallowed with the rest of this sweep's ignored result. */
+    failures: ApplyFailure[],
   ): Promise<void> {
     // ── Diagnostic sub-phase timing (perfLog only; zero cost when off) ────────
     // Attributes the reconcile lap across its regions so a slow first-sync round shows
@@ -1361,7 +1384,7 @@ export class ServerSyncClient {
         // higher stamp never changes cross-device convergence; only the per-fold rebuild
         // used to keep this monotonic, which is exactly the cost being removed.
         this.hlc.setCurrent(hlcMax(this.hlc.getCurrent(), merge.mergedHlc));
-        await this.host.applyMerge(merge.actions, localOne, remoteOne);
+        failures.push(...(await this.host.applyMerge(merge.actions, localOne, remoteOne)).failures);
         if (T) tFold += T() - foldStart;   // singleFileState + mergeVaultStates + applyMerge
         folds++;
         folded = true;

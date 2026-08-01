@@ -19,7 +19,7 @@ import { AuthError } from '../src/network/sync-errors';
 import { SyncCancelledError } from '../src/network/sync-cancellation';
 import { TestDevice } from './helpers/test-device';
 
-const EMPTY_SUMMARY: SyncRoundSummary = { pushed: 0, pulled: 0, deferred: [], stranded: [], deferredConflicts: [] };
+const EMPTY_SUMMARY: SyncRoundSummary = { pushed: 0, pulled: 0, deferred: [], stranded: [], deferredConflicts: [], applyFailures: [] };
 
 /** Build a coordinator over a real device stack with recording ports + a stubbed
  *  round. `order` captures the pre-sync capture sequence; `runRound` returns
@@ -76,7 +76,7 @@ describe('SyncCoordinator', () => {
 
   test('a happy round folds the summary into sync-state and clears any prior error', async () => {
     const id = 'fileX';
-    const h = await harness({ summary: { pushed: 2, pulled: 3, deferred: [id], stranded: ['hashY'], deferredConflicts: [] } });
+    const h = await harness({ summary: { pushed: 2, pulled: 3, deferred: [id], stranded: ['hashY'], deferredConflicts: [], applyFailures: [] } });
     await h.syncState.setError('stale failure', 1); // a leftover error from a previous round
 
     await h.coordinator.sync('manual');
@@ -173,7 +173,7 @@ describe('SyncCoordinator', () => {
     // The stubbed round stands in for the applicator invoking the coordinator's handler.
     h.runRound.mockImplementationOnce(async () => {
       await h.coordinator.decideDeleteConflict('ask', deleteAction);
-      return { pushed: 0, pulled: 2, deferred: ['fConf', 'fDrift'], stranded: [], deferredConflicts: ['fConf'] };
+      return { pushed: 0, pulled: 2, deferred: ['fConf', 'fDrift'], stranded: [], deferredConflicts: ['fConf'], applyFailures: [] };
     });
 
     await h.coordinator.sync('manual');
