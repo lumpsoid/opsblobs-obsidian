@@ -14,6 +14,7 @@ import { VaultFiles, VaultFileRef } from '../ports/vault-files';
 import { FileRegistry } from '../core/file-registry';
 import { ContentStore, hashContent } from '../core/content-store';
 import { OperationLogger } from '../core/operation-logger';
+import { dedupeOpsById } from '../core/operations';
 import { SyncApplicator } from './sync-applicator';
 import { HybridLogicalClock } from '../core/hlc';
 import { CursorStore } from './cursor-store';
@@ -130,7 +131,11 @@ export class PluginVaultSyncHost implements VaultSyncHost {
       deviceId: this.deviceId,
       hlc: this.hlc.getCurrent(),
       fileEntries,
-      pendingOps: this.opLogger.getPendingOps(),
+      // Defence in depth at the push boundary: a duplicated op id is rejected by the
+      // server for the whole batch, and the retry replays the same batch — so a local
+      // bookkeeping fault upstream wedges sync permanently rather than transiently.
+      // The dedupe is O(n) once per round (see `dedupeOpsById` for the measured cost).
+      pendingOps: dedupeOpsById(this.opLogger.getPendingOps()),
       contentStore,
     };
   }
