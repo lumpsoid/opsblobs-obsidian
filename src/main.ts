@@ -144,9 +144,12 @@ export default class VaultSyncPlugin extends Plugin {
   }
 
   /** The two-headed files a text conflict left awaiting resolution (Step 6). A
-   *  derived query over the registry — no hand-maintained set. */
+   *  derived query over the registry — no hand-maintained set. Iterates the registry
+   *  rather than copying it (`entriesIterator`, not `getAllEntries`): this runs from
+   *  `updateStatusBar`/`updateRibbonState` on *every* `opLogger.onChange`, i.e. after
+   *  every debounced edit, and a Map copy there is O(F) allocation per save. */
   private twoHeadedConflicts(): ConflictListItem[] {
-    return listTwoHeadedConflicts(this.registry.getAllEntries().values());
+    return listTwoHeadedConflicts(this.registry.entriesIterator());
   }
 
   /** Total conflicts needing the user: two-headed text files (derived from the
@@ -215,6 +218,8 @@ export default class VaultSyncPlugin extends Plugin {
           action,
         ),
       (action) => this.coordinator.decideBinaryConflict(action),
+      // Wall clock for the registry's tombstone-retention horizon (post-round prune).
+      () => Date.now(),
     );
 
     // Load persisted state

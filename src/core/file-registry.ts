@@ -24,6 +24,30 @@ const REGISTRY_PATH = '.opsblobs/file-registry.json';
  *  truncates it. Mirrors `ContentStore`'s pack/index journal. */
 const REGISTRY_JOURNAL_PATH = '.opsblobs/file-registry.journal';
 
+/** A tombstone is never reclaimed until its deletion is at least this old, however
+ *  short `ancestorRetentionDays` is set. The two windows share a *rationale* (past it,
+ *  a merge base has no bytes left and a delete has reached every peer that still
+ *  syncs) but not a *failure mode*: dropping a base's bytes early degrades a deep
+ *  merge to a visible conflict, whereas dropping a tombstone early lets a peer that
+ *  never pulled the delete resurrect the file. So shrinking the blob window to reclaim
+ *  disk must not also shrink this safety margin. Equal to the default
+ *  `ancestorRetentionDays` (30), so the default behaviour is exactly "reuse the blob
+ *  window". See {@link FileRegistry.reclaimTombstones}. */
+const MIN_TOMBSTONE_RETENTION_MS = 30 * 86_400_000;
+
+/** The inputs {@link FileRegistry.compact} needs to reclaim stale tombstones. Absent →
+ *  compaction is a pure journal fold and the entry set is left untouched. */
+export interface TombstoneReclaim {
+  /** Wall-clock now, in ms. Injected (never read from `Date.now()` inside) so the
+   *  horizon is deterministic under test — mirrors `ContentStore.gc(keep, ms, now)`. */
+  now: number;
+  /** fileIds a still-*pending* (un-pushed) op references. A tombstone whose delete op
+   *  hasn't reached the server yet must survive: no peer has seen the delete, so
+   *  dropping the entry would leave the pending op citing an identity the registry no
+   *  longer holds. Supply it only from a post-push checkpoint. */
+  pinned: ReadonlySet<string>;
+}
+
 type SerializedRegistry = {
   version: number;
   entries: Array<[string, FileEntry]>;   // [uuid, entry]
@@ -168,12 +192,22 @@ export class FileRegistry {
    *  (last-write-wins) onto an already-current snapshot; a crash that truncated
    *  first would lose every mutation the journal still held. Both writes are atomic
    *  (tmp+rename), so neither can tear. Runs off the per-checkpoint hot path only —
-   *  at capture/merge end, opportunistically on load, or the live-path valve (§3). */
-  async compact(): Promise<void> {
-    // Nothing journalled since the last snapshot → the snapshot already reflects the
-    // current Map, so there is nothing to fold. Skipping keeps a routine no-op capture
-    // (and an empty vault) from redundantly rewriting the snapshot / creating files.
-    if (this.journalRecords === 0) return;
+   *  at capture/merge end, opportunistically on load, or the live-path valve (§3).
+   *
+   *  When `reclaim` is supplied this is also where stale tombstones are dropped (see
+   *  {@link reclaimTombstones}) — the one place that already rewrites the whole
+   *  snapshot, so the drop costs nothing extra and is durable by construction (full
+   *  rewrite + journal truncate) without needing a `{del}` journal line of its own. */
+  async compact(reclaim?: TombstoneReclaim): Promise<void> {
+    // Prune before serializing, so the snapshot written below IS the pruned Map.
+    const dropped = reclaim ? this.reclaimTombstones(reclaim) : 0;
+    // Nothing journalled since the last snapshot and nothing dropped → the snapshot
+    // already reflects the current Map, so there is nothing to fold. Skipping keeps a
+    // routine no-op capture (and an empty vault) from redundantly rewriting the
+    // snapshot / creating files. A drop forces the rewrite even with an empty journal —
+    // otherwise the entry would be gone from memory but still in the snapshot, and the
+    // next `load()` would resurrect it.
+    if (this.journalRecords === 0 && dropped === 0) return;
     await this.ensureDir();
     const data: SerializedRegistry = {
       version: 1,
@@ -502,6 +536,22 @@ export class FileRegistry {
     return new Map(this.entries);
   }
 
+  /**
+   * A read-only iterator over every entry (live *and* tombstoned), in insertion
+   * order — the allocation-free counterpart to {@link getAllEntries}, whose defensive
+   * `new Map(this.entries)` copy costs O(F) per call. Use this for any *counting* or
+   * *scanning* read: the conflict count behind the status bar and ribbon recomputes
+   * after every debounced edit, so a Map copy there is O(F) churn per save on a
+   * registry that only ever grows.
+   *
+   * Callers must treat the yielded entries as read-only (they are the live objects,
+   * not copies) and must not mutate the registry while iterating — go through the
+   * mutation methods above.
+   */
+  entriesIterator(): IterableIterator<FileEntry> {
+    return this.entries.values();
+  }
+
   getActiveEntries(): FileEntry[] {
     return Array.from(this.entries.values()).filter(e => !e.deleted);
   }
@@ -541,6 +591,78 @@ export class FileRegistry {
   }
 
   // ─── Private helpers ──────────────────────────────────────────────────────
+
+  /**
+   * Drop tombstones that are safely past the retention horizon; returns how many.
+   * Called only from {@link compact}.
+   *
+   * WHY. `markDeleted` only flips `deleted = true` — the entry then sits in the Map
+   * forever (the sole other hard-delete is `adoptRemote`'s divergent-duplicate drop).
+   * So the registry grows with the vault's *lifetime* file churn even when the live
+   * file count is flat: create and delete a scratch note daily for a year and you
+   * carry 365 dead entries that are re-serialized by every `compact()`, re-parsed by
+   * every `load()`, re-iterated by `buildLocalIdentity` every round, and unioned by
+   * every merge. Reclaiming bounds the registry by the live vault plus one retention
+   * window of churn instead.
+   *
+   * An entry is dropped only when ALL of:
+   *  · it is a tombstone (`deleted`);
+   *  · its deletion is at least {@link tombstoneRetentionMs} old, measured on the HLC
+   *    wall time `markDeleted` stamped. An HLC merged from a remote can run *ahead* of
+   *    real time, which only ever makes a tombstone look younger — it is retained
+   *    longer, never dropped sooner, so the drift direction is the safe one;
+   *  · no pending op references it ({@link TombstoneReclaim.pinned}) — i.e. its delete
+   *    is already on the server;
+   *  · it carries no `conflictParents` — an unresolved conflict is still the user's to
+   *    settle and the Conflicts panel reads it straight off the registry.
+   *
+   * THE TRADEOFF (deliberate; it is what the horizon buys time against). The tombstone
+   * is what makes a peer's *late* edit to a file we deleted surface as a delete/edit
+   * conflict. Once it's gone we hold no entry for that id, so such an op reads as a
+   * plain new remote file and the file comes back. That is a *visible* resurrection,
+   * not silent divergence (guide §7's actual enemy): nothing is dropped or overwritten,
+   * and it takes a peer that went a full retention window without pulling our delete.
+   * The durable record of a delete is the **server op log**, not this Map — a fresh
+   * device replays the delete op and rebuilds the tombstone — so reclaiming here is a
+   * local-cache decision of the same kind as the blob and DAG windows.
+   *
+   * Dropping an id does NOT prune its version-DAG nodes (the DAG still has no removal
+   * API — see the DAG-pruning task). Harmless, and mildly helpful: the nodes are tiny
+   * and, unreachable from any live head, they stop feeding `referencedHashes`' keep-set.
+   */
+  private reclaimTombstones({ now, pinned }: TombstoneReclaim): number {
+    const horizon = now - this.tombstoneRetentionMs();
+    let dropped = 0;
+    // Deleting the current key while iterating a Map is well-defined (the iterator
+    // only ever moves forward over remaining entries).
+    for (const [id, entry] of this.entries) {
+      if (!entry.deleted) continue;
+      if (entry.conflictParents) continue;
+      if (pinned.has(id)) continue;
+      if (entry.hlcTimestamp.wallTime > horizon) continue;
+      this.entries.delete(id);
+      // `markDeleted` deliberately leaves the path→id mapping in place so a re-create
+      // can resurrect the entry under its original id. With the entry gone that mapping
+      // would dangle and `registerFile` would hand back an id the Map no longer holds,
+      // so drop it too: a later re-create at this path mints a fresh id, exactly as it
+      // would for a brand-new file (the create op is a fresh DAG root either way, so a
+      // peer still holding the file sees a create/create collision — F2 converges it).
+      if (this.pathIndex.get(entry.path) === id) this.pathIndex.delete(entry.path);
+      dropped++;
+    }
+    return dropped;
+  }
+
+  /** How long a tombstone must have been dead before it can be reclaimed: the blob
+   *  retention window, floored at {@link MIN_TOMBSTONE_RETENTION_MS}. */
+  private tombstoneRetentionMs(): number {
+    // `ancestorRetentionDays` comes from user-editable JSON; a missing/garbage value
+    // must fall back to the floor, never propagate a NaN — `wallTime > now - NaN` is
+    // false for every entry, which would make the whole tombstone set droppable.
+    const days = this.getSettings().ancestorRetentionDays;
+    const configured = Number.isFinite(days) ? days * 86_400_000 : 0;
+    return Math.max(configured, MIN_TOMBSTONE_RETENTION_MS);
+  }
 
   private async ensureDir(): Promise<void> {
     if (!(await this.metadata.exists(REGISTRY_DIR))) {

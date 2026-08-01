@@ -136,6 +136,9 @@ export class TestDevice {
       this.hlc,
       async a => this.resolveDeleteConflict?.(a) ?? 'keep_deleted',
       async a => this.resolveBinaryConflict?.(a) ?? 'keep_local',
+      // Same settable wall clock the HLC reads, so `setWall()` also moves the
+      // registry's tombstone-retention horizon.
+      () => this.clock.wall,
     );
     this.cursorStore = new CursorStore(this.metadata);
     this.versionDagStore = new VersionDagStore(this.metadata);

@@ -53,6 +53,10 @@ export class SyncApplicator {
     private hlc: HybridLogicalClock,
     public onDeleteConflict: DeleteConflictHandler,
     public onBinaryConflict: BinaryConflictHandler,
+    /** Wall clock feeding the registry's tombstone-retention horizon (see the
+     *  `compact({ now, pinned })` call at the end of `applyActions`). Injected so the
+     *  horizon is deterministic under test; defaults to the real clock. */
+    private now: () => number = () => Date.now(),
   ) {}
 
   /**
@@ -167,7 +171,18 @@ export class SyncApplicator {
       // Fold this batch's journal into a fresh snapshot (registry-append-journal-spec
       // §3.2) — keeps the journal from carrying merge deltas into steady state. Off the
       // per-action hot path; no-ops if nothing was journalled.
-      await this.registry.compact();
+      //
+      // This is also the round's tombstone-reclamation point: `markDeleted` never
+      // removes an entry, so without it the registry grows with lifetime file churn
+      // forever. Here is the right place because (a) it already rewrites the whole
+      // snapshot, so the prune costs nothing extra and is durable, and (b) it is
+      // *post-push* — the round pushed every pending op before this apply began (guide
+      // §4 step 4) and the inner finally cleared the log, so anything pending NOW is a
+      // resolution/F5-recapture op that has NOT reached the server and must pin its
+      // file's tombstone. The retention horizon itself lives in the registry; see
+      // `FileRegistry.reclaimTombstones` for the reclamation rules and the tradeoff.
+      const pinned = new Set(this.opLogger.getPendingOps().map(op => op.fileId));
+      await this.registry.compact({ now: this.now(), pinned });
     }
 
     return { deferred, deferredConflicts };

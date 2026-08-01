@@ -144,7 +144,7 @@ relevant `core`/`merge` unit) with a port for the Obsidian bit.
 |--------|------|
 | `core/hlc.ts` | Hybrid Logical Clock — total ordering of events across devices; persisted (F7) so logical time never regresses across a wall-clock jump. Also mints each op's id (`hlcToString`). |
 | `core/version-dag.ts` | **The v2 causal graph.** Pure, in-memory DAG of `versionId (op-id) → { parents, contentHash, fileId }`. `isAncestor` / `mergeBase` (LCA, returns `MULTIPLE_BASES` on a criss-cross) / `isMergeNode` (≥2 parents) / `contentHashOf` / `leaves(fileId)` (open heads — 1 = converged, ≥2 = un-reconciled divergence) / `reachableContentHashes(versionId, bounds?)` (base-bytes staging + GC keep-set; `bounds.has`/`bounds.maxDepth` cut the ancestor walk at the first version whose bytes are gone, so its cost is O(retained history), not O(edits-ever)). Acyclic by construction (op-id keys). |
-| `core/file-registry.ts` | The source of truth for file **identity**: UUID → `{path, contentHash, headVersionId, lastSyncedPath, deleted, conflictParents}`. `adoptRemote` converges identity across devices and records the adopted head. `referencedHashes(dag?, bounds?)` is the content-GC keep-set (live content + DAG-reachable merge bases). Pass `bounds.has = contentStore.hasStored` to bound the walk — a hash the store does not hold cannot be collected anyway, so cutting there never shortens the keep-set below what `gc()` needs; a `maxDepth` shorter than the retention window WOULD. |
+| `core/file-registry.ts` | The source of truth for file **identity**: UUID → `{path, contentHash, headVersionId, lastSyncedPath, deleted, conflictParents}`. `adoptRemote` converges identity across devices and records the adopted head. `referencedHashes(dag?, bounds?)` is the content-GC keep-set (live content + DAG-reachable merge bases). Pass `bounds.has = contentStore.hasStored` to bound the walk — a hash the store does not hold cannot be collected anyway, so cutting there never shortens the keep-set below what `gc()` needs; a `maxDepth` shorter than the retention window WOULD. `compact({now, pinned})` additionally **reclaims stale tombstones** (see §5 below); `entriesIterator()` is the allocation-free read for scanning/counting (`getAllEntries()` copies the whole Map — never call it from a per-edit path). |
 | `core/content-store.ts` | Hash → bytes cache (`.opsblobs/content/`). Age-aware GC (`gc(keep, retentionMs, now)`); the keep-set now sees the DAG so reachable merge bases survive (Step 8). The coordinator runs it after a successful round at most once a day (`gcDue`/`lastGcAt`) — it used to run only from the settings button, so `ancestorRetentionDays` was effectively advisory. |
 | `core/operation-logger.ts` | Watches vault events, debounces edits into ops (each carrying `parents: [prevHead]`), persists the pending oplog, advances `headVersionId`. Cold-start capture (`captureOfflineChanges`), force-push baseline (`captureAllAsBaseline`), and the two-headed → merge-node resolution branch (`flushModify` emits `Ops.merge` when a save removes conflict markers). |
 | `core/operations.ts` | Op factories (`Ops.create/update/delete/move/merge/mergeDelete`) + `mergeVersionId` (deterministic content-addressed `m-` id for merge nodes, commutative in parents). The single catalog of op shapes. |
@@ -277,6 +277,25 @@ docs.
   cursor held — the in-flight edit is never overwritten.
 - **F7 — HLC persistence.** Logical time is persisted per-op and on shutdown so a
   wall-clock regression can't rewind below an already-issued timestamp.
+
+**Tombstones are a bounded local cache, not the record of a delete.** `markDeleted` only
+flips `deleted = true`, so the entry set used to grow with the vault's *lifetime* file
+churn even when the live file count was flat — and every dead entry is re-serialized by
+`compact()`, re-parsed by `load()`, re-iterated by `buildLocalIdentity`, and unioned by
+every merge. The round's post-apply `registry.compact({now, pinned})` now reclaims a
+tombstone once **all** of: it is past the retention horizon (`ancestorRetentionDays`,
+floored at 30 days — see `MIN_TOMBSTONE_RETENTION_MS`), measured on the HLC wall time
+`markDeleted` stamped; no *pending* (un-pushed) op references it — which is why the call
+sits post-push; and it carries no `conflictParents`. The durable record of a delete is the
+**server op log**: a fresh device replays the delete op and rebuilds the tombstone, so
+this is a local-cache decision of the same kind as the blob and DAG windows. **The
+tradeoff to know:** the tombstone is what turns a peer's *late* edit to a deleted file
+into a delete/edit conflict; past the horizon we hold no entry, so such an op reads as a
+plain new remote file and the file comes back. That is a *visible* resurrection (nothing
+dropped or overwritten) requiring a peer that went a full window without pulling our
+delete — the acceptable side of §7's silent-vs-loud rule. A re-create at a reclaimed path
+mints a fresh id (the create op is a fresh DAG root either way, so a peer still holding
+the file gets an F2 create/create collision, which converges).
 
 **File identity is by UUID, not path.** The merge is keyed on `fileId`. `adoptRemote`
 converges two devices onto one id for the same path and moves the pathIndex — get this

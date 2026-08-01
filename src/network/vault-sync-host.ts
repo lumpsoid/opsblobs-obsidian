@@ -75,7 +75,15 @@ export class PluginVaultSyncHost implements VaultSyncHost {
     const refs = new Map<string, VaultFileRef>();
     for (const r of this.files.list()) refs.set(r.path, r);
 
-    for (const [id, entry] of this.registry.getAllEntries()) {
+    // Iterate the registry in place (`entriesIterator`) instead of copying it —
+    // `getAllEntries()`'s defensive Map copy is O(F) and this loop only reads. The copy
+    // never gave a stable snapshot anyway: `new Map(this.entries)` is shallow, so a
+    // live-watcher mutation between the awaits below (markDeleted, updateContentHash)
+    // already showed through by reference. The one semantic delta is that a file
+    // *created* mid-loop is now visited rather than missed — which matches the
+    // `getPendingOps()` snapshot taken right after, so it's the more consistent side.
+    for (const entry of this.registry.entriesIterator()) {
+      const id = entry.id;
       let resolved = entry;
 
       if (!entry.deleted) {
