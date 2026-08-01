@@ -137,6 +137,13 @@ export default class VaultSyncPlugin extends Plugin {
    *  allows only one listener, so the plugin fans out through this set. */
   private conflictChangeListeners = new Set<() => void>();
 
+  /** Subscribers (the settings tab's "Sync now" button) to notify whenever the
+   *  busy state {@link isSyncing} reports flips — a round or the startup capture
+   *  starting or settling. Without this fan-out a control could only ever sample the
+   *  state at render time, so a round it didn't start (ribbon, command, auto-sync, or
+   *  an earlier render of the same tab) left it stuck in whatever state it opened in. */
+  private syncStateListeners = new Set<() => void>();
+
   /** Delete/binary conflicts an unattended auto-round deferred and that still need a
    *  manual sync — a *derived* count over the last round's observable state (Step 7),
    *  not a hand-maintained badge. Text conflicts are the two-headed files below. */
@@ -163,6 +170,21 @@ export default class VaultSyncPlugin extends Plugin {
 
   private emitConflictChange(): void {
     for (const cb of this.conflictChangeListeners) cb();
+  }
+
+  /** Fan out a busy-state transition. Fired immediately next to every write of the
+   *  two flags {@link isSyncing} reads — not at the end of the surrounding block — so
+   *  a throw in the UI work that follows can never strand a subscriber (e.g. the
+   *  settings "Sync now" button) in the busy state. */
+  private emitSyncStateChange(): void {
+    for (const cb of this.syncStateListeners) cb();
+  }
+
+  /** Subscribe to busy-state transitions; returns the unsubscribe. Read with
+   *  {@link isSyncing} — the callback carries no payload, subscribers re-derive. */
+  onSyncStateChange(cb: () => void): () => void {
+    this.syncStateListeners.add(cb);
+    return () => this.syncStateListeners.delete(cb);
   }
 
   // ─── Lifecycle ────────────────────────────────────────────────────────────
@@ -277,10 +299,12 @@ export default class VaultSyncPlugin extends Plugin {
         // this window, before the real listener attaches below — so this flag (and
         // the try/finally) must wrap that whole sequence, not just the main pass.
         this.startupCaptureInProgress = true;
+        this.emitSyncStateChange();
         try {
           await this.captureOfflineWithPerf();
         } finally {
           this.startupCaptureInProgress = false;
+          this.emitSyncStateChange();
         }
         // Start listening for vault changes.
         this.opLogger.startListening();
@@ -771,6 +795,7 @@ export default class VaultSyncPlugin extends Plugin {
     }
 
     this.syncInProgress = true;
+    this.emitSyncStateChange();
     this.updateRibbonState('syncing');
     // Snapshot the total conflict count so we can tell if THIS round newly introduced
     // any (§3). Covers both text (two-headed files) and delete/binary conflicts — the
@@ -787,6 +812,10 @@ export default class VaultSyncPlugin extends Plugin {
       }
     } finally {
       this.syncInProgress = false;
+      // Release every control bound to the busy state FIRST — before the ribbon/status
+      // repaint below, so a throw in any of it can't leave "Sync now" disabled for the
+      // rest of the session (the round is over; the UI is what's left to settle).
+      this.emitSyncStateChange();
       // Clear the in-flight activity so the modal's live section settles back.
       this.syncActivity = null;
       this.uploadProgress = null;

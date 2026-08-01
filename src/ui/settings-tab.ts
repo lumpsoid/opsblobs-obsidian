@@ -34,10 +34,12 @@ export interface SettingsHost extends Plugin {
   rebuildLocalStateFromScratch(): Promise<void>;
   recheckConflicts(): Promise<void>;
   syncNow(): Promise<void>;
-  /** Whether a sync round is currently running — read when the "Sync now" button is
-   *  (re)rendered so it opens already disabled/de-colored if the tab is reopened
-   *  mid-round, instead of looking idle for a round it isn't driving. */
+  /** Whether a sync round — or the startup capture that precedes it — is running.
+   *  Re-read on every {@link onSyncStateChange} notification, so "Sync now" tracks
+   *  rounds it isn't driving (ribbon, command, auto-sync) instead of sampling once. */
   isSyncing(): boolean;
+  /** Subscribe to {@link isSyncing} transitions; returns the unsubscribe. */
+  onSyncStateChange(cb: () => void): () => void;
   openSyncStatus(): void;
   /** Open the in-app perf log viewer tab (the `.opsblobs/perf-log.txt` dotfolder is
    *  unreachable on iOS, so we surface it as a tab rather than a hidden file). */
@@ -49,6 +51,11 @@ export class SyncSettingTab extends PluginSettingTab {
    *  {@link updateReadiness} whenever a required field changes, so the checklist
    *  tracks typing without a full settings re-display. */
   private readinessEl: HTMLElement | null = null;
+
+  /** Drops the current render's "Sync now" subscription. The tab re-renders from
+   *  scratch on every open, so the previous render's button is detached and must let
+   *  go — otherwise every open leaks a listener writing to dead DOM. */
+  private syncStateUnsub: (() => void) | null = null;
 
   constructor(app: App, private host: SettingsHost) {
     super(app, host);
@@ -64,6 +71,8 @@ export class SyncSettingTab extends PluginSettingTab {
 
   display(): void {
     const { containerEl } = this;
+    // Everything below is rebuilt, so release what the last render subscribed.
+    this.releaseSyncState();
     containerEl.empty();
 
     this.renderSetup(containerEl);
@@ -71,6 +80,17 @@ export class SyncSettingTab extends PluginSettingTab {
     this.renderSync(containerEl);
     this.renderAdvanced(containerEl);
     this.renderDangerZone(containerEl);
+  }
+
+  /** Obsidian calls this when the tab is navigated away from / the settings modal
+   *  closes: stop listening until the next `display`. */
+  hide(): void {
+    this.releaseSyncState();
+  }
+
+  private releaseSyncState(): void {
+    this.syncStateUnsub?.();
+    this.syncStateUnsub = null;
   }
 
   // ─── Setup (required fields + readiness) ────────────────────────────────────
@@ -338,19 +358,29 @@ export class SyncSettingTab extends PluginSettingTab {
       .setName('Sync now')
       .setDesc('Run a full sync against the server.')
       .addButton(btn => {
-        btn.setButtonText('Sync now').setCta();
-        // The tab re-renders from scratch every time it's opened, so a round already
-        // running (started before this open, e.g. auto-sync or a prior manual click)
-        // would otherwise look idle. Reflect the live state on render, not just on click.
-        if (this.host.isSyncing()) btn.setDisabled(true).removeCta();
+        btn.setButtonText('Sync now');
+        // Bind to the plugin's LIVE busy state rather than sampling it once at render.
+        // A render-time snapshot could only ever be undone by the click handler that
+        // owned that button object, so a round started elsewhere — or by an earlier
+        // render of this tab — left the button dead until the plugin reloaded. Disabled
+        // + de-colored reads as inactive; live phase stays in the status bar/modal.
+        const applyBusyState = () => {
+          const busy = this.host.isSyncing();
+          btn.setDisabled(busy);
+          if (busy) btn.removeCta(); else btn.setCta();
+        };
+        applyBusyState();
+        this.syncStateUnsub = this.host.onSyncStateChange(applyBusyState);
         btn.onClick(async () => {
-          // Disable + drop CTA color to read as inactive while syncing — no text
-          // changes here; live phase is surfaced via the status bar/modal instead.
+          // Immediate feedback: `syncNow` runs its guards (config/binding/key) before
+          // it flips the shared flag, so don't wait for the fan-out to disable this.
           btn.setDisabled(true).removeCta();
           try {
             await this.host.syncNow();
           } finally {
-            btn.setDisabled(false).setCta();
+            // Re-derive instead of assuming idle — a click the plugin bounced (a round
+            // was already running) must stay disabled until that round settles.
+            applyBusyState();
           }
         });
       });
