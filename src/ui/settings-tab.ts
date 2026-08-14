@@ -29,6 +29,10 @@ export interface SettingsHost extends Plugin {
   testConnection(): Promise<string>;
   setupAutoSync(): void;
   clearContentCache(): Promise<number>;
+  /** Fold many small packs (and any pack with dead blobs) into a small number of
+   *  larger ones. See `main.ts` / `ContentStore.consolidatePacks`. Returns null when
+   *  the pass declined (a sync/GC was already running). */
+  optimizeContentIndex(): Promise<{ packsBefore: number; packsAfter: number; blobsKept: number; blobsDropped: number } | null>;
   resetSyncState(): Promise<void>;
   rebaselineToServer(): Promise<void>;
   rebuildLocalStateFromScratch(): Promise<void>;
@@ -510,6 +514,47 @@ export class SyncSettingTab extends PluginSettingTab {
           setTimeout(() => { btn.setButtonText('Clear cache').setDisabled(false); }, 2000);
         });
       });
+
+    // Not destructive — it only ever rewrites pack layout, never touches vault content
+    // or referenced blobs — so it gets the same quiet styling as Clear cache above.
+    // Runs on demand rather than on a schedule: the automated GC's mark-and-compact
+    // only fires on *aged, mostly-dead* packs, so a vault whose steady-state edits
+    // produce many fully-live 1-blob packs never gets consolidated without this.
+    const optimizeSetting = new Setting(details)
+      .setName('Optimize content index')
+      .setDesc('Fold many small packs (and any pack holding dead blobs) into a small number ' +
+        'of larger ones. Reduces the size of .opsblobs/content/pack/index and the number of ' +
+        'files there. Safe — only rewrites pack layout, vault content is never touched. ' +
+        'May take a while on a very fragmented store.');
+    optimizeSetting.addButton(btn => {
+      btn.setButtonText('Optimize').onClick(async () => {
+        btn.setDisabled(true);
+        btn.setButtonText('Optimizing…');
+        const originalDesc = optimizeSetting.descEl.textContent ?? '';
+        try {
+          const result = await this.host.optimizeContentIndex();
+          if (result === null) {
+            btn.setButtonText('Busy — try again');
+          } else {
+            const { packsBefore, packsAfter, blobsKept, blobsDropped } = result;
+            optimizeSetting.setDesc(
+              `Packs ${packsBefore} → ${packsAfter}. Kept ${blobsKept} blobs, dropped ${blobsDropped}.`,
+            );
+            btn.setButtonText('Done');
+          }
+        } catch (e) {
+          optimizeSetting.setDesc(`Optimize failed: ${(e as Error).message}`);
+          btn.setButtonText('Failed');
+        } finally {
+          setTimeout(() => {
+            btn.setButtonText('Optimize').setDisabled(false);
+            // Restore the original description on the next open — leave the last-run
+            // stats visible for a few seconds so the user can read them, then reset.
+            optimizeSetting.setDesc(originalDesc);
+          }, 6000);
+        }
+      });
+    });
 
     new Setting(details)
       .setName('Re-check for conflicts')

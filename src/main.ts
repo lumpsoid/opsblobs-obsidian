@@ -1051,6 +1051,36 @@ export default class VaultSyncPlugin extends Plugin {
     return this.runContentGc();
   }
 
+  /** Settings "Optimize content index" button — folds a fragmented pack directory
+   *  (many 1-blob packs from steady-state edits) back into a small number of larger
+   *  packs. See {@link ContentStore.consolidatePacks} for the three-pass logic. Uses
+   *  the same single-flight lock and busy-refusal as {@link clearContentCache} because
+   *  it too rewrites the pack index.
+   *
+   *  The thresholds here — `SMALL_PACK_THRESHOLD` and `CONSOLIDATE_FLUSH_EVERY` — are
+   *  chosen so a rewritten pack ends up around a few hundred KB of typical markdown
+   *  (~64 blobs × ~5 KB), which keeps whole-pack reads cheap while making the
+   *  amortisation `getFromPack` relies on actually pay off. Not load-bearing. */
+  async optimizeContentIndex(): Promise<{ packsBefore: number; packsAfter: number; blobsKept: number; blobsDropped: number } | null> {
+    if (this.syncInProgress || this.startupCaptureInProgress) {
+      new Notice('OpsBlobs: finish the current sync before optimizing the index.');
+      return null;
+    }
+    if (this.gcInProgress) return null;
+    this.gcInProgress = true;
+    try {
+      const SMALL_PACK_THRESHOLD = 64;
+      const CONSOLIDATE_FLUSH_EVERY = 64;
+      const dagStore = new VersionDagStore(this.metadata);
+      const dag = await dagStore.load();
+      await this.sweepVersionDag(dagStore, dag);
+      const keep = this.registry.referencedHashes(dag, { has: h => this.contentStore.hasStored(h) });
+      return await this.contentStore.consolidatePacks(keep, SMALL_PACK_THRESHOLD, CONSOLIDATE_FLUSH_EVERY);
+    } finally {
+      this.gcInProgress = false;
+    }
+  }
+
   /** Garbage-collect the content store down to what the registry still
    *  references (live content + the DAG-reachable merge bases of each live head),
    *  honouring `ancestorRetentionDays`. Returns the count removed. The version-DAG's

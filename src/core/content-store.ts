@@ -421,6 +421,127 @@ export class ContentStore {
   }
 
   /**
+   * Manual, user-triggered defragmentation for a store whose steady-state 1-blob packs
+   * have accumulated to the point where the per-pack overhead (a file + an index line)
+   * dwarfs the payload — a single-file-edit workflow produces exactly this shape, since
+   * `put` writes each blob into its own fresh pack and the automated `gc` above only
+   * rewrites *aged, mostly-dead* packs (COMPACT_LIVE_FRACTION), so a vault whose packs
+   * are all fully live sees no consolidation.
+   *
+   * Three passes, in dependency order:
+   *
+   *   1. **Retire wholly-dead packs** — age-blind, unlike gc's §4.1 (the user opted in
+   *      to a maintenance pass, they don't want a retention-window veto).
+   *   2. **Stream-merge small packs** — any pack with fewer than `smallPackThreshold`
+   *      live blobs, regardless of dead-count, is rewritten into a stream of fresh packs
+   *      capped at ~`flushEvery` blobs each. Old packs are only removed *after* a
+   *      `flushPack` has made their live blobs durable in a fresh pack — same
+   *      "reachable via either pack" crash-safety as §4.2. Reads each old pack once
+   *      via `metadata.read` and slices its body with `loc.offset/loc.len`, bypassing
+   *      `get`'s O(index) whole-pack scan (which would cost O(P·N) across P packs).
+   *   3. **In-place compact large-mixed packs** — packs that are at/above the threshold
+   *      but hold some dead blobs still benefit from reclamation without needing a
+   *      merge; delegated to {@link compactPack} so the crash-safety story matches gc.
+   *
+   *   Aged-but-fully-live-at-threshold packs are left alone.
+   *
+   *   Returns before/after pack counts and kept/dropped blob counts so the caller can
+   *   show the user a concrete "N → M packs" line.
+   */
+  async consolidatePacks(
+    keepHashes: Set<string>,
+    smallPackThreshold: number,
+    flushEvery: number,
+  ): Promise<{ packsBefore: number; packsAfter: number; blobsKept: number; blobsDropped: number }> {
+    const members = new Map<string, string[]>(); // packId → its blob hashes
+    for (const [hash, loc] of this.index) {
+      let list = members.get(loc.packId);
+      if (!list) members.set(loc.packId, (list = []));
+      list.push(hash);
+    }
+    const packsBefore = members.size;
+    let blobsKept = 0;
+    let blobsDropped = 0;
+
+    const toRetire: string[] = [];
+    const toStreamMerge: string[] = [];
+    const toCompactInPlace: string[] = [];
+    for (const [packId, hashes] of members) {
+      let liveCount = 0;
+      for (const h of hashes) if (keepHashes.has(h)) liveCount++;
+      if (liveCount === 0) toRetire.push(packId);
+      else if (liveCount < smallPackThreshold) toStreamMerge.push(packId);
+      else if (liveCount < hashes.length) toCompactInPlace.push(packId);
+    }
+
+    // 1. Age-blind whole-pack retirement.
+    for (const packId of toRetire) {
+      await this.metadata.remove(this.packPath(packId));
+      for (const h of members.get(packId)!) {
+        this.index.delete(h);
+        this.cacheDelete(h);
+        blobsDropped++;
+      }
+    }
+
+    // 2. Stream-merge — deferred removals batch the crash-safety fence with the flush.
+    let pendingRemoval: string[] = [];
+    const flushAndRetireDeferred = async (): Promise<void> => {
+      if (this.packBuffer.length === 0 && pendingRemoval.length === 0) return;
+      await this.flushPack();
+      for (const oldId of pendingRemoval) {
+        await this.metadata.remove(this.packPath(oldId));
+        for (const h of members.get(oldId) ?? []) {
+          if (this.index.get(h)?.packId === oldId) {
+            this.index.delete(h);
+            this.cacheDelete(h);
+          }
+        }
+      }
+      pendingRemoval = [];
+    };
+    for (const packId of toStreamMerge) {
+      const packText = await this.metadata.read(this.packPath(packId));
+      if (packText === null) continue; // vanished under us — nothing to move
+      for (const h of members.get(packId)!) {
+        const loc = this.index.get(h);
+        if (!loc || loc.packId !== packId) continue;
+        if (!keepHashes.has(h)) { blobsDropped++; continue; }
+        const body = packText.substr(loc.offset, loc.len);
+        if (body.length !== loc.len) { blobsDropped++; continue; } // torn tail
+        // C4 hash-verify per blob — a corrupt payload is treated as missing (F1-safe),
+        // matching what getFromPack does on the read path.
+        const content = base64ToUint8(body);
+        if ((await hashContent(content)) !== h) { blobsDropped++; continue; }
+        this.packBuffer.push({ hash: h, b64: body });
+        blobsKept++;
+      }
+      pendingRemoval.push(packId);
+      if (this.packBuffer.length >= flushEvery) await flushAndRetireDeferred();
+    }
+    await flushAndRetireDeferred();
+
+    // 3. In-place compact — reuses the automated GC's §4.2 primitive so the crash
+    //    story here matches what the coordinator's scheduled GC has always done.
+    for (const packId of toCompactInPlace) {
+      const before = members.get(packId)!;
+      let liveBefore = 0;
+      for (const h of before) if (keepHashes.has(h)) liveBefore++;
+      await this.compactPack(packId, keepHashes);
+      blobsKept += liveBefore;
+      blobsDropped += before.length - liveBefore;
+    }
+
+    if (toRetire.length || toStreamMerge.length || toCompactInPlace.length) {
+      await this.rewriteIndex();
+    }
+
+    const packsAfterSet = new Set<string>();
+    for (const loc of this.index.values()) packsAfterSet.add(loc.packId);
+    return { packsBefore, packsAfter: packsAfterSet.size, blobsKept, blobsDropped };
+  }
+
+  /**
    * Rewrite the live blobs of `packId` into a fresh pack and drop the old one, reclaiming
    * the dead bytes a cold-but-live blob was pinning. Ordering (§4.2): the fresh pack +
    * its index delta are made durable (via `flushPack`) BEFORE the old pack is removed,
