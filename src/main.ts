@@ -1068,14 +1068,33 @@ export default class VaultSyncPlugin extends Plugin {
     }
     if (this.gcInProgress) return null;
     this.gcInProgress = true;
+    // Per-phase timings land in `.opsblobs/perf-log.txt` when the `perfLog` diagnostic
+    // is on (Layer 3) — this pass can take a while on a heavily fragmented store and
+    // it is exactly the kind of thing the perf log is there to attribute. `undefined`
+    // when off, so the code path stays inert on everyday installs.
+    const sink = this.perfSink('optimize');
+    const t = sink ? new PhaseTimer(sink) : null;
     try {
       const SMALL_PACK_THRESHOLD = 64;
       const CONSOLIDATE_FLUSH_EVERY = 64;
       const dagStore = new VersionDagStore(this.metadata);
       const dag = await dagStore.load();
       await this.sweepVersionDag(dagStore, dag);
+      t?.lap('prepareKeepSet');
       const keep = this.registry.referencedHashes(dag, { has: h => this.contentStore.hasStored(h) });
-      return await this.contentStore.consolidatePacks(keep, SMALL_PACK_THRESHOLD, CONSOLIDATE_FLUSH_EVERY);
+      const result = await this.contentStore.consolidatePacks(keep, SMALL_PACK_THRESHOLD, CONSOLIDATE_FLUSH_EVERY);
+      if (sink) {
+        // The core measured each of its three sub-phases already; forward them so the
+        // log's `optimize`-scoped lines mirror the return shape.
+        sink('retire', result.retireMs);
+        sink('streamMerge', result.streamMergeMs);
+        sink('compactInPlace', result.compactInPlaceMs);
+      }
+      t?.end('total');
+      return {
+        packsBefore: result.packsBefore, packsAfter: result.packsAfter,
+        blobsKept: result.blobsKept, blobsDropped: result.blobsDropped,
+      };
     } finally {
       this.gcInProgress = false;
     }

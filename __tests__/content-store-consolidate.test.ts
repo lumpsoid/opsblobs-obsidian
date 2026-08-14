@@ -124,6 +124,22 @@ describe('ContentStore.consolidatePacks', () => {
   test('no-op when the store is empty', async () => {
     const { store } = await fresh();
     const result = await store.consolidatePacks(new Set(), 8, 8);
-    expect(result).toEqual({ packsBefore: 0, packsAfter: 0, blobsKept: 0, blobsDropped: 0 });
+    expect(result.packsBefore).toBe(0);
+    expect(result.packsAfter).toBe(0);
+    expect(result.blobsKept).toBe(0);
+    expect(result.blobsDropped).toBe(0);
+  });
+
+  test('returns per-phase wall-clock timings for perfLog attribution', async () => {
+    const { store } = await fresh();
+    const hashes = await seedManySmallPacks(store, 5);
+    const result = await store.consolidatePacks(new Set(hashes), 8, 8);
+    // Only assert the shape: real wall-clock numbers can be zero on a fast fake FS.
+    expect(typeof result.retireMs).toBe('number');
+    expect(typeof result.streamMergeMs).toBe('number');
+    expect(typeof result.compactInPlaceMs).toBe('number');
+    expect(result.retireMs).toBeGreaterThanOrEqual(0);
+    expect(result.streamMergeMs).toBeGreaterThanOrEqual(0);
+    expect(result.compactInPlaceMs).toBeGreaterThanOrEqual(0);
   });
 });

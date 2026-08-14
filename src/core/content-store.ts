@@ -445,14 +445,20 @@ export class ContentStore {
    *
    *   Aged-but-fully-live-at-threshold packs are left alone.
    *
-   *   Returns before/after pack counts and kept/dropped blob counts so the caller can
-   *   show the user a concrete "N → M packs" line.
+   *   Returns before/after pack counts, kept/dropped blob counts, and per-phase
+   *   wall-clock milliseconds so the caller (main.ts optimizeContentIndex) can feed
+   *   them to the `perfLog` sink — this pass can take a while on a heavily fragmented
+   *   store and the phase breakdown is what tells you *which* phase dominates.
    */
   async consolidatePacks(
     keepHashes: Set<string>,
     smallPackThreshold: number,
     flushEvery: number,
-  ): Promise<{ packsBefore: number; packsAfter: number; blobsKept: number; blobsDropped: number }> {
+  ): Promise<{
+    packsBefore: number; packsAfter: number;
+    blobsKept: number; blobsDropped: number;
+    retireMs: number; streamMergeMs: number; compactInPlaceMs: number;
+  }> {
     const members = new Map<string, string[]>(); // packId → its blob hashes
     for (const [hash, loc] of this.index) {
       let list = members.get(loc.packId);
@@ -475,6 +481,7 @@ export class ContentStore {
     }
 
     // 1. Age-blind whole-pack retirement.
+    const retireStart = nowMs();
     for (const packId of toRetire) {
       await this.metadata.remove(this.packPath(packId));
       for (const h of members.get(packId)!) {
@@ -483,6 +490,7 @@ export class ContentStore {
         blobsDropped++;
       }
     }
+    const retireMs = nowMs() - retireStart;
 
     // 2. Stream-merge — deferred removals batch the crash-safety fence with the flush.
     let pendingRemoval: string[] = [];
@@ -500,6 +508,7 @@ export class ContentStore {
       }
       pendingRemoval = [];
     };
+    const streamMergeStart = nowMs();
     for (const packId of toStreamMerge) {
       const packText = await this.metadata.read(this.packPath(packId));
       if (packText === null) continue; // vanished under us — nothing to move
@@ -520,9 +529,11 @@ export class ContentStore {
       if (this.packBuffer.length >= flushEvery) await flushAndRetireDeferred();
     }
     await flushAndRetireDeferred();
+    const streamMergeMs = nowMs() - streamMergeStart;
 
     // 3. In-place compact — reuses the automated GC's §4.2 primitive so the crash
     //    story here matches what the coordinator's scheduled GC has always done.
+    const compactInPlaceStart = nowMs();
     for (const packId of toCompactInPlace) {
       const before = members.get(packId)!;
       let liveBefore = 0;
@@ -531,6 +542,7 @@ export class ContentStore {
       blobsKept += liveBefore;
       blobsDropped += before.length - liveBefore;
     }
+    const compactInPlaceMs = nowMs() - compactInPlaceStart;
 
     if (toRetire.length || toStreamMerge.length || toCompactInPlace.length) {
       await this.rewriteIndex();
@@ -538,7 +550,11 @@ export class ContentStore {
 
     const packsAfterSet = new Set<string>();
     for (const loc of this.index.values()) packsAfterSet.add(loc.packId);
-    return { packsBefore, packsAfter: packsAfterSet.size, blobsKept, blobsDropped };
+    return {
+      packsBefore, packsAfter: packsAfterSet.size,
+      blobsKept, blobsDropped,
+      retireMs, streamMergeMs, compactInPlaceMs,
+    };
   }
 
   /**
