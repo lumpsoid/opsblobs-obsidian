@@ -458,6 +458,13 @@ export class ContentStore {
     packsBefore: number; packsAfter: number;
     blobsKept: number; blobsDropped: number;
     retireMs: number; streamMergeMs: number; compactInPlaceMs: number;
+    // Sub-phase attribution for the dominant streamMerge phase — main.ts forwards
+    // each to the perfLog sink so we can tell whether the wall-clock is going to
+    // native FS reads, base64 decode, SHA-256 verify, pack flushes, or pack removes.
+    smReadMs: number; smDecodeMs: number; smHashMs: number; smFlushMs: number; smRemoveMs: number;
+    smReads: number; smFlushes: number; smRemoves: number;
+    retireRemoves: number; compactInPlacePacks: number;
+    indexRewriteMs: number;
   }> {
     const members = new Map<string, string[]>(); // packId → its blob hashes
     for (const [hash, loc] of this.index) {
@@ -482,8 +489,10 @@ export class ContentStore {
 
     // 1. Age-blind whole-pack retirement.
     const retireStart = nowMs();
+    let retireRemoves = 0;
     for (const packId of toRetire) {
       await this.metadata.remove(this.packPath(packId));
+      retireRemoves++;
       for (const h of members.get(packId)!) {
         this.index.delete(h);
         this.cacheDelete(h);
@@ -493,12 +502,25 @@ export class ContentStore {
     const retireMs = nowMs() - retireStart;
 
     // 2. Stream-merge — deferred removals batch the crash-safety fence with the flush.
+    //    Sub-phase timers (smReadMs / smDecodeMs / smHashMs / smFlushMs / smRemoveMs)
+    //    let us tell where the wall-clock actually goes — the 116s streamMerge on the
+    //    fragmented-9194-pack device didn't match SHA-256's ~0.16 ms/call baseline
+    //    (docs/perf-baseline-2026-07-23.md §Layer-3), so the culprit is something
+    //    else here and the sub-phase attribution is what will show which.
     let pendingRemoval: string[] = [];
+    let smReadMs = 0, smDecodeMs = 0, smHashMs = 0, smFlushMs = 0, smRemoveMs = 0;
+    let smReads = 0, smFlushes = 0, smRemoves = 0;
     const flushAndRetireDeferred = async (): Promise<void> => {
       if (this.packBuffer.length === 0 && pendingRemoval.length === 0) return;
+      const tf = nowMs();
       await this.flushPack();
+      smFlushMs += nowMs() - tf;
+      smFlushes++;
       for (const oldId of pendingRemoval) {
+        const tr = nowMs();
         await this.metadata.remove(this.packPath(oldId));
+        smRemoveMs += nowMs() - tr;
+        smRemoves++;
         for (const h of members.get(oldId) ?? []) {
           if (this.index.get(h)?.packId === oldId) {
             this.index.delete(h);
@@ -510,7 +532,10 @@ export class ContentStore {
     };
     const streamMergeStart = nowMs();
     for (const packId of toStreamMerge) {
+      const trd = nowMs();
       const packText = await this.metadata.read(this.packPath(packId));
+      smReadMs += nowMs() - trd;
+      smReads++;
       if (packText === null) continue; // vanished under us — nothing to move
       for (const h of members.get(packId)!) {
         const loc = this.index.get(h);
@@ -520,8 +545,13 @@ export class ContentStore {
         if (body.length !== loc.len) { blobsDropped++; continue; } // torn tail
         // C4 hash-verify per blob — a corrupt payload is treated as missing (F1-safe),
         // matching what getFromPack does on the read path.
+        const tdc = nowMs();
         const content = base64ToUint8(body);
-        if ((await hashContent(content)) !== h) { blobsDropped++; continue; }
+        smDecodeMs += nowMs() - tdc;
+        const thc = nowMs();
+        const verified = (await hashContent(content)) === h;
+        smHashMs += nowMs() - thc;
+        if (!verified) { blobsDropped++; continue; }
         this.packBuffer.push({ hash: h, b64: body });
         blobsKept++;
       }
@@ -534,18 +564,23 @@ export class ContentStore {
     // 3. In-place compact — reuses the automated GC's §4.2 primitive so the crash
     //    story here matches what the coordinator's scheduled GC has always done.
     const compactInPlaceStart = nowMs();
+    let compactInPlacePacks = 0;
     for (const packId of toCompactInPlace) {
       const before = members.get(packId)!;
       let liveBefore = 0;
       for (const h of before) if (keepHashes.has(h)) liveBefore++;
       await this.compactPack(packId, keepHashes);
+      compactInPlacePacks++;
       blobsKept += liveBefore;
       blobsDropped += before.length - liveBefore;
     }
     const compactInPlaceMs = nowMs() - compactInPlaceStart;
 
+    let indexRewriteMs = 0;
     if (toRetire.length || toStreamMerge.length || toCompactInPlace.length) {
+      const tir = nowMs();
       await this.rewriteIndex();
+      indexRewriteMs = nowMs() - tir;
     }
 
     const packsAfterSet = new Set<string>();
@@ -554,6 +589,10 @@ export class ContentStore {
       packsBefore, packsAfter: packsAfterSet.size,
       blobsKept, blobsDropped,
       retireMs, streamMergeMs, compactInPlaceMs,
+      smReadMs, smDecodeMs, smHashMs, smFlushMs, smRemoveMs,
+      smReads, smFlushes, smRemoves,
+      retireRemoves, compactInPlacePacks,
+      indexRewriteMs,
     };
   }
 

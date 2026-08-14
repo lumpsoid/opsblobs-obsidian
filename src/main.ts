@@ -1084,11 +1084,25 @@ export default class VaultSyncPlugin extends Plugin {
       const keep = this.registry.referencedHashes(dag, { has: h => this.contentStore.hasStored(h) });
       const result = await this.contentStore.consolidatePacks(keep, SMALL_PACK_THRESHOLD, CONSOLIDATE_FLUSH_EVERY);
       if (sink) {
-        // The core measured each of its three sub-phases already; forward them so the
-        // log's `optimize`-scoped lines mirror the return shape.
+        // The core measured each phase (retire / streamMerge / compactInPlace) plus a
+        // sub-phase breakdown of streamMerge — the fat one, which on the 9194-pack
+        // device was 116 s of the 122 s total. `sink` only takes (phase, ms), so
+        // counts ride in the phase-name suffix (`streamMerge.reads=9194 0.0ms` reads
+        // clearly in the log); the `<name>Ms` lines carry real wall-clock.
         sink('retire', result.retireMs);
+        sink(`retire.removes=${result.retireRemoves}`, 0);
         sink('streamMerge', result.streamMergeMs);
+        sink('streamMerge.readMs', result.smReadMs);
+        sink('streamMerge.decodeMs', result.smDecodeMs);
+        sink('streamMerge.hashMs', result.smHashMs);
+        sink('streamMerge.flushMs', result.smFlushMs);
+        sink('streamMerge.removeMs', result.smRemoveMs);
+        sink(`streamMerge.reads=${result.smReads}`, 0);
+        sink(`streamMerge.flushes=${result.smFlushes}`, 0);
+        sink(`streamMerge.removes=${result.smRemoves}`, 0);
         sink('compactInPlace', result.compactInPlaceMs);
+        sink(`compactInPlace.packs=${result.compactInPlacePacks}`, 0);
+        sink('indexRewriteMs', result.indexRewriteMs);
       }
       t?.end('total');
       return {
